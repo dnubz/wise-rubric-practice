@@ -1,0 +1,76 @@
+using System;
+using System.Collections;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class WiseSwordPosePreview
+{
+    const string Folder = "Temp/WiseSword";
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static WiseSwordPosePreview() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: live combat-ready idle uses the imported sword at the right-hand grip, with its blade angled upward/forward. Runtime render saved."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/preview.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        EditorApplication.isPaused = false; Application.runInBackground = true;
+        if (Time.timeSinceLevelLoad < 1 || CharacterSwitchManager.CurrentCharacterTransform == null) return;
+        File.Delete(Folder + "/preview.request"); routine = Run();
+    }
+    static void Finish(string result) { File.WriteAllText(Folder + "/preview-result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static IEnumerator Run()
+    {
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        Object.FindAnyObjectByType<CharacterSwitchManager>().SwitchToCharacter(0);
+        var hero = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = hero.GetComponent<CharacterMovement>(); movement.enabled = false;
+        hero.GetComponent<CharacterController>().enabled = false;
+        hero.SetPositionAndRotation(new Vector3(0, 300, 0), Quaternion.identity);
+        foreach (var item in hero.GetComponentsInChildren<Transform>(true)) item.gameObject.layer = 30;
+        var animator = hero.GetComponentInChildren<Animator>(); animator.enabled = true;
+        animator.cullingMode = AnimatorCullingMode.AlwaysAnimate; animator.applyRootMotion = false;
+        animator.SetFloat("Speed", 0); animator.SetBool("IsGrounded", true);
+        animator.Play("Base Layer.Idle", 0, 0);
+        var hand = animator.GetBoneTransform(HumanBodyBones.RightHand); var sword = hand.Find("WiSeSword");
+        if (sword == null) throw new Exception("Sword is missing from the animated hand.");
+        var cameraObject = new GameObject("SwordGripPreview", typeof(Camera), typeof(Light));
+        var camera = cameraObject.GetComponent<Camera>(); camera.cullingMask = 1 << 30;
+        camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.08f, .09f, .12f);
+        camera.orthographic = true; camera.orthographicSize = 3.5f;
+        Vector3 centre = hero.position + Vector3.up * 2.7f;
+        camera.transform.position = centre + new Vector3(6, 3.5f, 8); camera.transform.LookAt(centre);
+        var light = cameraObject.GetComponent<Light>(); light.type = LightType.Directional; light.intensity = 1.4f; light.cullingMask = 1 << 30;
+        var target = new RenderTexture(700, 850, 24); camera.targetTexture = target;
+        // Let the normal player loop render the current skinned pose.
+        for (int frame = 0; frame < 12; frame++) yield return null;
+        sword.localRotation = Quaternion.Inverse(hand.rotation) * hero.rotation * Quaternion.Euler(20, 0, 0);
+        File.WriteAllText(Folder + "/live-local-rotation.json", JsonUtility.ToJson(sword.localRotation));
+        for (int frame = 0; frame < 8; frame++) yield return null;
+        if (Vector3.Dot(sword.up, hero.up) < .75f || Vector3.Distance(sword.position, hand.position) > .6f)
+            throw new Exception("Live sword grip failed: direction=" + sword.up + "; hand=" + hand.position + "; grip=" + sword.position);
+        var previous = RenderTexture.active; RenderTexture.active = target;
+        var image = new Texture2D(700, 850, TextureFormat.RGB24, false);
+        image.ReadPixels(new Rect(0, 0, 700, 850), 0, 0); image.Apply();
+        File.WriteAllBytes(Folder + "/ready-grip.png", image.EncodeToPNG());
+        File.WriteAllText(Folder + "/live-grip.txt", "Controller=" + animator.runtimeAnimatorController.name + "; blade=" + sword.up + "; hand=" + hand.position);
+        File.WriteAllText(Folder + "/saved-grip.request", "save");
+        RenderTexture.active = previous; camera.targetTexture = null;
+        Object.Destroy(image); target.Release(); Object.Destroy(target); Object.Destroy(cameraObject);
+    }
+}

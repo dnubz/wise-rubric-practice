@@ -1,0 +1,115 @@
+using Unity.AI.Navigation;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.AI;
+
+// Navigation uses the generated colliders; it never changes WFC terrain or content rolls.
+public sealed class ExplorationNavigation : MonoBehaviour
+{
+    public bool overworld;
+    NavMeshSurface surface;
+    NavMeshData ownedData, pendingData;
+    List<NavMeshBuildSource> lastSources;
+    AsyncOperation building;
+    Vector3 centre;
+    bool dirty = true, added;
+    float nextBuild;
+    public bool Ready => added && surface != null && surface.navMeshData != null;
+    public bool IsBuilding => dirty || building != null;
+
+    void Awake()
+    {
+        surface = gameObject.AddComponent<NavMeshSurface>();
+        surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
+        surface.overrideVoxelSize = true; surface.voxelSize = .25f;
+        surface.overrideTileSize = true; surface.tileSize = 128;
+        surface.minRegionArea = 1;
+        surface.ignoreNavMeshAgent = true;
+        surface.ignoreNavMeshObstacle = true;
+    }
+
+    public void RequestRebuild() => dirty = true;
+
+    public void BeforeTerrainChanges()
+    {
+        // Chunk unload destroys TerrainData used by the in-flight bake.
+        if (pendingData != null) { NavMeshBuilder.Cancel(pendingData); Destroy(pendingData); pendingData = null; }
+        building = null; dirty = true;
+    }
+
+    void LateUpdate()
+    {
+        if (building != null)
+        {
+            if (!building.isDone) return;
+            building = null;
+            // Keep the current map usable until the complete replacement is ready.
+            surface.RemoveData();
+            if (ownedData != null) Destroy(ownedData);
+            ownedData = pendingData; pendingData = null;
+            surface.navMeshData = ownedData;
+            surface.AddData(); added = true;
+        }
+        if (overworld)
+        {
+            Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+            if (player == null || BattleSession.IsActive || DungeonSession.IsInside) return;
+            Vector3 point = player.position;
+            // Snap build bounds to tiles so ordinary walking doesn't keep rebaking.
+            Vector3 next = new Vector3(Mathf.Floor(point.x / 24) * 24, point.y, Mathf.Floor(point.z / 24) * 24);
+            if (!added || Mathf.Abs(next.x - centre.x) > .1f || Mathf.Abs(next.z - centre.z) > .1f)
+            { centre = next; dirty = true; }
+            surface.collectObjects = CollectObjects.Volume;
+            surface.center = transform.InverseTransformPoint(centre);
+            surface.size = new Vector3(160, 100, 160);
+        }
+        else surface.collectObjects = CollectObjects.Children;
+        if (!dirty || Time.unscaledTime < nextBuild) return;
+        Physics.SyncTransforms(); dirty = false; nextBuild = Time.unscaledTime + .5f;
+        pendingData = new NavMeshData(surface.agentTypeID)
+        { position = transform.position, rotation = transform.rotation, name = name + " Exploration" };
+        var sources = new List<NavMeshBuildSource>();
+        var markups = new List<NavMeshBuildMarkup>();
+        foreach (var modifier in NavMeshModifier.activeModifiers)
+        {
+            if (!modifier.AffectsAgentType(surface.agentTypeID) || !overworld && !modifier.transform.IsChildOf(transform)) continue;
+            markups.Add(new NavMeshBuildMarkup { root = modifier.transform, overrideArea = modifier.overrideArea,
+                area = modifier.area, ignoreFromBuild = modifier.ignoreFromBuild, applyToChildren = modifier.applyToChildren });
+        }
+        Bounds bounds = new Bounds(centre, surface.size);
+        if (overworld)
+            NavMeshBuilder.CollectSources(bounds, ~0, NavMeshCollectGeometry.PhysicsColliders, 0, false, markups, false, sources);
+        else
+            NavMeshBuilder.CollectSources(transform, ~0, NavMeshCollectGeometry.PhysicsColliders, 0, false, markups, false, sources);
+        // Explicitly remove disabled colliders: they must stop blocking paths at
+        // slash impact, before the collapsing visual finishes its animation.
+        sources.RemoveAll(s => s.component != null &&
+            (s.component is Collider c && (!c.enabled || c.isTrigger) ||
+             overworld && !s.component.transform.IsChildOf(transform) ||
+             s.component.GetComponentInParent<NavMeshAgent>() != null ||
+             s.component.GetComponentInParent<NavMeshObstacle>() != null));
+        lastSources = sources;
+        if (!overworld)
+        {
+            bounds = GetComponent<BoxCollider>().bounds;
+            bounds.Expand(new Vector3(2, 30, 2));
+        }
+        bounds.center = transform.InverseTransformPoint(bounds.center);
+        var settings = surface.GetBuildSettings();
+        settings.agentRadius = .8f; settings.agentHeight = 5.2f;
+        building = NavMeshBuilder.UpdateNavMeshDataAsync(pendingData, settings, sources, bounds);
+    }
+
+    void OnDestroy()
+    {
+        if (pendingData != null) { NavMeshBuilder.Cancel(pendingData); Destroy(pendingData); }
+        if (surface != null) surface.RemoveData();
+        if (ownedData != null) Destroy(ownedData);
+    }
+
+    public static void ExcludeWater(GameObject terrain)
+    {
+        var modifier = terrain.AddComponent<NavMeshModifier>();
+        modifier.overrideArea = true; modifier.area = 1; // Not Walkable
+    }
+}

@@ -1,0 +1,23 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 44179c446030f3446977158de66b3fdd, type: 3}
+  m_Name: Secret Scroll
+  m_EditorClassIdentifier: Assembly-CSharp::Equipment
+  itemName: Secret Scroll
+  icon: {fileID: 21300000, guid: b3b56032a879d954880f8dddf10d1167, type: 3}
+  description: An ancient scroll containing mysterious knowledge and hidden secrets.
+  hpBonus: 1
+  spBonus: 111
+  atkBonus: 111
+  defBonus: 11
+  critBonus: 11
+  cost: 250

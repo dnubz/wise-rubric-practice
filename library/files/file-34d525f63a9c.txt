@@ -1,0 +1,20 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[System.Serializable]
+public class ShopEntry
+{
+    public Item item;
+
+    public int GetPrice()
+    {
+        return item != null ? item.Cost : 0;
+    }
+}
+
+[CreateAssetMenu(fileName = "New Shop Inventory", menuName = "Shop/Shop Inventory")]
+public class ShopInventory : ScriptableObject
+{
+    public string shopName = "Merchant";
+    public List<ShopEntry> items = new List<ShopEntry>();
+}

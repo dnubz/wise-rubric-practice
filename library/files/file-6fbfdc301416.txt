@@ -1,0 +1,49 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[RequireComponent(typeof(CharacterMovement))]
+[DefaultExecutionOrder(-100)]
+public class Druid : CharacterBase
+{
+    [SerializeField, Min(0.1f)] private float glideFallSpeed = 0.35f;
+
+    private CharacterMovement movement;
+    private InputSystem_Actions inputActions;
+    private InputAction jumpAction;
+
+    protected override void Awake()
+    {
+        base.Awake();
+        movement = GetComponent<CharacterMovement>();
+        inputActions = new InputSystem_Actions();
+
+        Animator bodyAnimator = GetComponentInChildren<Animator>();
+        if (bodyAnimator != null)
+            bodyAnimator.applyRootMotion = false;
+    }
+
+    private void OnEnable()
+    {
+        if (inputActions == null)
+            inputActions = new InputSystem_Actions();
+
+        inputActions.Enable();
+        jumpAction = inputActions.Player.Jump;
+    }
+
+    private void Update()
+    {
+        // The first press performs the normal jump. Holding it in the air slows the fall.
+        movement.SetFloating(jumpAction != null && jumpAction.IsPressed(), glideFallSpeed);
+    }
+
+    private void OnDisable()
+    {
+        if (movement != null)
+            movement.SetFloating(false);
+
+        if (inputActions != null)
+            inputActions.Disable();
+        jumpAction = null;
+    }
+}

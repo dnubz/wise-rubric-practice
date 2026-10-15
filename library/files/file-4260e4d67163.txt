@@ -1,0 +1,166 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+
+public enum DungeonRoomKind { Spawn, Normal, Treasure, Enemy, Boss, Guide }
+public enum DungeonKeyKind { None, Original, Boss }
+
+public sealed class DungeonRoomData
+{
+    public int Index, Degree, Number, Chain;
+    public Vector2Int Grid, Size;
+    public DungeonRoomKind Kind = DungeonRoomKind.Normal;
+    public DungeonKeyKind Key;
+}
+
+public sealed class DungeonDoorData
+{
+    public int A, B;
+    public DungeonKeyKind Lock;
+}
+
+/// <summary>Deterministic room topology, independent of meshes, scene objects and frame timing.</summary>
+public sealed class DungeonLayout
+{
+    // Larger graphs allow nested substituents while retaining the 11-room parent-chain limit.
+    public const int MaximumRooms = 24;
+    public int Seed, SpawnRoom, BossRoom, BerdlyRoom, MaximumDegree;
+    public string Name;
+    public BerdlyMolecule Graph;
+    public readonly List<DungeonRoomData> Rooms = new List<DungeonRoomData>();
+    public readonly List<DungeonDoorData> Doors = new List<DungeonDoorData>();
+    public readonly List<List<int>> Chains = new List<List<int>>();
+    static readonly Vector2Int[] Directions = { Vector2Int.up, Vector2Int.right, Vector2Int.down, Vector2Int.left };
+    struct Edge { public int A, B; public double Weight; }
+
+    public static int ChooseRoomCount(int seed, int minimum, int maximum)
+    {
+        if (minimum < 8 || maximum > MaximumRooms || maximum < minimum)
+            throw new ArgumentOutOfRangeException(nameof(minimum));
+        // Separate count and topology streams: rerolls remain independent of tree rejection.
+        return new System.Random(unchecked(seed ^ 0x524F4F4D)).Next(minimum, maximum + 1);
+    }
+
+    public static DungeonLayout Generate(int seed, int roomCount, int minimumSize, int maximumSize, BerdlyChemistry naming)
+    {
+        if (roomCount < 8 || roomCount > MaximumRooms) throw new ArgumentOutOfRangeException(nameof(roomCount));
+        if (minimumSize < 7 || maximumSize < minimumSize) throw new ArgumentOutOfRangeException(nameof(minimumSize));
+        var random = new System.Random(seed);
+        for (int attempt = 0; attempt < 2048; attempt++)
+        {
+            var result = new DungeonLayout { Seed = seed,
+                Graph = WalkTree(random, roomCount) };
+            if (naming.LongestChainLength(result.Graph) > BerdlyChemistry.MaximumChain) continue;
+            for (int i = 0; i < result.Graph.Count; i++)
+                result.Rooms.Add(new DungeonRoomData { Index = i, Grid = result.Graph.Positions[i],
+                    Size = new Vector2Int(random.Next(minimumSize, maximumSize + 1), random.Next(minimumSize, maximumSize + 1)),
+                    Kind = (DungeonRoomKind)random.Next((int)DungeonRoomKind.Normal, (int)DungeonRoomKind.Enemy + 1) });
+            result.AssignChains(naming, new HashSet<int>(Enumerable.Range(0, roomCount)), -1, 1);
+            if (result.Chains.Count < 2 || result.Chains[0].Count < 4) continue;
+            if (roomCount >= 18)
+            {
+                int mainBranches = result.Chains.Skip(1).Count(chain => result.Rooms[chain[0]].Degree == 2);
+                int nestedBranches = result.Chains.Skip(1).Count(chain => result.Rooms[chain[0]].Degree >= 3);
+                if (mainBranches < (roomCount >= 21 ? 4 : 3) || nestedBranches < (roomCount >= 21 ? 2 : 1)) continue;
+            }
+            var main = result.Chains[0];
+            result.SpawnRoom = main[0]; result.BerdlyRoom = main[1]; result.BossRoom = main[main.Count - 1];
+            result.Rooms[result.SpawnRoom].Kind = DungeonRoomKind.Spawn;
+            result.Rooms[result.BerdlyRoom].Kind = DungeonRoomKind.Guide;
+            result.Rooms[result.BossRoom].Kind = DungeonRoomKind.Boss;
+            var keyCandidates = main.Skip(1).Take(main.Count - 2).ToList();
+            for (int i = 0; i < 2; i++)
+            {
+                int index = random.Next(keyCandidates.Count);
+                result.Rooms[keyCandidates[index]].Key = DungeonKeyKind.Original;
+                keyCandidates.RemoveAt(index);
+            }
+            var deepest = new List<int>();
+            for (int chain = 1; chain < result.Chains.Count; chain++)
+            {
+                var rooms = result.Chains[chain];
+                int end = rooms[rooms.Count - 1];
+                // Every non-boss branch replenishes the key spent entering it,
+                // so exploring branches in any order cannot exhaust yellow keys.
+                result.Rooms[end].Key = DungeonKeyKind.Original;
+                if (result.Rooms[end].Degree == result.MaximumDegree) deepest.Add(end);
+            }
+            result.Rooms[deepest[random.Next(deepest.Count)]].Key = DungeonKeyKind.Boss;
+            // Required key loot belongs in a treasure room, never an ordinary decoration-only room.
+            // The fixed second room remains the guide room even when it holds a progression key.
+            foreach (DungeonRoomData room in result.Rooms)
+                if (room.Kind == DungeonRoomKind.Normal && room.Key != DungeonKeyKind.None)
+                    room.Kind = DungeonRoomKind.Treasure;
+            for (int a = 0; a < roomCount; a++)
+                foreach (int b in result.Graph.Bonds[a])
+                    if (b > a) result.Doors.Add(new DungeonDoorData { A = a, B = b,
+                        Lock = a == result.BossRoom || b == result.BossRoom ? DungeonKeyKind.Boss :
+                            result.Rooms[a].Chain != result.Rooms[b].Chain ? DungeonKeyKind.Original : DungeonKeyKind.None });
+            result.Name = naming.Name(result.Graph);
+            return result;
+        }
+        throw new InvalidOperationException("Could not generate a branched dungeon within the bounded retry budget.");
+    }
+
+    void AssignChains(BerdlyChemistry naming, HashSet<int> included, int root, int degree)
+    {
+        List<int> chain = naming.SelectChain(Graph, included, root);
+        int chainIndex = Chains.Count; Chains.Add(chain);
+        MaximumDegree = Math.Max(MaximumDegree, degree);
+        var excluded = new HashSet<int>(chain);
+        for (int i = 0; i < chain.Count; i++)
+        {
+            var room = Rooms[chain[i]]; room.Degree = degree; room.Number = i + 1; room.Chain = chainIndex;
+        }
+        foreach (int room in chain)
+            foreach (int neighbour in Graph.Bonds[room])
+                if (included.Contains(neighbour) && !excluded.Contains(neighbour))
+                    AssignChains(naming, BerdlyChemistry.Component(Graph, neighbour, included, excluded), neighbour, degree + 1);
+    }
+
+    static BerdlyMolecule WalkTree(System.Random random, int count)
+    {
+        var points = new List<Vector2Int> { Vector2Int.zero };
+        var seen = new HashSet<Vector2Int>(points);
+        Vector2Int cursor = Vector2Int.zero;
+        for (int step = 0; points.Count < count && step < count * 100; step++)
+        {
+            cursor += Directions[random.Next(4)];
+            if (seen.Add(cursor)) points.Add(cursor);
+        }
+        // Complete a slow walk by adding an adjacent unvisited cell.
+        while (points.Count < count)
+        {
+            var frontier = new List<Vector2Int>(); var unique = new HashSet<Vector2Int>();
+            foreach (Vector2Int point in points)
+                foreach (Vector2Int direction in Directions)
+                {
+                    Vector2Int next = point + direction;
+                    if (!seen.Contains(next) && unique.Add(next)) frontier.Add(next);
+                }
+            cursor = frontier[random.Next(frontier.Count)]; seen.Add(cursor); points.Add(cursor);
+        }
+        var edges = new List<Edge>();
+        for (int a = 0; a < count; a++)
+            for (int b = a + 1; b < count; b++)
+                if (Math.Abs(points[a].x - points[b].x) + Math.Abs(points[a].y - points[b].y) == 1)
+                    edges.Add(new Edge { A = a, B = b, Weight = random.NextDouble() });
+        edges.Sort((a, b) => a.Weight.CompareTo(b.Weight));
+        var tree = new BerdlyMolecule(); var sets = new int[count];
+        for (int i = 0; i < count; i++) { tree.AddCarbon(points[i]); sets[i] = i; }
+        foreach (var edge in edges)
+        {
+            int a = Find(sets, edge.A), b = Find(sets, edge.B);
+            if (a == b) continue;
+            sets[a] = b; tree.Connect(edge.A, edge.B);
+        }
+        return tree;
+    }
+
+    static int Find(int[] sets, int node)
+    {
+        while (sets[node] != node) { sets[node] = sets[sets[node]]; node = sets[node]; }
+        return node;
+    }
+}

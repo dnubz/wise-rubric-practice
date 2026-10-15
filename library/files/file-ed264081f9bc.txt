@@ -1,0 +1,82 @@
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Rounded panel/border and pixel pointer drawn directly by the Unity UI.</summary>
+[RequireComponent(typeof(CanvasRenderer))]
+public sealed class ChallengePromptGraphic : MaskableGraphic
+{
+    public float cornerRadius = 28f;
+    public float borderWidth = 3f;
+    public Color borderColor = new Color(0.9f, 0.36f, 0.66f, 1f);
+    public bool handPointer;
+
+    protected override void OnPopulateMesh(VertexHelper mesh)
+    {
+        mesh.Clear();
+        Rect rect = GetPixelAdjustedRect();
+        if (handPointer)
+        {
+            string[] pixels = { "0111000", "1111111", "1111000", "1111000", "0110000" };
+            float size = Mathf.Min(rect.width / 7f, rect.height / 5f);
+            Vector2 origin = rect.center + new Vector2(-3.5f * size, 2.5f * size);
+            for (int y = 0; y < 5; y++)
+                for (int x = 0; x < 7; x++)
+                    if (pixels[y][x] == '1')
+                        AddQuad(mesh, new Rect(origin.x + x * size, origin.y - (y + 1) * size, size, size), color);
+            return;
+        }
+
+        float stroke = Mathf.Clamp(borderWidth, 0f, Mathf.Min(rect.width, rect.height) * 0.5f);
+        Rect inner = new Rect(rect.x + stroke, rect.y + stroke, rect.width - stroke * 2f, rect.height - stroke * 2f);
+        float radius = Mathf.Clamp(cornerRadius, 0f, Mathf.Min(rect.width, rect.height) * 0.5f);
+        const int perimeterCount = 36;
+        Vector2[] outerPoints = GetPerimeter(rect, radius);
+        Vector2[] innerPoints = GetPerimeter(inner, Mathf.Max(0f, radius - stroke));
+        mesh.AddVert(inner.center, color, Vector2.zero);
+        for (int i = 0; i < perimeterCount; i++) mesh.AddVert(innerPoints[i], color, Vector2.zero);
+        for (int i = 0; i < perimeterCount; i++) mesh.AddTriangle(0, i + 1, (i + 1) % perimeterCount + 1);
+        if (stroke <= 0f) return;
+        int start = mesh.currentVertCount;
+        for (int i = 0; i < perimeterCount; i++)
+        {
+            mesh.AddVert(outerPoints[i], borderColor, Vector2.zero);
+            mesh.AddVert(innerPoints[i], borderColor, Vector2.zero);
+        }
+        for (int i = 0; i < perimeterCount; i++)
+        {
+            int next = (i + 1) % perimeterCount;
+            mesh.AddTriangle(start + i * 2, start + next * 2, start + i * 2 + 1);
+            mesh.AddTriangle(start + next * 2, start + next * 2 + 1, start + i * 2 + 1);
+        }
+    }
+
+    static Vector2[] GetPerimeter(Rect rect, float radius)
+    {
+        Vector2[] points = new Vector2[36];
+        Vector2[] centres =
+        {
+            new Vector2(rect.xMax - radius, rect.yMax - radius),
+            new Vector2(rect.xMin + radius, rect.yMax - radius),
+            new Vector2(rect.xMin + radius, rect.yMin + radius),
+            new Vector2(rect.xMax - radius, rect.yMin + radius)
+        };
+        for (int corner = 0; corner < 4; corner++)
+            for (int step = 0; step <= 8; step++)
+            {
+                float angle = (corner * 90f + step * 90f / 8f) * Mathf.Deg2Rad;
+                points[corner * 9 + step] = centres[corner] + new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius;
+            }
+        return points;
+    }
+
+    internal static void AddQuad(VertexHelper mesh, Rect rect, Color colour)
+    {
+        int first = mesh.currentVertCount;
+        mesh.AddVert(new Vector3(rect.xMin, rect.yMin), colour, Vector2.zero);
+        mesh.AddVert(new Vector3(rect.xMin, rect.yMax), colour, Vector2.zero);
+        mesh.AddVert(new Vector3(rect.xMax, rect.yMax), colour, Vector2.zero);
+        mesh.AddVert(new Vector3(rect.xMax, rect.yMin), colour, Vector2.zero);
+        mesh.AddTriangle(first, first + 1, first + 2);
+        mesh.AddTriangle(first, first + 2, first + 3);
+    }
+}

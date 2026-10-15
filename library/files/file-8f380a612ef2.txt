@@ -1,0 +1,134 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class OverworldObstacleSetup
+{
+    const string Folder = "Temp/OverworldObstacles", AssetsFolder = "Assets/Resources/Overworld";
+    static double next;
+    static OverworldObstacleSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved lower Druid glide platforms, wide gaps, diamond chest for landed characters and seeded GameScene spawner."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    [MenuItem("WiSe/Set Up Overworld Platform Challenge")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder); Directory.CreateDirectory(AssetsFolder + "/Materials"); AssetDatabase.Refresh();
+        var book = MakeBook(); var obstacle = MakeObstacle();
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity"); bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var world = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<WFCWorldManager>(true)).Single();
+            var spawner = world.GetComponent<OverworldObstacleSpawner>(); if (spawner == null) spawner = world.gameObject.AddComponent<OverworldObstacleSpawner>();
+            spawner.platformPrefab = obstacle; EditorUtility.SetDirty(spawner);
+            foreach (var actor in scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<RandaL>(true)))
+            {
+                var fields = new SerializedObject(actor); fields.FindProperty("bookPrefab").objectReferenceValue = book;
+                fields.ApplyModifiedPropertiesWithoutUndo();
+            }
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene); AssetDatabase.SaveAssets();
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+    static GameObject MakeBook()
+    {
+        var root = new GameObject("RandaLJumpBook");
+        try
+        {
+            AddModel(Load("Assets/Prefabs/BookReal.prefab"), root.transform, new Vector3(4.2f, 1.8f, 3), new Vector3(0, .9f, 0));
+            var collider = root.AddComponent<BoxCollider>(); collider.center = Vector3.up * .9f; collider.size = new Vector3(4.2f, 1.8f, 3);
+            return PrefabUtility.SaveAsPrefabAsset(root, AssetsFolder + "/RandaLJumpBook.prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static OverworldPlatformObstacle MakeObstacle()
+    {
+        var root = new GameObject("PlatformObstacle");
+        try
+        {
+            var obstacle = root.AddComponent<OverworldPlatformObstacle>(); obstacle.platforms = new BoxCollider[3];
+            var planks = Load("Assets/EmaceArt - raft on the desert/Prefabs/Wooden/Floor/EA04_Wooden_Floor_01a_PRE.prefab");
+            var timber = AssetDatabase.LoadAssetAtPath<Material>(AssetsFolder + "/Materials/Timber.mat");
+            if (timber == null) { timber = new Material(Shader.Find("Universal Render Pipeline/Lit")); timber.SetColor("_BaseColor", new Color(.24f, .115f, .055f)); AssetDatabase.CreateAsset(timber, AssetsFolder + "/Materials/Timber.mat"); }
+            for (int i = 0; i < 3; i++)
+            {
+                float top = 3f + i * 1.5f, width = i == 2 ? 6.5f : 5.2f, z = i == 2 ? 31f : i * 13f;
+                var deck = new GameObject("Platform " + (i + 1)); deck.transform.SetParent(root.transform, false);
+                deck.transform.localPosition = new Vector3(0, top - .16f, z);
+                AddModel(planks, deck.transform, new Vector3(width, .32f, 5.2f), Vector3.zero);
+                Cube("Deck Base", deck.transform, new Vector3(0, -.08f, 0), new Vector3(width, .16f, 5.2f), timber);
+                var solid = deck.AddComponent<BoxCollider>(); solid.size = new Vector3(width, .32f, 5.2f); obstacle.platforms[i] = solid;
+                foreach (int x in new[] { -1, 1 }) foreach (int side in new[] { -1, 1 })
+                    Cube("Timber Support", root.transform, new Vector3(x * (width / 2 - .65f), (top - .32f) / 2 - .25f, z + side * 1.9f),
+                        new Vector3(.5f, top + .18f, .5f), timber);
+                Cube("Front Beam", root.transform, new Vector3(0, top - .55f, z - 1.9f), new Vector3(width, .4f, .4f), timber);
+                Cube("Back Beam", root.transform, new Vector3(0, top - .55f, z + 1.9f), new Vector3(width, .4f, .4f), timber);
+            }
+            var chest = (GameObject)PrefabUtility.InstantiatePrefab(Load("Assets/Prefabs/Normal Chest.prefab"));
+            chest.transform.SetParent(root.transform, false); chest.transform.rotation = Quaternion.identity;
+            if (!ChunkSpawnUtility.TryGetVisualBounds(chest, out var bounds)) throw new Exception("Chest visual missing.");
+            chest.transform.localScale *= 2.4f / Mathf.Max(bounds.size.x, bounds.size.z);
+            ChunkSpawnUtility.TryGetVisualBounds(chest, out bounds);
+            var finalDeck = obstacle.platforms[2];
+            chest.transform.position += new Vector3(0, finalDeck.bounds.max.y + .02f - bounds.min.y, finalDeck.transform.localPosition.z) - new Vector3(bounds.center.x, 0, bounds.center.z);
+            obstacle.chest = chest.GetComponent<Chest>();
+            var loot = AssetDatabase.LoadAssetAtPath<LootTable>(AssetsFolder + "/PlatformDiamondLoot.asset");
+            if (loot == null) { loot = ScriptableObject.CreateInstance<LootTable>(); AssetDatabase.CreateAsset(loot, AssetsFolder + "/PlatformDiamondLoot.asset"); }
+            var lootFields = new SerializedObject(loot); var entries = lootFields.FindProperty("entries"); entries.arraySize = 1;
+            entries.GetArrayElementAtIndex(0).FindPropertyRelative("item").objectReferenceValue = AssetDatabase.LoadAssetAtPath<Consumable>("Assets/Scripts/Inventory/Items/Consumable/Diamond.asset");
+            entries.GetArrayElementAtIndex(0).FindPropertyRelative("weight").intValue = 100; lootFields.ApplyModifiedPropertiesWithoutUndo();
+            var fields = new SerializedObject(obstacle.chest); fields.FindProperty("lootTable").objectReferenceValue = loot;
+            fields.FindProperty("interactDistance").floatValue = 8; fields.ApplyModifiedPropertiesWithoutUndo();
+            return PrefabUtility.SaveAsPrefabAsset(root, AssetsFolder + "/PlatformObstacle.prefab").GetComponent<OverworldPlatformObstacle>();
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static GameObject Load(string path) => AssetDatabase.LoadAssetAtPath<GameObject>(path) ?? throw new Exception("Missing asset: " + path);
+    static void Cube(string name, Transform parent, Vector3 position, Vector3 size, Material material)
+    {
+        var cube = GameObject.CreatePrimitive(PrimitiveType.Cube); cube.name = name; cube.transform.SetParent(parent, false);
+        cube.transform.localPosition = position; cube.transform.localScale = size; cube.GetComponent<Renderer>().sharedMaterial = material;
+    }
+    static void AddModel(GameObject source, Transform parent, Vector3 size, Vector3 centre)
+    {
+        var wrapper = new GameObject(source.name + " Visual"); wrapper.transform.SetParent(parent, false);
+        var model = (GameObject)PrefabUtility.InstantiatePrefab(source); model.transform.SetParent(wrapper.transform, false);
+        foreach (var collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+        foreach (var renderer in model.GetComponentsInChildren<Renderer>(true))
+        {
+            var materials = renderer.sharedMaterials;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                var original = materials[i]; if (original == null) continue;
+                string path = AssetsFolder + "/Materials/" + original.name.Replace("/", "_") + ".mat";
+                var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+                if (material == null)
+                {
+                    material = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+                    material.SetTexture("_BaseMap", original.HasProperty("_BaseMap") ? original.GetTexture("_BaseMap") : original.mainTexture);
+                    material.SetColor("_BaseColor", original.HasProperty("_BaseColor") ? original.GetColor("_BaseColor") : original.HasProperty("_Color") ? original.GetColor("_Color") : Color.white);
+                    material.SetFloat("_Smoothness", .1f); AssetDatabase.CreateAsset(material, path);
+                }
+                materials[i] = material;
+            }
+            renderer.sharedMaterials = materials;
+        }
+        if (!ChunkSpawnUtility.TryGetVisualBounds(wrapper, out var b)) throw new Exception("Model has no bounds: " + source.name);
+        wrapper.transform.localScale = new Vector3(size.x / b.size.x, size.y / b.size.y, size.z / b.size.z);
+        ChunkSpawnUtility.TryGetVisualBounds(wrapper, out b);
+        wrapper.transform.position += parent.TransformPoint(centre) - b.center;
+    }
+}

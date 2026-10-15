@@ -1,0 +1,28 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public sealed class ContinueSaveUI : MonoBehaviour
+{
+    [SerializeField] Button continueButton;
+    [SerializeField] TMP_Text label;
+    bool loading;
+    void Awake() { if (continueButton != null) continueButton.onClick.AddListener(Continue); }
+    void OnEnable()
+    {
+        Refresh(); GameSave.SavesChanged += Refresh;
+    }
+    void OnDisable() { GameSave.SavesChanged -= Refresh; }
+    void Refresh()
+    {
+        if (continueButton != null) continueButton.interactable = GameSave.HasSave;
+        if (label != null) label.text = "Continue Last Played";
+    }
+    public void Continue()
+    {
+        if (loading || SceneTravelFade.IsTransitioning) return;
+        if (!GameSave.TryContinue(out string error, LoadFailed)) { LoadFailed(error); return; }
+        loading = true;
+    }
+    void LoadFailed(string error) { loading = false; if (label != null) label.text = error; }
+}

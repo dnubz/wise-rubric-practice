@@ -1,0 +1,41 @@
+using System.Collections;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+public class SceneSwitcher : MonoBehaviour
+{
+    public string sceneName = "GameScene";
+    public AudioSource musicSource;
+    public Image fadePanel;
+
+    public void SwitchScene()
+    {
+        if (sceneName == "GameScene") GameSave.BeginNewGame();
+        StartCoroutine(FadeAndSwitch());
+    }
+
+    private IEnumerator FadeAndSwitch()
+    {
+        float timer = 0f;
+
+        while (timer < 2f)
+        {
+            timer += Time.deltaTime;
+
+            float progress = timer / 2f;
+
+            musicSource.volume = Mathf.Lerp(1f, 0f, progress);
+
+            Color color = fadePanel.color;
+            color.a = Mathf.Lerp(0f, 1f, progress);
+            fadePanel.color = color;
+
+            yield return null;
+        }
+
+        musicSource.volume = 0f;
+
+        SceneManager.LoadScene(sceneName);
+    }
+}

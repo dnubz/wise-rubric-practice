@@ -1,0 +1,239 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
+
+/// <summary>
+/// Manages switching between different sub-menus/tabs (e.g. Potion Menu, Item/Equipment Menu).
+/// Supports UI button clicks, tab highlighting, and optional keyboard shortcuts (Q/E or 1/2).
+/// </summary>
+public class MenuTabManager : MonoBehaviour
+{
+    [Serializable]
+    public class TabEntry
+    {
+        [Tooltip("Identifier name for this tab (e.g. 'Potions' or 'Items').")]
+        public string tabName = "Tab";
+
+        [Tooltip("The panel GameObject activated when this tab is selected.")]
+        public GameObject panel;
+
+        [Tooltip("Optional button that selects this tab when clicked.")]
+        public Button tabButton;
+
+        [Tooltip("Optional visual indicator / background image on the button to highlight active state.")]
+        public Image tabHighlightImage;
+
+        [Tooltip("Optional text component to tint when active/inactive.")]
+        public TextMeshProUGUI tabButtonText;
+    }
+
+    [Header("Menu Tabs Configuration")]
+    [Tooltip("List of all menu tabs to switch between.")]
+    [SerializeField] private List<TabEntry> tabs = new List<TabEntry>();
+
+    [Tooltip("Index of the tab to show by default when opening.")]
+    [SerializeField] private int defaultTabIndex = 0;
+
+    [Header("Visual Feedback")]
+    [SerializeField] private Color activeColor = Color.white;
+    [SerializeField] private Color inactiveColor = new Color(0.6f, 0.6f, 0.6f, 0.6f);
+
+    [Header("Keyboard Navigation (Optional)")]
+    [Tooltip("If enabled, Q / E or 1-9 keys will cycle / switch between open tabs.")]
+    [SerializeField] private bool enableKeyboardShortcuts = true;
+
+    [Header("Currency Display (Optional)")]
+    [Tooltip("Optional TextMeshProUGUI displaying player coins/gold in the menu.")]
+    [SerializeField] private TextMeshProUGUI coinText;
+
+    private int currentTabIndex = -1;
+
+    public int CurrentTabIndex => currentTabIndex;
+
+    private void Awake()
+    {
+        SetupButtonListeners();
+    }
+
+    private void OnEnable()
+    {
+        ShowDefaultTab();
+
+        UpdateCoinDisplay(PlayerInventory.Instance != null ? PlayerInventory.Instance.Gold : 0);
+
+        if (PlayerInventory.Instance != null)
+        {
+            PlayerInventory.Instance.OnGoldChanged -= UpdateCoinDisplay;
+            PlayerInventory.Instance.OnGoldChanged += UpdateCoinDisplay;
+        }
+    }
+
+    private void OnDisable()
+    {
+        if (PlayerInventory.HasInstance)
+        {
+            PlayerInventory.Instance.OnGoldChanged -= UpdateCoinDisplay;
+        }
+    }
+
+    public void UpdateCoinDisplay(int currentGold)
+    {
+        if (coinText != null)
+        {
+            coinText.text = currentGold.ToString();
+        }
+    }
+
+    private void Update()
+    {
+        if (CheatConsole.BlocksGameplayInput) return;
+        if (!enableKeyboardShortcuts || tabs.Count <= 1) return;
+
+        HandleKeyboardInput();
+    }
+
+    private void SetupButtonListeners()
+    {
+        for (int i = 0; i < tabs.Count; i++)
+        {
+            if (tabs[i] != null && tabs[i].tabButton != null)
+            {
+                int index = i;
+                tabs[i].tabButton.onClick.RemoveAllListeners();
+                tabs[i].tabButton.onClick.AddListener(() => SwitchToTab(index));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Activates the menu tab at the given index and deactivates all others.
+    /// </summary>
+    public void SwitchToTab(int index)
+    {
+        if (tabs == null || tabs.Count == 0) return;
+        if (index < 0 || index >= tabs.Count) return;
+
+        currentTabIndex = index;
+
+        for (int i = 0; i < tabs.Count; i++)
+        {
+            TabEntry tab = tabs[i];
+            if (tab == null) continue;
+
+            bool isActive = (i == index);
+
+            // Activate / deactivate panel
+            if (tab.panel != null)
+            {
+                tab.panel.SetActive(isActive);
+            }
+
+            // Update button visual highlight
+            if (tab.tabHighlightImage != null)
+            {
+                tab.tabHighlightImage.color = isActive ? activeColor : inactiveColor;
+            }
+
+            // Update text color
+            if (tab.tabButtonText != null)
+            {
+                tab.tabButtonText.color = isActive ? activeColor : inactiveColor;
+            }
+
+            // Set button interactability (optional: non-interactable when already active)
+            if (tab.tabButton != null)
+            {
+                tab.tabButton.interactable = !isActive;
+            }
+        }
+    }
+
+    public void ShowDefaultTab()
+    {
+        SwitchToTab(defaultTabIndex);
+    }
+
+    /// <summary>
+    /// Switches to a tab matching the specified tabName.
+    /// </summary>
+    public void SwitchToTab(string name)
+    {
+        for (int i = 0; i < tabs.Count; i++)
+        {
+            if (tabs[i] != null && string.Equals(tabs[i].tabName, name, StringComparison.OrdinalIgnoreCase))
+            {
+                SwitchToTab(i);
+                return;
+            }
+        }
+
+        Debug.LogWarning($"[MenuTabManager] No tab found with name '{name}'");
+    }
+
+    /// <summary>
+    /// Cycles to the next tab to the right.
+    /// </summary>
+    public void NextTab()
+    {
+        if (tabs.Count <= 1) return;
+        int nextIndex = (currentTabIndex + 1) % tabs.Count;
+        SwitchToTab(nextIndex);
+    }
+
+    /// <summary>
+    /// Cycles to the previous tab to the left.
+    /// </summary>
+    public void PreviousTab()
+    {
+        if (tabs.Count <= 1) return;
+        int prevIndex = (currentTabIndex - 1 + tabs.Count) % tabs.Count;
+        SwitchToTab(prevIndex);
+    }
+
+    private void HandleKeyboardInput()
+    {
+#if ENABLE_INPUT_SYSTEM
+        if (Keyboard.current != null)
+        {
+            // Q / E shoulder tabs
+            if (Keyboard.current.eKey.wasPressedThisFrame)
+                NextTab();
+            else if (Keyboard.current.qKey.wasPressedThisFrame)
+                PreviousTab();
+
+            // Number keys 1, 2, 3...
+            if (Keyboard.current.digit1Key.wasPressedThisFrame && tabs.Count > 0)
+                SwitchToTab(0);
+            else if (Keyboard.current.digit2Key.wasPressedThisFrame && tabs.Count > 1)
+                SwitchToTab(1);
+            else if (Keyboard.current.digit3Key.wasPressedThisFrame && tabs.Count > 2)
+                SwitchToTab(2);
+            else if (Keyboard.current.digit4Key.wasPressedThisFrame && tabs.Count > 3)
+                SwitchToTab(3);
+            else if (Keyboard.current.digit5Key.wasPressedThisFrame && tabs.Count > 4)
+                SwitchToTab(4);
+            else if (Keyboard.current.digit6Key.wasPressedThisFrame && tabs.Count > 5)
+                SwitchToTab(5);
+        }
+#endif
+
+#if ENABLE_LEGACY_INPUT_MANAGER
+        if (Input.GetKeyDown(KeyCode.E))
+            NextTab();
+        else if (Input.GetKeyDown(KeyCode.Q))
+            PreviousTab();
+
+        if (Input.GetKeyDown(KeyCode.Alpha1) && tabs.Count > 0)
+            SwitchToTab(0);
+        else if (Input.GetKeyDown(KeyCode.Alpha2) && tabs.Count > 1)
+            SwitchToTab(1);
+        else if (Input.GetKeyDown(KeyCode.Alpha3) && tabs.Count > 2)
+            SwitchToTab(2);
+#endif
+    }
+}

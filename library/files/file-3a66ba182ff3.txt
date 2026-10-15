@@ -1,0 +1,111 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Displays the currently selected character without polling every frame.</summary>
+public sealed class CurrentCharacterHud : MonoBehaviour
+{
+    [Header("Events and character source")]
+    [SerializeField] private CharacterHudEventChannel hudEvents;
+    [SerializeField] private CharacterSwitchManager switchManager;
+
+    [Header("UI references")]
+    [SerializeField] private Image portraitImage;
+    [SerializeField] private TMP_Text characterNameText;
+    [SerializeField] private TMP_Text levelText;
+    [SerializeField] private TMP_Text hpText;
+    [SerializeField] private TMP_Text spText;
+    [SerializeField] private Image hpFillImage;
+    [SerializeField] private Image spFillImage;
+
+    private CharacterBase selectedCharacter;
+
+    private void Awake()
+    {
+        if (switchManager == null)
+            switchManager = FindFirstObjectByType<CharacterSwitchManager>();
+    }
+
+    private void OnEnable()
+    {
+        if (hudEvents != null)
+        {
+            hudEvents.CharacterSelected += OnCharacterSelected;
+            hudEvents.CharacterStatsChanged += OnCharacterStatsChanged;
+        }
+
+        ShowCurrentCharacter();
+    }
+
+    private void Start()
+    {
+        // Covers either Start order when the HUD and switch manager load together.
+        ShowCurrentCharacter();
+    }
+
+    private void OnDisable()
+    {
+        if (hudEvents != null)
+        {
+            hudEvents.CharacterSelected -= OnCharacterSelected;
+            hudEvents.CharacterStatsChanged -= OnCharacterStatsChanged;
+        }
+    }
+
+    private void ShowCurrentCharacter()
+    {
+        if (switchManager == null || switchManager.CurrentCharacter == null)
+            return;
+
+        selectedCharacter = switchManager.CurrentCharacter;
+        Refresh();
+    }
+
+    private void OnCharacterSelected(CharacterBase character)
+    {
+        selectedCharacter = character;
+        Refresh();
+    }
+
+    private void OnCharacterStatsChanged(CharacterBase character)
+    {
+        if (character == selectedCharacter)
+            Refresh();
+    }
+
+    private void Refresh()
+    {
+        if (selectedCharacter == null)
+            return;
+
+        CharacterData data = selectedCharacter.characterData;
+        string displayName = data != null && !string.IsNullOrWhiteSpace(data.displayName)
+            ? data.displayName
+            : selectedCharacter.gameObject.name;
+
+        if (characterNameText != null)
+            characterNameText.text = displayName;
+        if (levelText != null)
+            levelText.text = $"Lv. {selectedCharacter.CurrentLevel}";
+
+        int maxHP = selectedCharacter.GetMaxHP();
+        int maxSP = selectedCharacter.GetMaxSP();
+        int currentHP = selectedCharacter.GetCurrHP();
+        int currentSP = selectedCharacter.GetCurrSP();
+
+        if (hpText != null)
+            hpText.text = $"{currentHP} / {maxHP}";
+        if (spText != null)
+            spText.text = $"{currentSP} / {maxSP}";
+        if (hpFillImage != null)
+            hpFillImage.fillAmount = maxHP > 0 ? Mathf.Clamp01((float)currentHP / maxHP) : 0f;
+        if (spFillImage != null)
+            spFillImage.fillAmount = maxSP > 0 ? Mathf.Clamp01((float)currentSP / maxSP) : 0f;
+
+        if (portraitImage != null)
+        {
+            portraitImage.sprite = data != null ? data.portrait : null;
+            portraitImage.enabled = portraitImage.sprite != null;
+        }
+    }
+}

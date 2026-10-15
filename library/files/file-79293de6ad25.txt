@@ -1,0 +1,68 @@
+using System.Collections;
+using TMPro;
+using UnityEngine;
+
+/// <summary>A nonblocking area-title overlay sharing the saved dungeon arrival style and cue.</summary>
+public sealed class DungeonAreaTitle : MonoBehaviour
+{
+    [SerializeField] CanvasGroup group;
+    [SerializeField] AudioSource cue;
+    [SerializeField] TMP_Text title;
+    [SerializeField] float fadeIn = .6f, hold = 2.5f, fadeOut = .9f;
+    static DungeonAreaTitle overworldTitle;
+    public bool IsShowing { get; private set; }
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics() => overworldTitle = null;
+
+    public static void ShowOverworld()
+    {
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        if (settings == null || settings.areaTitlePrefab == null) return;
+        if (overworldTitle == null)
+        {
+            // Parenting to the world also stops the cue/banner when dungeon or battle travel suspends it.
+            Transform world = WFCWorldManager.Instance != null ? WFCWorldManager.Instance.transform : null;
+            overworldTitle = Instantiate(settings.areaTitlePrefab, world);
+            overworldTitle.name = "OverworldAreaTitle";
+        }
+        overworldTitle.Play(settings.areaEnterSound, "Overworld");
+    }
+
+    public static void HideOverworld() { if (overworldTitle != null) overworldTitle.StopPresentation(); }
+
+    void OnDisable() => StopPresentation();
+    public void StopPresentation()
+    {
+        StopAllCoroutines(); IsShowing = false;
+        if (group != null) group.alpha = 0;
+        if (cue != null) cue.Stop();
+    }
+    public void Play(AudioClip clip, string areaName = null)
+    {
+        StopPresentation();
+        if (title == null) title = GetComponentInChildren<TMP_Text>(true);
+        if (areaName != null && title != null) title.text = areaName;
+        group.alpha = 0; group.blocksRaycasts = false;
+        group.interactable = false; IsShowing = true;
+        if (clip != null)
+        {
+            cue.clip = clip; cue.spatialBlend = 0; cue.loop = false;
+            GameAudio.RouteSFX(cue); cue.Play();
+        }
+        StartCoroutine(Present());
+    }
+    IEnumerator Present()
+    {
+        yield return Fade(0, 1, fadeIn);
+        yield return new WaitForSecondsRealtime(hold);
+        yield return Fade(1, 0, fadeOut);
+        IsShowing = false;
+    }
+    IEnumerator Fade(float from, float to, float duration)
+    {
+        for (float time = 0; time < duration; time += Time.unscaledDeltaTime)
+        { group.alpha = Mathf.Lerp(from, to, time / duration); yield return null; }
+        group.alpha = to;
+    }
+}

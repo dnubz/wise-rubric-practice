@@ -1,0 +1,71 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+/// <summary>Saves the coin's editable animation/prefab and assigns existing sound effects.</summary>
+[InitializeOnLoad]
+public static class DungeonFeedbackSetup
+{
+    const string Folder = "Temp/DungeonFeedback";
+    const string ClipPath = "Assets/Resources/Dungeon/CoinFloatSpin.anim";
+    const string PrefabPath = "Assets/Resources/Dungeon/DungeonCoin.prefab";
+    static double nextCheck;
+    static DungeonFeedbackSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved floating/spinning coin prefab and animation; existing swing, impact and gate sounds assigned with leading silence skipped."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Set Up Dungeon Feedback")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(ClipPath);
+        if (clip == null) { clip = new AnimationClip(); AssetDatabase.CreateAsset(clip, ClipPath); }
+        clip.legacy = true; clip.name = "CoinFloatSpin"; clip.wrapMode = WrapMode.Loop; clip.frameRate = 30;
+        var bob = new AnimationCurve(new Keyframe(0, 0, 0, 0), new Keyframe(.45f, .18f, 0, 0),
+            new Keyframe(.9f, 0, 0, 0), new Keyframe(1.35f, -.18f, 0, 0), new Keyframe(1.8f, 0, 0, 0));
+        clip.SetCurve("AnimatedCoin", typeof(Transform), "localPosition.y", bob);
+        clip.SetCurve("AnimatedCoin", typeof(Transform), "localEulerAnglesRaw.y", AnimationCurve.Linear(0, 0, 1.8f, 360));
+        EditorUtility.SetDirty(clip);
+        var root = new GameObject("DungeonCoin");
+        try
+        {
+            var visual = new GameObject("AnimatedCoin"); visual.transform.SetParent(root.transform, false);
+            var mesh = GameObject.CreatePrimitive(PrimitiveType.Cylinder); mesh.name = "CoinModel";
+            mesh.transform.SetParent(visual.transform, false); mesh.transform.localRotation = Quaternion.Euler(90, 0, 0);
+            mesh.transform.localScale = new Vector3(1, .12f, 1); Object.DestroyImmediate(mesh.GetComponent<Collider>());
+            var animation = root.AddComponent<Animation>(); animation.AddClip(clip, clip.name);
+            animation.clip = clip; animation.playAutomatically = true; animation.wrapMode = WrapMode.Loop;
+            var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+            settings.coinPrefab = PrefabUtility.SaveAsPrefabAsset(root, PrefabPath);
+            settings.breakingSwingSound = Sound("Combat/sword_swing_01.wav");
+            settings.breakingImpactSound = DungeonTravelFeedbackSetup.ImmediateClip("wooden-box-breaking-sound-effects_KKsee2Bg", "Wooden Box Break Impact");
+            settings.gateLiftSound = Sound("Dungeon/LockedDoor.mp3");
+            settings.breakingSwingStartSeconds = AudibleStart(settings.breakingSwingSound);
+            settings.breakingImpactStartSeconds = 0;
+            settings.gateLiftStartSeconds = AudibleStart(settings.gateLiftSound);
+            File.WriteAllText(Folder + "/sound-details.txt", $"Swing: {settings.breakingSwingSound.name}, length={settings.breakingSwingSound.length:F3}s, onset={settings.breakingSwingStartSeconds:F3}s\nImpact: {settings.breakingImpactSound.name}, length={settings.breakingImpactSound.length:F3}s, onset={settings.breakingImpactStartSeconds:F3}s\nGate: {settings.gateLiftSound.name}, length={settings.gateLiftSound.length:F3}s, onset={settings.gateLiftStartSeconds:F3}s\n");
+            EditorUtility.SetDirty(settings); AssetDatabase.SaveAssets();
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static AudioClip Sound(string path) => AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/SFX/" + path);
+    static float AudibleStart(AudioClip clip)
+    {
+        if (clip == null) throw new InvalidOperationException("Existing sound is missing.");
+        clip.LoadAudioData();
+        var samples = new float[clip.samples * clip.channels];
+        if (!clip.GetData(samples, 0)) return 0;
+        for (int i = 0; i < samples.Length; i++)
+            if (Mathf.Abs(samples[i]) > .02f) return Mathf.Max(0, (float)(i / clip.channels) / clip.frequency - .005f);
+        return 0;
+    }
+}

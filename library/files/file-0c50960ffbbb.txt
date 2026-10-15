@@ -1,0 +1,123 @@
+using System;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Events;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DungeonFeedbackChecks
+{
+    const string Folder = "Temp/DungeonFeedback";
+    static double nextCheck;
+    static readonly BindingFlags Hidden = BindingFlags.Instance | BindingFlags.NonPublic;
+    static DungeonFeedbackChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: actual humanoid swing cues fire once at forward swing/contact and cancel cleanly; saved coin clip visibly bobs/spins and loops; normal, interaction/shop and challenge NPCs start on approach, avoid repeated restarts, reset after exiting and defer while a modal is open; key/F gate behavior still passes with the assigned existing door sound."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Validate Dungeon Feedback")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        DungeonBreakingChecks.Run(); DungeonDoorInteractionChecks.Run();
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings.coinPrefab != null && settings.gateLiftSound != null, "Feedback assets are not assigned.");
+        Require(settings.breakingImpactStartSeconds >= 0 && settings.breakingImpactStartSeconds < settings.breakingImpactSound.length &&
+            settings.gateLiftStartSeconds < settings.gateLiftSound.length, "Sound onset is outside the clip.");
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var owned = new GameObject("FeedbackCheck"); SceneManager.MoveGameObjectToScene(owned, scene);
+        FieldInfo playerField = typeof(CharacterSwitchManager).GetField("<CurrentCharacterTransform>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
+        FieldInfo blockedFrame = typeof(NPCChallengePrompt).GetField("closedFrame", BindingFlags.Static | BindingFlags.NonPublic);
+        object previousPlayer = playerField.GetValue(null), previousBlocked = blockedFrame.GetValue(null);
+        try
+        {
+            var coin = Object.Instantiate(settings.coinPrefab, owned.transform);
+            var animation = coin.GetComponent<Animation>();
+            Require(animation != null && animation.clip != null && animation.clip.legacy && animation.wrapMode == WrapMode.Loop,
+                "Coin has no saved looping animation.");
+            Transform visual = coin.transform.Find("AnimatedCoin");
+            animation.clip.SampleAnimation(coin, 0); Vector3 basePosition = visual.localPosition;
+            animation.clip.SampleAnimation(coin, .45f);
+            Require(visual.localPosition.y > basePosition.y + .15f && Quaternion.Angle(Quaternion.identity, visual.localRotation) > 80,
+                "Coin animation does not visibly rise/spin.");
+            animation.clip.SampleAnimation(coin, 1.8f);
+            Require(Vector3.Distance(visual.localPosition, basePosition) < .001f && Quaternion.Angle(visual.localRotation, Quaternion.identity) < .01f,
+                "Coin loop jumps at the seam.");
+            Require(coin.GetComponentInChildren<Collider>() == null, "Coin unexpectedly blocks the player.");
+            var player = new GameObject("ApproachPlayer"); player.transform.SetParent(owned.transform);
+            playerField.SetValue(null, player.transform);
+            CheckApproach(owned, player.transform, typeof(ApproachNormalProbe));
+            CheckApproach(owned, player.transform, typeof(ApproachInteractProbe));
+            CheckApproach(owned, player.transform, typeof(ApproachChallengeProbe));
+            var shopPrefab = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/MARI2.prefab");
+            var shopLines = (string[])typeof(NPCBase).GetField("dialogueLines", Hidden).GetValue(shopPrefab.GetComponentInChildren<InteractableNPC>(true));
+            Require(shopLines.Length > 0, "The shop NPC has no dialogue to show on approach.");
+            var shopProbe = new GameObject("ShopApproach"); shopProbe.transform.SetParent(owned.transform);
+            var shopNPC = shopProbe.AddComponent<ApproachInteractProbe>();
+            typeof(InteractableNPC).GetField("shopInventory", Hidden).SetValue(shopNPC,
+                typeof(InteractableNPC).GetField("shopInventory", Hidden).GetValue(shopPrefab.GetComponentInChildren<InteractableNPC>(true)));
+            typeof(NPCBase).GetMethod("CheckPlayerProximity", Hidden).Invoke(shopNPC, null);
+            Require(shopNPC.IsShop && shopNPC.starts == 1, "Shop NPC still requires F before greeting.");
+            CheckDungeonNPCs(owned, player.transform, settings);
+            var actionObject = new GameObject("InteractionAction"); actionObject.transform.SetParent(owned.transform);
+            var actionNPC = actionObject.AddComponent<ApproachInteractProbe>();
+            int actions = 0; var action = new UnityEvent(); action.AddListener(() => actions++);
+            typeof(InteractableNPC).GetField("onInteract", Hidden).SetValue(actionNPC, action);
+            actionNPC.StartDialogue();
+            typeof(InteractableNPC).GetMethod("OnFKeyPressedAfterSentence", Hidden).Invoke(actionNPC, null);
+            Require(actions == 1 && !(bool)typeof(NPCBase).GetField("isDialogueActive", Hidden).GetValue(actionNPC), "Interaction no longer follows the final dialogue line.");
+        }
+        finally
+        {
+            playerField.SetValue(null, previousPlayer); blockedFrame.SetValue(null, previousBlocked);
+            Object.DestroyImmediate(owned); SceneManager.SetActiveScene(original); EditorSceneManager.CloseScene(scene, true);
+        }
+    }
+    static void CheckDungeonNPCs(GameObject owned, Transform player, DungeonSettings settings)
+    {
+        foreach (GameObject prefab in new[] { settings.dungeonGuideNPC, settings.dungeonFriendlyNPC })
+        {
+            Require(prefab != null && prefab.GetComponent<NormalNPC>() != null &&
+                prefab.GetComponent<NormalNPC>().enabled && prefab.GetComponentInChildren<NPCSpeechBubble>(true) != null,
+                "Dungeon NPC is missing its saved proximity dialogue prefab.");
+        }
+    }
+    static string Table(string name) => Resources.Load<TextAsset>("BerdlyNaming/" + name).text;
+    static void CheckApproach(GameObject parent, Transform player, Type type)
+    {
+        var obj = new GameObject(type.Name); obj.transform.SetParent(parent.transform);
+        var npc = (NPCBase)obj.AddComponent(type);
+        var count = type.GetField("starts");
+        var nearby = typeof(NPCBase).GetField("isPlayerNearby", Hidden);
+        var active = typeof(NPCBase).GetField("isDialogueActive", Hidden);
+        var check = typeof(NPCBase).GetMethod("CheckPlayerProximity", Hidden);
+        var blocked = typeof(NPCChallengePrompt).GetField("closedFrame", BindingFlags.Static | BindingFlags.NonPublic);
+        player.position = Vector3.zero; blocked.SetValue(null, Time.frameCount); check.Invoke(npc, null);
+        Require((int)count.GetValue(npc) == 0 && !(bool)nearby.GetValue(npc), type.Name + " lost its pending approach during a modal.");
+        blocked.SetValue(null, -1); check.Invoke(npc, null); check.Invoke(npc, null);
+        Require((int)count.GetValue(npc) == 1 && (bool)active.GetValue(npc), type.Name + " needs F to start or restarts each frame.");
+        npc.EndDialogue(); check.Invoke(npc, null);
+        Require((int)count.GetValue(npc) == 1, type.Name + " repeats without leaving range.");
+        player.position = Vector3.right * 20; check.Invoke(npc, null);
+        Require(!(bool)nearby.GetValue(npc) && !(bool)active.GetValue(npc), type.Name + " retains dialogue out of range.");
+        player.position = Vector3.zero; check.Invoke(npc, null);
+        Require((int)count.GetValue(npc) == 2 && (bool)active.GetValue(npc), type.Name + " does not talk on the next approach.");
+        Object.DestroyImmediate(obj);
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}
+
+// Exercise the real proximity/subclass flow without running typewriter coroutines in edit mode.
+public class ApproachNormalProbe : NormalNPC { public int starts; protected override void DisplayLine(int index) { starts++; } }
+public class ApproachInteractProbe : InteractableNPC { public int starts; protected override void DisplayLine(int index) { starts++; } }
+public class ApproachChallengeProbe : MinigameNPC { public int starts; protected override void DisplayLine(int index) { starts++; } }

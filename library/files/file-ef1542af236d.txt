@@ -1,0 +1,77 @@
+using System.Collections;
+using UnityEngine;
+
+/// <summary>A one-hit decoration. The room keeps its broken state until the dungeon visit ends.</summary>
+public sealed class DungeonBreakable : MonoBehaviour
+{
+    public bool IsBroken { get; private set; }
+    public bool IsBreaking { get; private set; }
+    public bool DropsCoin { get; private set; }
+    public int Room { get; private set; }
+    DungeonGenerator dungeon;
+    DungeonSettings settings;
+
+    public void Initialize(DungeonGenerator owner, int room, bool dropsCoin)
+    {
+        dungeon = owner; Room = room; DropsCoin = dropsCoin;
+        settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+    }
+
+    // Start a single swing. Breaking and loot happen only when the swing reaches the prop.
+    public bool TryBreak(CharacterBase character)
+    {
+        if (IsBreaking || !CanBreak(character)) return false;
+        var movement = CharacterSwitchManager.CurrentCharacterTransform.GetComponent<CharacterMovement>();
+        if (movement == null || !movement.TryPlayBreakAction(transform.position,
+            () => { if (this != null && CanBreak(character)) BreakAtImpact(); },
+            () => { if (this != null) IsBreaking = false; },
+            () => { if (this != null && CanBreak(character) && settings != null)
+                DungeonAudio.Play(settings.breakingSwingSound, transform.position, .35f, settings.breakingSwingStartSeconds); })) return false;
+        IsBreaking = true;
+        return true;
+    }
+
+    bool CanBreak(CharacterBase character)
+    {
+        Transform active = CharacterSwitchManager.CurrentCharacterTransform;
+        if (IsBroken || !(character is WiSe) || active == null || active.GetComponentInChildren<CharacterBase>() != character ||
+            dungeon == null || !dungeon.Exploring || dungeon.CurrentRoom != Room ||
+            NPCChallengePrompt.BlocksGameplayInput || !gameObject.activeInHierarchy) return false;
+        Vector3 delta = active.position - transform.position; delta.y = 0;
+        return delta.sqrMagnitude <= 3f * 3f;
+    }
+
+    void BreakAtImpact()
+    {
+        IsBroken = true;
+        foreach (Collider blocker in GetComponentsInChildren<Collider>()) blocker.enabled = false;
+        GetComponentInParent<ExplorationNavigation>()?.RequestRebuild();
+        if (settings != null && settings.breakingEffect != null)
+        {
+            GameObject effect = Instantiate(settings.breakingEffect, transform.position + Vector3.up * .65f,
+                Quaternion.identity, transform.parent);
+            if (Application.isPlaying) Destroy(effect, 1.2f);
+        }
+        if (settings != null)
+            DungeonAudio.Play(settings.breakingImpactSound, transform.position, .5f, settings.breakingImpactStartSeconds);
+        if (DropsCoin) dungeon.SpawnCoin(Room, transform.position);
+        if (Application.isPlaying) StartCoroutine(Collapse());
+    }
+
+    IEnumerator Collapse()
+    {
+        Vector3 scale = transform.localScale;
+        Quaternion rotation = transform.localRotation;
+        float elapsed = 0;
+        while (elapsed < .18f)
+        {
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / .18f);
+            transform.localRotation = rotation * Quaternion.Euler(t * 12, 0, -t * 8);
+            transform.localScale = Vector3.Scale(scale, new Vector3(1 - t * .3f, 1 - t * .8f, 1 - t * .3f));
+            yield return null;
+        }
+        gameObject.SetActive(false);
+        Destroy(gameObject);
+    }
+}

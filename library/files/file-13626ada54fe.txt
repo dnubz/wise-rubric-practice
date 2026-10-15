@@ -1,0 +1,24 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 606a84878e26c6e41add112baf4dff39, type: 3}
+  m_Name: Skill_2_3
+  m_EditorClassIdentifier: Assembly-CSharp::BattleSkill
+  displayName: Grand Ensemble
+  description: An 18-second rhythm performance. Accuracy determines each enemy's
+    charm chance.
+  icon: {fileID: 21300000, guid: faa4bff8220cecc4d9d3a12b47bee3b1, type: 3}
+  character: 2
+  slot: 3
+  sp: 30
+  cooldown: 5
+  range: 0
+  radius: 0

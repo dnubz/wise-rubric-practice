@@ -1,0 +1,153 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>Clones only the saved battle UI; advances effects explicitly without touching the live battle.</summary>
+[InitializeOnLoad]
+public static class BerdlyFeedbackChecks
+{
+    const string Folder = "Temp/BerdlyFeedback";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static BerdlyFeedbackChecks() { EditorApplication.update += Poll; }
+    static void Poll()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: cloned actual Berdly UI; blue right-facing and red left-facing triple sonic waves; damage occurs once at impact; target recoil restores; defend healing/cap/zero feedback; rising/fading popup; unchanged damage/guard values; ordered player/enemy turns and lethal player damage; immediate Exit cancels pending damage and restores portraits; native blue/red/healing renders saved. Live battle, party and saves untouched."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); }
+    }
+    [MenuItem("WiSe/Berdly/Validate Battle Feedback")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        var original = Object.FindAnyObjectByType<BerdlyBattleController>(FindObjectsInactive.Include);
+        Require(original != null, "Open GameScene before checking its saved UI.");
+        var sourcePanel = Field<GameObject>(original, "battlePanel");
+        var staticFlags = BindingFlags.Static | BindingFlags.NonPublic;
+        var active = typeof(BerdlyBattleController).GetField("activeBattle", staticFlags);
+        var closed = typeof(BerdlyBattleController).GetField("closedFrame", staticFlags);
+        var previousBattle = active.GetValue(null); var previousFrame = closed.GetValue(null);
+        var fixture = new GameObject("BerdlyFeedbackFixture", typeof(RectTransform), typeof(Canvas));
+        fixture.hideFlags = HideFlags.HideAndDontSave; fixture.SetActive(false);
+        fixture.GetComponent<RectTransform>().sizeDelta = new Vector2(1920, 1080);
+        fixture.transform.position = Vector3.one * 100000;
+        var canvas = fixture.GetComponent<Canvas>(); canvas.renderMode = RenderMode.WorldSpace;
+        var panel = Object.Instantiate(sourcePanel, fixture.transform, false); panel.SetActive(true);
+        var battle = fixture.AddComponent<BerdlyBattleController>(); battle.enabled = false;
+        Set(battle, "initialized", true); Set(battle, "battlePanel", panel); battle.AssignMissingReferences();
+        Set(battle, "turnFeedbackSeconds", 0f);
+        Call(battle, "CreatePortraitFeedback"); Call(battle, "CreateSonicWave");
+        var wave = Field<BerdlySonicWave>(battle, "sonicWave");
+        var healing = Field<TMP_Text>(battle, "healingText");
+        var player = Field<RectTransform>(battle, "playerPortrait"); var enemy = Field<RectTransform>(battle, "berdlyPortrait");
+        Vector2 playerOrigin = player.anchoredPosition, enemyOrigin = enemy.anchoredPosition;
+        try
+        {
+            State(battle, 70, 100, 3, 0);
+            var turn = (IEnumerator)Call(battle, "ResolveEnemyTurn", BerdlyBattleController.BattleScreen.Attack, "Time's up!");
+            var blue = Child(turn); Require(blue.MoveNext() && wave.IsPlaying && wave.FromPlayer, "Blue attack did not start.");
+            wave.Advance(.35f); Require(battle.BerdlyHP == 100 && wave.color.b > wave.color.r, "Player damage/colour before impact is wrong.");
+            CheckGeometry(wave, true); Capture(fixture, Folder + "/player-blue.png");
+            wave.Advance(.4f); Require(battle.BerdlyHP == 70, "Player impact damage is wrong.");
+            Require(enemy.anchoredPosition != enemyOrigin, "Berdly portrait did not recoil.");
+            wave.Advance(2); Require(battle.BerdlyHP == 70 && enemy.anchoredPosition == enemyOrigin && !blue.MoveNext(), "Player impact repeated or recoil drifted.");
+            Require(!Child(turn).MoveNext(), "Feedback should be zero in fixture.");
+            var red = Child(turn); Require(red.MoveNext() && wave.IsPlaying && !wave.FromPlayer, "Berdly attack did not follow player attack.");
+            wave.Advance(.35f); Require(battle.PlayerHP == 70 && wave.color.r > wave.color.b, "Enemy damage/colour before impact is wrong.");
+            CheckGeometry(wave, false); Capture(fixture, Folder + "/berdly-red.png");
+            wave.Advance(2); Require(battle.PlayerHP == 37 && player.anchoredPosition == playerOrigin && !red.MoveNext(), "Enemy damage/recoil is wrong.");
+            Require(!Child(turn).MoveNext() && !turn.MoveNext() && battle.Screen == BerdlyBattleController.BattleScreen.MoveSelection, "Turn failed to return to move selection.");
+
+            State(battle, 94, 100, 1, 2);
+            turn = (IEnumerator)Call(battle, "ResolveEnemyTurn", BerdlyBattleController.BattleScreen.Defend, "Time's up!");
+            Require(turn.MoveNext() && battle.PlayerHP == 100 && healing.gameObject.activeSelf && healing.text == "+6 HP", "Defend did not heal/show actual amount.");
+            Require(healing.transform.parent == panel.transform && healing.transform.GetSiblingIndex() > panel.transform.Find("Board").GetSiblingIndex(), "Board covers healing popup.");
+            Vector2 popupOrigin = healing.rectTransform.anchoredPosition;
+            Call(battle, "AnimateHealingFeedback", .2f);
+            Require(healing.alpha == 1 && healing.rectTransform.anchoredPosition.y > popupOrigin.y, "Healing feedback did not rise/hold.");
+            Capture(fixture, Folder + "/healing.png");
+            Require(!healing.isTextOverflowing, "Healing amount text overflows.");
+            Call(battle, "AnimateHealingFeedback", .8f); Require(healing.alpha > 0 && healing.alpha < 1, "Healing feedback does not fade.");
+            Call(battle, "AnimateHealingFeedback", 1f); Require(!healing.gameObject.activeSelf && healing.rectTransform.anchoredPosition == popupOrigin, "Healing feedback did not reset.");
+            Require(turn.Current is IEnumerator && !((IEnumerator)turn.Current).MoveNext(), "Defend wait fixture is wrong.");
+            red = Child(turn); Require(red.MoveNext(), "Guarded enemy attack missing."); wave.Advance(2);
+            Require(battle.PlayerHP == 83.5f && battle.ProtectionTurns == 1, "Guard damage/consumption changed.");
+            ((IDisposable)turn).Dispose();
+
+            State(battle, 99, 100, 3, 2);
+            turn = (IEnumerator)Call(battle, "ResolveEnemyTurn", BerdlyBattleController.BattleScreen.Defend, "Test");
+            Require(turn.MoveNext() && battle.PlayerHP == 100 && healing.text == "+1 HP", "Healing popup ignores the HP cap."); ((IDisposable)turn).Dispose();
+            State(battle, 100, 100, 3, 2);
+            turn = (IEnumerator)Call(battle, "ResolveEnemyTurn", BerdlyBattleController.BattleScreen.Defend, "Test");
+            Require(turn.MoveNext() && !healing.gameObject.activeSelf, "Full HP shows fake healing."); ((IDisposable)turn).Dispose();
+
+            State(battle, 100, 100, 3, 0);
+            blue = (IEnumerator)Call(battle, "PlaySonicAttack", true, (Action)(() => Value(battle, "BerdlyHP", 70)));
+            Require(blue.MoveNext(), "Exit fixture wave missing."); wave.Advance(.3f); battle.ExitBattle(); wave.Advance(2);
+            Require(battle.Screen == BerdlyBattleController.BattleScreen.Closed && battle.BerdlyHP == 100 && !wave.IsPlaying && !panel.activeSelf && !healing.gameObject.activeSelf, "Exit left pending damage/feedback.");
+            State(battle, 100, 100, 0, 0);
+            int hits = 0; red = (IEnumerator)Call(battle, "PlaySonicAttack", false, (Action)(() => hits++));
+            Require(red.MoveNext(), "Recoil exit fixture missing."); wave.Advance(.75f);
+            Require(hits == 1 && player.anchoredPosition != playerOrigin, "Recoil exit fixture did not hit.");
+            battle.ExitBattle(); wave.Advance(2); Require(hits == 1 && player.anchoredPosition == playerOrigin, "Exit did not restore recoil/cancel callback.");
+            // Damage zero must not create a player wave; defeat from ten correct answers ends before an enemy wave.
+            State(battle, 100, 100, 0, 0);
+            turn = (IEnumerator)Call(battle, "ResolveEnemyTurn", BerdlyBattleController.BattleScreen.Attack, "Test");
+            Require(!Child(turn).MoveNext() && !wave.IsPlaying, "Zero-damage attack emitted a wave."); ((IDisposable)turn).Dispose();
+            // Stop after the lethal player's impact, then inspect the victory branch without awarding a live reward.
+            State(battle, 100, 100, 10, 0);
+            turn = (IEnumerator)Call(battle, "ResolveEnemyTurn", BerdlyBattleController.BattleScreen.Attack, "Test");
+            blue = Child(turn); Require(blue.MoveNext(), "Lethal attack wave missing."); wave.Advance(2);
+            Require(battle.BerdlyHP == 0 && !blue.MoveNext(), "Lethal damage failed."); ((IDisposable)turn).Dispose();
+        }
+        finally
+        {
+            Value(battle, "Screen", BerdlyBattleController.BattleScreen.Closed);
+            Object.DestroyImmediate(fixture); active.SetValue(null, previousBattle); closed.SetValue(null, previousFrame);
+        }
+    }
+    static void State(BerdlyBattleController battle, float hp, int enemyHP, int answers, int guard)
+    {
+        Call(battle, "ResetPortraitFeedback");
+        Value(battle, "Screen", BerdlyBattleController.BattleScreen.Resolving); Value(battle, "PlayerHP", hp); Value(battle, "BerdlyHP", enemyHP);
+        Set(battle, "correctAnswers", answers); Set(battle, "protectionTurns", guard); Field<GameObject>(battle, "battlePanel").SetActive(true);
+        Field<GameObject>(battle, "movePanel").SetActive(false); Field<GameObject>(battle, "guessingPanel").SetActive(false);
+        Field<GameObject>(battle, "moleculeContainer").SetActive(false); Call(battle, "UpdateHP");
+    }
+    static IEnumerator Child(IEnumerator parent) { Require(parent.MoveNext() && parent.Current is IEnumerator, "Missing resolution stage."); return (IEnumerator)parent.Current; }
+    static void CheckGeometry(BerdlySonicWave wave, bool player)
+    {
+        using (var mesh = new VertexHelper())
+        {
+            typeof(BerdlySonicWave).GetMethod("OnPopulateMesh", Private | BindingFlags.DeclaredOnly).Invoke(wave, new object[] { mesh });
+            Require(mesh.currentVertCount == 3 * 2 * 24 * 4, "Expected three glow/core crescents.");
+            var lower = new UIVertex(); var middle = new UIVertex(); mesh.PopulateUIVertex(ref lower, 0); mesh.PopulateUIVertex(ref middle, 12 * 4);
+            Require(player ? middle.position.x > lower.position.x : middle.position.x < lower.position.x, "Wrong parenthesis facing direction.");
+        }
+    }
+    static void Capture(GameObject root, string path)
+    {
+        foreach (var child in root.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+        var obj = new GameObject("BerdlyFeedbackCamera"); obj.hideFlags = HideFlags.HideAndDontSave;
+        var camera = obj.AddComponent<Camera>(); camera.orthographic = true; camera.orthographicSize = 540;
+        camera.transform.position = root.transform.position - Vector3.forward * 10; camera.cullingMask = 1 << 30;
+        camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = Color.black;
+        root.GetComponent<Canvas>().worldCamera = camera;
+        var target = new RenderTexture(960, 540, 24); camera.targetTexture = target;
+        Texture2D image = null; var old = RenderTexture.active;
+        try { root.SetActive(true); Canvas.ForceUpdateCanvases(); camera.Render(); RenderTexture.active = target;
+            image = new Texture2D(960, 540, TextureFormat.RGB24, false); image.ReadPixels(new Rect(0, 0, 960, 540), 0, 0); image.Apply(); File.WriteAllBytes(path, image.EncodeToPNG()); }
+        finally { RenderTexture.active = old; camera.targetTexture = null; Object.DestroyImmediate(obj); Object.DestroyImmediate(target); if (image != null) Object.DestroyImmediate(image); }
+    }
+    static object Call(object obj, string method, params object[] args) => obj.GetType().GetMethod(method, Private).Invoke(obj, args);
+    static T Field<T>(object obj, string name) => (T)obj.GetType().GetField(name, Private).GetValue(obj);
+    static void Set(object obj, string name, object value) => obj.GetType().GetField(name, Private).SetValue(obj, value);
+    static void Value(object obj, string name, object value) => obj.GetType().GetField("<" + name + ">k__BackingField", Private).SetValue(obj, value);
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

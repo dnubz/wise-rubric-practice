@@ -1,0 +1,43 @@
+
+using UnityEngine;
+
+public class SpriteItemBobber : MonoBehaviour
+{
+    float baseY;
+    float amplitude;
+    float speed;
+    float offset;
+    bool spinWhileBobbing;
+    float rotationSpeed;
+
+    public void Initialize(float amplitude, float speed, float baseY)
+    {
+        Initialize(amplitude, speed, baseY,
+            (float)WorldRandom.AtPosition(transform.position, 0x424F4242).NextDouble() * Mathf.PI * 2, false, 0f);
+    }
+
+    public void Initialize(float amplitude, float speed, float baseY, float phaseOffset,
+        bool spin, float degreesPerSecond)
+    {
+        this.amplitude = amplitude;
+        this.speed = speed;
+        this.baseY = baseY;
+        offset = phaseOffset;
+        spinWhileBobbing = spin;
+        rotationSpeed = degreesPerSecond;
+    }
+
+    void Update()
+    {
+        float y = baseY + Mathf.Sin((Time.time + offset) * speed) * amplitude;
+
+        transform.position = new Vector3(
+            transform.position.x,
+            y,
+            transform.position.z
+        );
+
+        if (spinWhileBobbing)
+            transform.Rotate(Vector3.up, rotationSpeed * Time.deltaTime, Space.World);
+    }
+}

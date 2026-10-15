@@ -1,0 +1,11 @@
+using UnityEngine;
+
+[CreateAssetMenu(menuName = "WiSe/Battle/Enemy")]
+public sealed class BattleEnemyData : ScriptableObject
+{
+    public BattleEnemyKind kind;
+    public string displayName;
+    public GameObject prefab;
+    public int hp = 140, attack = 60, defense = 12, experience = 25;
+    public float movementRange = 6, attackRange = 2.8f;
+}

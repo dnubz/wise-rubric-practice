@@ -1,0 +1,43 @@
+using UnityEngine;
+
+[RequireComponent(typeof(BattleAppearance))]
+public sealed class BattleCover : MonoBehaviour
+{
+    public int HP { get; private set; } = 100;
+    public Transform shape;
+    public BoxCollider box;
+    public GameObject topHalf, breakEffect;
+    Vector3 fullScale, fullSize, fullCenter;
+    Vector3 fullShapePosition;
+    bool topBroken;
+    public bool HalfCovered => HP > 0 && HP <= 50;
+    void Awake() { fullScale = shape.localScale; fullShapePosition = shape.localPosition; fullSize = box.size; fullCenter = box.center; }
+    public void Damage(int attack)
+    {
+        if (HP <= 0) return; HP = Mathf.Max(0, HP - Mathf.Max(1, attack));
+        BattleController.Instance?.Popup(transform.position + Vector3.up, attack.ToString(), Color.yellow);
+        if (HP == 0) { gameObject.SetActive(false); BattleController.Instance?.RebuildGround(); return; }
+        if (HalfCovered && !topBroken)
+        {
+            topBroken = true;
+            if (breakEffect != null)
+            {
+                Vector3 point = transform.TransformPoint(fullCenter + Vector3.up * fullSize.y * .25f);
+                var effect = Instantiate(breakEffect, point, transform.rotation);
+                var particles = effect.GetComponent<ParticleSystem>(); var emission = particles.shape;
+                emission.scale = Vector3.Scale(new Vector3(fullSize.x, fullSize.y * .5f, fullSize.z), transform.lossyScale);
+                Destroy(effect, 2);
+            }
+            // Authored walls have separate upper/lower meshes: remove the
+            // upper stones, rather than compressing the whole wall.
+            if (topHalf != null) topHalf.SetActive(false);
+            else
+            {
+                shape.localScale = new Vector3(fullScale.x, fullScale.y * .5f, fullScale.z);
+                shape.localPosition = fullShapePosition - Vector3.up * fullSize.y * .25f;
+            }
+            box.size = new Vector3(fullSize.x, fullSize.y * .5f, fullSize.z);
+            box.center = fullCenter - Vector3.up * fullSize.y * .25f;
+        }
+    }
+}

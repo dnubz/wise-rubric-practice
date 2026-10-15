@@ -1,0 +1,160 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class NPCShopChecks
+{
+    const string Folder = "Temp/NPCShops";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double resume;
+    static NPCShopChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < resume) return;
+        if (routine == null)
+        {
+            if (!File.Exists(Folder + "/check.request")) return;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+            File.Delete(Folder + "/check.request"); routine = Run();
+        }
+        try
+        {
+            if (routine.MoveNext()) { resume = EditorApplication.timeSinceStartup + (routine.Current is float seconds ? seconds : .05f); return; }
+            ((IDisposable)routine).Dispose(); routine = null;
+            File.WriteAllText(Folder + "/check-result.txt", "PASS: saved UI renders both empty and populated states for all four resources; Cancel preserves inventory; Sell All awards the PDF prices and removes only the selected resource; a second sale awards nothing; live quantities refresh. Normal NPCs auto-type and auto-advance; F finishes a sentence without advancing it; interactable and minigame NPCs wait for another F press, and show saved F prompts. Minigame theme music remains assigned.");
+            EditorApplication.isPlaying = false;
+        }
+        catch (Exception error)
+        {
+            ((IDisposable)routine)?.Dispose(); routine = null;
+            File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); EditorApplication.isPlaying = false;
+        }
+    }
+
+    static IEnumerator Run()
+    {
+        var world = WFCWorldManager.Instance; world.enabled = false;
+        var activeNPCs = Object.FindObjectsByType<NPCBase>().Where(n => n.enabled).ToArray();
+        foreach (var npc in activeNPCs) npc.enabled = false;
+        var ui = Object.FindAnyObjectByType<ResourceSellUI>(); var inventory = Object.FindAnyObjectByType<Inventory>();
+        var wallet = PlayerInventory.Instance; int originalGold = wallet.Gold;
+        var originalItems = inventory.Slots.Select(s => s.Item).ToArray();
+        var owned = new GameObject("NPCShopCheckFixtures"); owned.transform.position = Vector3.one * 10000;
+        try
+        {
+            Require(ui != null && !ui.IsOpen, "Saved shop UI is missing or opens at startup.");
+            string[] names = { "Wood", "Rock", "Cactus", "Mushroom" }; int[] prices = { 30, 40, 50, 60 };
+            var resources = names.Select(n => AssetDatabase.LoadAssetAtPath<ResourceItem>("Assets/Scripts/Inventory/Items/Resource/" + n + ".asset")).ToArray();
+            foreach (var item in resources) inventory.RemoveAll(item);
+            for (int i = 0; i < names.Length; i++)
+            {
+                var merchant = Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/NPCMerchants/" + names[i] + "Merchant.prefab"), owned.transform).GetComponent<InteractableNPC>(); merchant.enabled = false;
+                Require(merchant.BoughtResource == resources[i] && resources[i].Cost == prices[i], "Wrong merchant resource or PDF price.");
+                ui.Open(merchant);
+                var fields = new SerializedObject(ui); var title = (TMP_Text)fields.FindProperty("title").objectReferenceValue;
+                var details = (TMP_Text)fields.FindProperty("details").objectReferenceValue;
+                var sell = (Button)fields.FindProperty("sellButton").objectReferenceValue;
+                var cancel = (Button)fields.FindProperty("closeButton").objectReferenceValue;
+                Require(title.text.Contains("no") && !sell.interactable && ResourceSellUI.BlocksGameplayInput, "Empty state or movement blocker is missing.");
+                if (i == 0) Capture(ui, "empty");
+                ui.SellAll(); Require(wallet.Gold == originalGold, "Empty sale grants gold.");
+                for (int n = 0; n < 4; n++) inventory.AddItem(resources[i]);
+                Require(sell.interactable && details.text.Contains((4 * prices[i]).ToString()), "Live inventory changes do not refresh the sale.");
+                if (i == 0) Capture(ui, "wood");
+                cancel.onClick.Invoke(); Require(!ui.IsOpen && inventory.GetItemCount(resources[i]) == 4 && wallet.Gold == originalGold, "Cancel changes inventory or gold.");
+                ui.Open(merchant);
+                var other = resources[(i + 1) % 4]; inventory.AddItem(other);
+                int gold = wallet.Gold; sell.onClick.Invoke();
+                Require(wallet.Gold == gold + 4 * prices[i] && inventory.GetItemCount(resources[i]) == 0 && inventory.GetItemCount(other) == 1, "Sell All changes the wrong inventory or gold.");
+                if (i == 0) Capture(ui, "receipt");
+                ui.SellAll(); Require(wallet.Gold == gold + 4 * prices[i], "A duplicate confirmation awards gold twice.");
+                inventory.RemoveAll(other); ui.Close(); wallet.SetGold(originalGold);
+                Object.Destroy(merchant.gameObject); yield return .1f;
+            }
+            var normal = Fixture<NormalNPC>(owned.transform); Configure(normal, .15f); normal.SetDialogue("Normal check", "One.", "Two.");
+            yield return .1f; normal.StartDialogue(); yield return .25f;
+            var bubble = normal.GetComponentInChildren<NPCSpeechBubble>(true); var text = bubble.GetComponentInChildren<TextMeshProUGUI>(true);
+            Require(Value<bool>(normal, "isTyping") && text.maxVisibleCharacters > 0 && text.maxVisibleCharacters < 4, "Dialogue is not typed one character at a time.");
+            PressF(normal); Require(!Value<bool>(normal, "isTyping") && Value<int>(normal, "currentLineIndex") == 0 && text.maxVisibleCharacters == int.MaxValue, "F does not finish only the current sentence.");
+            yield return .25f; Require(Value<int>(normal, "currentLineIndex") == 1, "Normal NPC does not auto-advance.");
+            PressF(normal); yield return .25f; Require(!Value<bool>(normal, "isDialogueActive"), "Normal NPC does not finish its dialogue.");
+            Object.Destroy(normal.gameObject); yield return .1f;
+
+            var interact = Fixture<InteractableNPC>(owned.transform); Configure(interact, .15f); interact.SetDialogue("Marlow", "One.", "Two.");
+            typeof(InteractableNPC).GetField("resourceToBuy", Private).SetValue(interact, resources[0]);
+            yield return .1f; interact.StartDialogue(); PressF(interact); yield return .25f;
+            Require(Value<int>(interact, "currentLineIndex") == 0 && !ui.IsOpen, "Interactable NPC advances or opens its shop automatically.");
+            PressF(interact); PressF(interact); Require(!ui.IsOpen && Value<int>(interact, "currentLineIndex") == 1, "Skipping the last sentence opens the shop immediately.");
+            PressF(interact); Require(ui.IsOpen, "F after the final sentence does not open the shop.");
+            ui.Close(); Object.Destroy(interact.gameObject); yield return .1f;
+
+            var minigame = Fixture<MinigameNPC>(owned.transform); Configure(minigame, .15f); minigame.SetDialogue("Berdly", "One.", "Two.");
+            minigame.transform.position = CharacterSwitchManager.CurrentCharacterTransform.position + Vector3.right * 2;
+            yield return .1f; minigame.StartDialogue();
+            Require(Value<bool>(minigame, "isDialogueActive"), "Minigame dialogue cannot start; blocked=" + NPCChallengePrompt.BlocksGameplayInput + "; nearby=" + Value<bool>(minigame, "isPlayerNearby"));
+            PressF(minigame); yield return .25f;
+            Require(Value<int>(minigame, "currentLineIndex") == 0 && Value<bool>(minigame, "isDialogueActive"), "Minigame NPC auto-advances; index=" + Value<int>(minigame, "currentLineIndex") + "; active=" + Value<bool>(minigame, "isDialogueActive") + "; nearby=" + Value<bool>(minigame, "isPlayerNearby"));
+            Require(minigame.GetComponentInChildren<NPCSpeechBubble>(true).transform.Find("InteractPrompt").gameObject.activeSelf, "Minigame lacks its saved F prompt.");
+            PressF(minigame); PressF(minigame); Require(!NPCChallengePrompt.IsOpen, "Finishing the sentence starts the challenge without another F.");
+            PressF(minigame); Require(NPCChallengePrompt.IsOpen, "Final F does not open the challenge.");
+            minigame.OnDeclineChallengeClicked();
+            foreach (string name in new[] { "Berdly", "Pink" }) Require(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/" + name + ".prefab").GetComponent<MinigameNPC>().ApproachMusic != null, "Minigame theme missing.");
+            Require(typeof(NPCBase).GetMethod("OnFKeyHeld", Private) == null, "Held F can still race through sentences.");
+        }
+        finally
+        {
+            ui?.Close(); Object.Destroy(owned);
+            foreach (var item in inventory.Slots.Select(s => s.Item).Distinct().ToArray()) inventory.RemoveAll(item);
+            foreach (var item in originalItems) inventory.AddItem(item);
+            wallet.SetGold(originalGold); foreach (var npc in activeNPCs) if (npc != null) npc.enabled = true; world.enabled = true;
+        }
+    }
+    static T Fixture<T>(Transform parent) where T : NPCBase
+    {
+        var root = new GameObject(typeof(T).Name); root.transform.SetParent(parent, false);
+        Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/UI/SpeechBubbleCanvas.prefab"), root.transform);
+        return root.AddComponent<T>();
+    }
+    static void Configure(NPCBase npc, float typing)
+    {
+        typeof(NPCBase).GetField("typingSpeed", Private).SetValue(npc, typing);
+        if (npc is NormalNPC) typeof(NormalNPC).GetField("autoAdvanceDelay", Private).SetValue(npc, .15f);
+    }
+    static T Value<T>(NPCBase npc, string field) => (T)typeof(NPCBase).GetField(field, Private).GetValue(npc);
+    static void PressF(NPCBase npc) => typeof(NPCBase).GetMethod("OnFKeyPressed", Private).Invoke(npc, null);
+    static void Capture(ResourceSellUI ui, string name)
+    {
+        var root = ui.transform; var parent = root.parent; int sibling = root.GetSiblingIndex();
+        var canvas = ui.GetComponent<Canvas>(); var mode = canvas.renderMode; var worldCamera = canvas.worldCamera;
+        var transforms = root.GetComponentsInChildren<Transform>(true); var layers = transforms.Select(t => t.gameObject.layer).ToArray();
+        var owned = new GameObject("ShopPreviewCamera"); var camera = owned.AddComponent<Camera>(); var target = new RenderTexture(1280, 720, 24);
+        var pixels = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            root.SetParent(null, false); camera.targetTexture = target; camera.cullingMask = 1 << 30;
+            camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.16f, .19f, .15f);
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = 1;
+            foreach (var child in transforms) child.gameObject.layer = 30;
+            Canvas.ForceUpdateCanvases();
+            foreach (var text in root.GetComponentsInChildren<TMP_Text>()) { text.ForceMeshUpdate(); Require(!text.isTextOverflowing, "Shop text does not fit: " + text.name); }
+            camera.Render(); RenderTexture.active = target; pixels.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); pixels.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", pixels.EncodeToPNG());
+        }
+        finally
+        {
+            root.SetParent(parent, false); root.SetSiblingIndex(sibling); canvas.renderMode = mode; canvas.worldCamera = worldCamera;
+            for (int i = 0; i < transforms.Length; i++) transforms[i].gameObject.layer = layers[i];
+            RenderTexture.active = previous; Object.DestroyImmediate(owned); Object.DestroyImmediate(target); Object.DestroyImmediate(pixels);
+        }
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}

@@ -1,0 +1,44 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Two key slots anchored to the bottom left; refreshes only when key counts change.</summary>
+public sealed class DungeonKeyHud : MonoBehaviour
+{
+    public static Color KeyColour(DungeonKeyKind key) => key == DungeonKeyKind.Boss ?
+        new Color(1, .12f, .12f) : new Color(1, .89f, .12f);
+    TextMeshProUGUI originalCount, bossCount;
+    GameObject bossIcon, bossBadge;
+
+    public void Initialize(Transform parent)
+    {
+        var root = Rect("KeySlots", parent, new Vector2(28, 28), new Vector2(196, 94));
+        CreateSlot(root, 0, KeyColour(DungeonKeyKind.Original), out originalCount, out _, out _);
+        CreateSlot(root, 106, KeyColour(DungeonKeyKind.Boss), out bossCount, out bossIcon, out bossBadge);
+        Refresh(0, 0);
+    }
+    public void Refresh(int original, int boss)
+    {
+        originalCount.text = original + "x"; bossCount.text = boss + "x";
+        bossIcon.SetActive(boss > 0); bossBadge.SetActive(boss > 0);
+    }
+    static void CreateSlot(Transform parent, float x, Color keyColour, out TextMeshProUGUI count, out GameObject icon, out GameObject badge)
+    {
+        var slot = Rect(x == 0 ? "OriginalKeySlot" : "BossKeySlot", parent, new Vector2(x, 10), new Vector2(84, 84));
+        var frame = slot.gameObject.AddComponent<DungeonKeyGraphic>(); frame.kind = DungeonKeyGraphic.Kind.Frame;
+        var key = Rect("KeyIcon", slot, new Vector2(10, 10), new Vector2(64, 64));
+        var graphic = key.gameObject.AddComponent<DungeonKeyGraphic>(); graphic.kind = DungeonKeyGraphic.Kind.Key; graphic.color = keyColour;
+        icon = key.gameObject;
+        var badgeRect = Rect("CountBadge", slot, new Vector2(62, -10), new Vector2(36, 36)); badge = badgeRect.gameObject;
+        var background = badge.AddComponent<DungeonKeyGraphic>(); background.kind = DungeonKeyGraphic.Kind.Badge;
+        count = DungeonSession.UILabel("Count", badgeRect, Vector2.zero, new Vector2(34, 30), 17);
+        count.fontStyle = FontStyles.Bold; count.enableAutoSizing = true; count.fontSizeMin = 10; count.fontSizeMax = 17;
+        count.raycastTarget = false;
+    }
+    static RectTransform Rect(string name, Transform parent, Vector2 position, Vector2 size)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = rect.pivot = Vector2.zero;
+        rect.anchoredPosition = position; rect.sizeDelta = size; return rect;
+    }
+}

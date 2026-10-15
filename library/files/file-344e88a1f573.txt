@@ -1,0 +1,38 @@
+using UnityEngine;
+using UnityEngine.AI;
+
+// Small rig for the existing skull/minion assets, which do not have humanoid animation avatars.
+public sealed class BattleEnemyMotion : MonoBehaviour
+{
+    public Transform visual, leftLeg, rightLeg, weaponArm;
+    NavMeshAgent agent;
+    float strike, phase;
+    Vector3 rest;
+    Quaternion visualRotation, weaponRotation;
+    void Awake()
+    {
+        agent = GetComponent<NavMeshAgent>();
+        if (visual != null) { rest = visual.localPosition; visualRotation = visual.localRotation; }
+        if (weaponArm != null) weaponRotation = weaponArm.localRotation;
+    }
+    public void Strike() => strike = .45f;
+    void Update()
+    {
+        if (BattleSession.MenuOpen || NPCChallengePrompt.BlocksGameplayInput || CheatConsole.BlocksGameplayInput) return;
+        float speed = agent != null && agent.enabled && agent.isOnNavMesh ? agent.velocity.magnitude : 0;
+        var unit = GetComponent<BattleUnit>();
+        var encounter = GetComponent<EncounterEnemy>();
+        bool ranged = (unit != null && unit.enemy != null ? unit.enemy.kind : encounter != null && encounter.data != null ? encounter.data.kind : BattleEnemyKind.Skeleton) == BattleEnemyKind.Minion;
+        phase += Time.deltaTime * (speed > .1f ? 9 : 2); strike = Mathf.Max(0, strike - Time.deltaTime);
+        float progress = 1 - strike / .45f;
+        float swing = strike > 0 ? Mathf.Sin(progress * Mathf.PI) : 0;
+        if (visual != null)
+        {
+            visual.localPosition = rest + Vector3.up * Mathf.Sin(phase) * (speed > .1f ? .08f : .025f) + Vector3.forward * swing * (ranged ? -.16f : .18f);
+            visual.localRotation = visualRotation * Quaternion.Euler(ranged ? swing * -12 : 0, ranged ? 0 : swing * 20, Mathf.Sin(phase) * Mathf.Min(3, speed));
+        }
+        if (leftLeg != null) leftLeg.localRotation = Quaternion.Euler(Mathf.Sin(phase) * Mathf.Min(30, speed * 8), 0, 0);
+        if (rightLeg != null) rightLeg.localRotation = Quaternion.Euler(-Mathf.Sin(phase) * Mathf.Min(30, speed * 8), 0, 0);
+        if (weaponArm != null) weaponArm.localRotation = weaponRotation * Quaternion.Euler(-swing * 100 + Mathf.Sin(phase) * Mathf.Min(15, speed * 4), swing * -35, 0);
+    }
+}

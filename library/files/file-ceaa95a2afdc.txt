@@ -1,0 +1,81 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[InitializeOnLoad]
+public static class MarioChartPreviewSetup
+{
+    const string Folder = "Temp/RhythmAnalysis";
+    public const string ChartPath = "Assets/Resources/Rhythm/RainbowRoad_First10Seconds.txt";
+    static double nextCheck;
+    static MarioChartPreviewSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        foreach (string action in new[] { "export", "export-full", "setup", "speed" })
+        {
+            string request = Folder + "/" + action + ".request";
+            if (!File.Exists(request)) continue;
+            File.Delete(request);
+            try
+            {
+                if (action == "export" || action == "export-full") ExportOpening(action == "export-full"); else if (action == "speed") SetNoteSpeed(); else Build();
+                File.WriteAllText(Folder + "/" + action + "-result.txt", "PASS");
+            }
+            catch (Exception error) { File.WriteAllText(Folder + "/" + action + "-result.txt", error.ToString()); Debug.LogException(error); }
+        }
+    }
+    [MenuItem("WiSe/Set Mario Note Speed to 450")]
+    public static void SetNoteSpeed()
+    {
+        Scene scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var controller = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<PinkRhythmController>(true)).First();
+            Undo.RecordObject(controller, "Increase Mario note speed");
+            var fields = new SerializedObject(controller);
+            fields.FindProperty("pixelsPerSecond").floatValue = 450;
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+    static void ExportOpening(bool fullSong = false)
+    {
+        var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(OverworldMusicSetup.MusicFolder + OverworldMusicSetup.MarioSong);
+        clip.LoadAudioData(); var data = new float[fullSong ? clip.samples * clip.channels : clip.frequency * clip.channels * 12];
+        if (!clip.GetData(data, 0)) throw new InvalidOperationException("Cannot read the song's decoded opening.");
+        using (var writer = new BinaryWriter(File.Create(Folder + (fullSong ? "/unity-full.f32" : "/unity-opening.f32")))) foreach (float sample in data) writer.Write(sample);
+        File.WriteAllText(Folder + "/unity-audio.txt", clip.frequency + "\n" + clip.channels);
+    }
+    [MenuItem("WiSe/Enable Mario 10 Second Chart Preview")]
+    public static void Build()
+    {
+        AssetDatabase.ImportAsset(ChartPath);
+        var chart = AssetDatabase.LoadAssetAtPath<TextAsset>(ChartPath);
+        var parsed = PinkBeatmap.Parse(chart.text);
+        if (parsed.AudioStartSeconds != 0 || parsed.Notes.Any(n => n.End >= 10)) throw new InvalidOperationException("Preview must use only the song's first ten seconds.");
+        Scene scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var controller = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<PinkRhythmController>(true)).First();
+            Undo.RecordObject(controller, "Enable ten-second chart preview");
+            var fields = new SerializedObject(controller);
+            fields.FindProperty("previewBeatmap").objectReferenceValue = chart;
+            fields.FindProperty("previewSeconds").floatValue = 10;
+            fields.FindProperty("usePreviewChart").boolValue = true;
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+}

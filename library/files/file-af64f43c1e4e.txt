@@ -1,0 +1,91 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DungeonTravelFeedbackSetup
+{
+    const string Folder = "Temp/DungeonTravelFeedback";
+    const string AudioFolder = "Assets/Imported Assets/Audio/SFX/Dungeon/";
+    static double next;
+    static DungeonTravelFeedbackSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        if (EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = false; return; }
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved room fade and preloaded PCM pickup/wood impact clips with leading silence removed."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + error); Debug.LogException(error); }
+    }
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder); AssetDatabase.Refresh();
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        settings.coinPickupSound = ImmediateClip("Collect Coin Sound Effect", "Coin Pickup Immediate");
+        settings.breakingImpactSound = ImmediateClip("wooden-box-breaking-sound-effects_KKsee2Bg", "Wooden Box Break Impact");
+        settings.breakingImpactStartSeconds = 0;
+        settings.roomTransitionPrefab = BuildFade();
+        settings.roomFadeOutSeconds = .18f; settings.roomFadeInSeconds = .22f;
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssetIfDirty(settings);
+    }
+    public static AudioClip ImmediateClip(string sourceName, string outputName)
+    {
+        Directory.CreateDirectory(Folder);
+        string sourcePath = AudioFolder + sourceName + ".mp3";
+        var importer = (AudioImporter)AssetImporter.GetAtPath(sourcePath);
+        if (importer == null) throw new Exception("Missing source sound: " + sourcePath);
+        var sample = importer.defaultSampleSettings;
+        sample.loadType = AudioClipLoadType.DecompressOnLoad; sample.preloadAudioData = true;
+        importer.defaultSampleSettings = sample; importer.SaveAndReimport();
+        var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(sourcePath); clip.LoadAudioData();
+        var pcm = new float[clip.samples * clip.channels];
+        if (!clip.GetData(pcm, 0)) throw new Exception("Could not decode " + sourceName);
+        int first = Array.FindIndex(pcm, value => Mathf.Abs(value) > .008f);
+        if (first < 0) throw new Exception("Sound contains no audible samples: " + sourceName);
+        int frame = Math.Max(0, first / clip.channels - Mathf.RoundToInt(clip.frequency * .002f));
+        string outputPath = AudioFolder + outputName + ".wav";
+        byte[] bytes;
+        using (var memory = new MemoryStream())
+        using (var writer = new BinaryWriter(memory))
+        {
+            int samples = pcm.Length - frame * clip.channels, dataBytes = samples * 2;
+            writer.Write(Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + dataBytes); writer.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+            writer.Write(16); writer.Write((short)1); writer.Write((short)clip.channels); writer.Write(clip.frequency);
+            writer.Write(clip.frequency * clip.channels * 2); writer.Write((short)(clip.channels * 2)); writer.Write((short)16);
+            writer.Write(Encoding.ASCII.GetBytes("data")); writer.Write(dataBytes);
+            for (int i = frame * clip.channels; i < pcm.Length; i++) writer.Write((short)Mathf.RoundToInt(Mathf.Clamp(pcm[i], -1, 1) * 32767));
+            writer.Flush(); bytes = memory.ToArray();
+        }
+        if (!File.Exists(outputPath) || !File.ReadAllBytes(outputPath).SequenceEqual(bytes)) File.WriteAllBytes(outputPath, bytes);
+        AssetDatabase.ImportAsset(outputPath);
+        importer = (AudioImporter)AssetImporter.GetAtPath(outputPath); sample = importer.defaultSampleSettings;
+        sample.loadType = AudioClipLoadType.DecompressOnLoad; sample.compressionFormat = AudioCompressionFormat.PCM; sample.preloadAudioData = true;
+        importer.defaultSampleSettings = sample; importer.SaveAndReimport();
+        File.WriteAllText(Folder + "/" + outputName + "-onset.txt", $"Source: {sourceName}\nRemoved leading silence: {(float)frame / clip.frequency:F4}s\nDuration: {clip.length:F3}s\nPlayback: preloaded PCM, 2ms preroll before audible onset.");
+        return AssetDatabase.LoadAssetAtPath<AudioClip>(outputPath);
+    }
+    static DungeonRoomTransition BuildFade()
+    {
+        var root = new GameObject("DungeonRoomTransition", typeof(RectTransform), typeof(Canvas), typeof(CanvasGroup), typeof(GraphicRaycaster));
+        try
+        {
+            var canvas = root.GetComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = 5000;
+            var cover = root.GetComponent<CanvasGroup>(); cover.alpha = 0; cover.blocksRaycasts = false;
+            var image = new GameObject("Black Cover", typeof(RectTransform), typeof(Image));
+            var rect = (RectTransform)image.transform; rect.SetParent(root.transform, false);
+            rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one; rect.sizeDelta = Vector2.zero;
+            image.GetComponent<Image>().color = Color.black;
+            var controller = root.AddComponent<DungeonRoomTransition>();
+            var data = new SerializedObject(controller); data.FindProperty("cover").objectReferenceValue = cover; data.ApplyModifiedPropertiesWithoutUndo();
+            return PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Dungeon/DungeonRoomTransition.prefab").GetComponent<DungeonRoomTransition>();
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+}

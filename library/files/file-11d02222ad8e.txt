@@ -1,0 +1,72 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public sealed class BattleCamera : MonoBehaviour
+{
+    public Camera view;
+    public Transform focus;
+    public Vector3 centre;
+    public float yaw = 45, tilt = 36, distance = 16;
+    public float focusWeight = 1;
+    public float minimumDistance = 8, maximumDistance = 24;
+    public float minimumTilt = 24, maximumTilt = 48;
+    public bool FirstPerson { get; set; }
+    float aimYaw, aimTilt;
+    public void SetFirstPerson(bool value)
+    { FirstPerson = value; if (value) { aimYaw = focus != null ? focus.eulerAngles.y : yaw; aimTilt = 0; } }
+    public void FrameGroup(Transform focusTarget, IEnumerable<Transform> subjects)
+    {
+        if (view == null || focusTarget == null) return;
+        var bounds = new Bounds(focusTarget.position, Vector3.zero);
+        foreach (var subject in subjects)
+        {
+            if (subject == null) continue;
+            bounds.Encapsulate(subject.position);
+            if (subject.TryGetComponent<Collider>(out var body) && body.enabled) bounds.Encapsulate(body.bounds);
+            else foreach (var renderer in subject.GetComponentsInChildren<Renderer>())
+                if (renderer.enabled) bounds.Encapsulate(renderer.bounds);
+        }
+        // Include headroom for enemy health bars and the performer's animated model.
+        bounds.Expand(3);
+        focusTarget.position = bounds.center - Vector3.up * 1.5f;
+        focus = focusTarget; focusWeight = 1;
+        var inverse = Quaternion.Inverse(Quaternion.Euler(tilt, yaw, 0));
+        float vertical = Mathf.Tan(view.fieldOfView * .5f * Mathf.Deg2Rad);
+        float horizontal = vertical * Mathf.Max(.1f, view.aspect);
+        float required = 12;
+        for (int i = 0; i < 8; i++)
+        {
+            var corner = bounds.center + Vector3.Scale(bounds.extents,
+                new Vector3((i & 1) == 0 ? -1 : 1, (i & 2) == 0 ? -1 : 1, (i & 4) == 0 ? -1 : 1));
+            Vector3 local = inverse * (corner - bounds.center);
+            required = Mathf.Max(required, Mathf.Abs(local.x) / horizontal - local.z,
+                Mathf.Abs(local.y) / vertical - local.z, view.nearClipPlane + 1 - local.z);
+        }
+        distance = required * 1.08f;
+        view.farClipPlane = Mathf.Max(view.farClipPlane, distance + bounds.size.magnitude + 10);
+    }
+    public void Zoom(float steps)
+    {
+        if (FirstPerson || Mathf.Abs(steps) < .001f) return;
+        distance = Mathf.Clamp(distance - steps * 1.1f, minimumDistance, maximumDistance);
+        tilt = Mathf.Lerp(minimumTilt, maximumTilt, Mathf.InverseLerp(minimumDistance, maximumDistance, distance));
+    }
+    void LateUpdate()
+    {
+        if (view == null || BattleSession.MenuOpen || CheatConsole.BlocksGameplayInput) return;
+        var keyboard = Keyboard.current; var mouse = Mouse.current;
+        if (FirstPerson && focus != null)
+        {
+            if (mouse != null) { var delta = mouse.delta.ReadValue(); aimYaw += delta.x * .10f; aimTilt = Mathf.Clamp(aimTilt - delta.y * .10f, -65, 65); }
+            view.transform.SetPositionAndRotation(focus.position + Vector3.up * 2.4f + focus.forward * .7f, Quaternion.Euler(aimTilt, aimYaw, 0));
+            return;
+        }
+        if (keyboard != null) yaw += ((keyboard.eKey.isPressed ? 1 : 0) - (keyboard.qKey.isPressed ? 1 : 0)) * 75 * Time.deltaTime;
+        if (mouse != null && !PinkRhythmController.IsOpen) Zoom(mouse.scroll.ReadValue().y / 120f);
+        var rotation = Quaternion.Euler(tilt, yaw, 0);
+        Vector3 point = centre + Vector3.up;
+        if (focus != null) point = Vector3.Lerp(point, focus.position + Vector3.up * 1.5f, focusWeight);
+        view.transform.SetPositionAndRotation(Vector3.Lerp(view.transform.position, point - rotation * Vector3.forward * distance, 1 - Mathf.Exp(-8 * Time.deltaTime)), Quaternion.Slerp(view.transform.rotation, rotation, 1 - Mathf.Exp(-8 * Time.deltaTime)));
+    }
+}

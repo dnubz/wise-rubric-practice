@@ -1,0 +1,24 @@
+using System;
+using UnityEngine;
+
+[Serializable]
+public class LootEntry
+{
+    [Tooltip("The item that can be awarded.")]
+    [SerializeField] private Item item;
+
+    [Tooltip("Relative weight for random selection. Higher weight = more frequent.")]
+    [Range(1, 100)]
+    [SerializeField] private int weight = 10;
+
+    public Item Item => item;
+    public int Weight => weight;
+
+    public LootEntry() { }
+
+    public LootEntry(Item item, int weight)
+    {
+        this.item = item;
+        this.weight = weight;
+    }
+}

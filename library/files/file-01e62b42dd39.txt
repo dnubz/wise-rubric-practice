@@ -1,0 +1,365 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using TMPro;
+
+/// <summary>
+/// Attached to a Healing Spot in the world.
+/// Automatically detects when the player steps onto the spot,
+/// restores HP and SP to all party characters, plays the heal sound effect,
+/// emits bonus particles, and displays a floating notification.
+/// </summary>
+[RequireComponent(typeof(SphereCollider))]
+public class HealingSpot : MonoBehaviour
+{
+    [Header("Detection Settings")]
+    [Tooltip("Radius around the healing spot center where player is healed.")]
+    [SerializeField] private float healRadius = 2.2f;
+
+    [Header("Cooldown Settings")]
+    [Tooltip("Cooldown in seconds before the healing spot can heal again while staying on it.")]
+    [SerializeField] private float healCooldown = 3.0f;
+
+    [Header("Audio Settings")]
+    [Tooltip("Audio clip played when characters are healed.")]
+    [SerializeField] private AudioClip healSound;
+    [Range(0f, 1f)]
+    [SerializeField] private float soundVolume = 0.9f;
+
+    [Header("Visual Feedback")]
+    [Tooltip("World offset for the floating notification text.")]
+    [SerializeField] private Vector3 promptOffset = new Vector3(0, 1.8f, 0);
+
+    [Tooltip("Notification text displayed when party is healed.")]
+    [SerializeField] private string healMessage = "★ HP & SP Restored! ★";
+
+    [Tooltip("Duration of floating text display.")]
+    [SerializeField] private float messageDuration = 2.0f;
+
+    private Transform playerTransform;
+    private ParticleSystem particleSys;
+    private float lastHealTime = -999f;
+    private bool wasPlayerInRange = false;
+
+    private GameObject promptUI;
+    private TextMeshProUGUI promptTextMesh;
+    private Coroutine messageCoroutine;
+
+    private void Awake()
+    {
+        // Automatically adapt healRadius to the visual Cylinder size if scaled up
+        Transform cylinder = transform.Find("Cylinder");
+        if (cylinder != null)
+        {
+            float maxVisualRadius = Mathf.Max(cylinder.localScale.x, cylinder.localScale.z) * 0.5f;
+            if (maxVisualRadius > healRadius)
+            {
+                healRadius = maxVisualRadius + 0.3f;
+            }
+        }
+
+        SphereCollider sc = GetComponent<SphereCollider>();
+        if (sc != null)
+        {
+            sc.isTrigger = true;
+            sc.radius = healRadius;
+            sc.center = new Vector3(0, 0.5f, 0);
+        }
+
+        // Make sure all colliders on this object hierarchy are triggers so player doesn't bump into them
+        Collider[] colliders = GetComponentsInChildren<Collider>();
+        foreach (Collider col in colliders)
+        {
+            col.isTrigger = true;
+        }
+
+        particleSys = GetComponentInChildren<ParticleSystem>();
+
+        SetupPromptUI();
+
+#if UNITY_EDITOR
+        if (healSound == null)
+        {
+            healSound = UnityEditor.AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/SFX/Overworld/HealingPoint.mp3");
+        }
+#endif
+    }
+
+    private void Start()
+    {
+        SetPromptVisible(false);
+    }
+
+    private void Update()
+    {
+        CheckPlayerDistance();
+    }
+
+    private void CheckPlayerDistance()
+    {
+        // Always get current active character (supports switching between WiSe, RandaL, Druid)
+        playerTransform = GetActivePlayerTransform();
+        if (playerTransform == null) return;
+
+        // Horizontal distance check (ignoring small elevation differences)
+        Vector3 playerPos = playerTransform.position;
+        Vector3 spotPos = transform.position;
+        float horizontalDist = Vector2.Distance(
+            new Vector2(playerPos.x, playerPos.z),
+            new Vector2(spotPos.x, spotPos.z)
+        );
+        float verticalDist = Mathf.Abs(playerPos.y - spotPos.y);
+
+        bool inRange = (horizontalDist <= healRadius) && (verticalDist <= 3.0f);
+
+        if (inRange)
+        {
+            // If player just entered range, or cooldown passed
+            if (!wasPlayerInRange || Time.time >= lastHealTime + healCooldown)
+            {
+                TryHealParty();
+            }
+            wasPlayerInRange = true;
+        }
+        else
+        {
+            wasPlayerInRange = false;
+        }
+    }
+
+    private void OnTriggerStay(Collider other)
+    {
+        if (other.CompareTag("Player") || other.GetComponent<CharacterBase>() != null)
+        {
+            if (Time.time >= lastHealTime + healCooldown || !wasPlayerInRange)
+            {
+                TryHealParty();
+            }
+            wasPlayerInRange = true;
+        }
+    }
+
+    private void OnTriggerExit(Collider other)
+    {
+        if (other.CompareTag("Player") || other.GetComponent<CharacterBase>() != null)
+        {
+            wasPlayerInRange = false;
+        }
+    }
+
+    /// <summary>
+    /// Checks party members. If any member has missing HP or SP, heals everyone to full.
+    /// If already full, displays confirmation feedback.
+    /// </summary>
+    public bool TryHealParty()
+    {
+        CharacterBase[] party = FindObjectsByType<CharacterBase>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        if (party == null || party.Length == 0) return false;
+
+        bool neededHealing = false;
+        foreach (CharacterBase character in party)
+        {
+            if (character == null) continue;
+            if (character.GetCurrHP() < character.GetMaxHP() || character.GetCurrSP() < character.GetMaxSP())
+            {
+                neededHealing = true;
+                break;
+            }
+        }
+
+        if (!neededHealing)
+        {
+            // Show feedback that the spot detected player, but health is already full
+            lastHealTime = Time.time;
+            ShowMessage("HP & SP Already Full!");
+            Debug.Log("[HealingSpot] Player is already at full HP and SP!");
+            return false;
+        }
+
+        // Perform full heal & restore SP on all characters
+        foreach (CharacterBase character in party)
+        {
+            if (character == null) continue;
+            character.Heal(character.GetMaxHP());
+            character.RestoreSP(character.GetMaxSP());
+        }
+
+        lastHealTime = Time.time;
+
+        // Play SFX
+        if (healSound != null)
+        {
+            GameAudio.PlaySFXAtPoint(healSound, transform.position, soundVolume);
+        }
+
+        // Particle burst
+        if (particleSys != null)
+        {
+            particleSys.Emit(30);
+        }
+
+        // Notify open Inventory UI
+        InventoryUI invUI = FindFirstObjectByType<InventoryUI>(FindObjectsInactive.Include);
+        if (invUI != null)
+        {
+            invUI.UpdateBars();
+        }
+
+        // Show floating feedback message
+        ShowMessage(healMessage);
+
+        Debug.Log("[HealingSpot] Party fully healed HP and SP!");
+        return true;
+    }
+
+    [ContextMenu("Test: Take 100 Damage on Party")]
+    public void TestDamageParty()
+    {
+        CharacterBase[] party = FindObjectsByType<CharacterBase>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var c in party)
+        {
+            if (c != null)
+            {
+                c.TakeDamage(100);
+                c.TestUseSP();
+            }
+        }
+        FindFirstObjectByType<InventoryUI>(FindObjectsInactive.Include)?.UpdateBars();
+        Debug.Log("[HealingSpot] Applied 100 damage and -25 SP to all party characters for testing.");
+    }
+
+    [ContextMenu("Test: Trigger Healing")]
+    public void TestTriggerHeal()
+    {
+        TryHealParty();
+    }
+
+    private Transform GetActivePlayerTransform()
+    {
+        if (CharacterSwitchManager.CurrentCharacterTransform != null && CharacterSwitchManager.CurrentCharacterTransform.gameObject.activeInHierarchy)
+            return CharacterSwitchManager.CurrentCharacterTransform;
+
+        GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+        if (playerObj != null && playerObj.activeInHierarchy) return playerObj.transform;
+
+        CharacterBase activeChar = FindFirstObjectByType<CharacterBase>();
+        if (activeChar != null && activeChar.gameObject.activeInHierarchy) return activeChar.transform;
+
+        return null;
+    }
+
+    private Transform GetPlayerTransform()
+    {
+        if (CharacterSwitchManager.CurrentCharacterTransform != null)
+            return CharacterSwitchManager.CurrentCharacterTransform;
+
+        GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+        if (playerObj != null) return playerObj.transform;
+
+        CharacterBase activeChar = FindFirstObjectByType<CharacterBase>();
+        if (activeChar != null) return activeChar.transform;
+
+        return null;
+    }
+
+    private void SetupPromptUI()
+    {
+        if (promptUI != null) return;
+
+        GameObject canvasObj = new GameObject("HealingSpot_Billboard");
+        canvasObj.transform.SetParent(transform, false);
+        canvasObj.transform.localPosition = promptOffset;
+
+        Canvas canvas = canvasObj.AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.WorldSpace;
+
+        RectTransform rectTransform = canvasObj.GetComponent<RectTransform>();
+        rectTransform.sizeDelta = new Vector2(5f, 1.2f);
+        canvasObj.transform.localScale = Vector3.one * 0.02f;
+
+        GameObject textObj = new GameObject("HealText");
+        textObj.transform.SetParent(canvasObj.transform, false);
+
+        promptTextMesh = textObj.AddComponent<TextMeshProUGUI>();
+        promptTextMesh.text = healMessage;
+        promptTextMesh.fontSize = 28;
+        promptTextMesh.fontStyle = FontStyles.Bold;
+        promptTextMesh.alignment = TextAlignmentOptions.Center;
+        promptTextMesh.color = new Color(0.3f, 1f, 0.4f); // Vibrant healing green
+        promptTextMesh.enableWordWrapping = false;
+
+        RectTransform textRect = textObj.GetComponent<RectTransform>();
+        textRect.anchorMin = Vector2.zero;
+        textRect.anchorMax = Vector2.one;
+        textRect.sizeDelta = Vector2.zero;
+        textRect.anchoredPosition = Vector2.zero;
+
+        promptUI = canvasObj;
+    }
+
+    private void LateUpdate()
+    {
+        // Keep billboard facing main camera
+        if (promptUI != null && promptUI.activeSelf && Camera.main != null)
+        {
+            promptUI.transform.rotation = Camera.main.transform.rotation;
+        }
+    }
+
+    private void ShowMessage(string message)
+    {
+        if (promptTextMesh != null)
+        {
+            promptTextMesh.text = message;
+        }
+
+        if (messageCoroutine != null)
+        {
+            StopCoroutine(messageCoroutine);
+        }
+        messageCoroutine = StartCoroutine(AnimateMessage());
+    }
+
+    private IEnumerator AnimateMessage()
+    {
+        SetPromptVisible(true);
+        if (promptUI == null || promptTextMesh == null) yield break;
+
+        Vector3 startLocalPos = promptOffset;
+        Vector3 targetLocalPos = promptOffset + Vector3.up * 1.0f;
+        Color baseColor = new Color(0.3f, 1f, 0.5f, 1f);
+
+        float elapsed = 0f;
+        while (elapsed < messageDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = elapsed / messageDuration;
+
+            // Float upwards
+            promptUI.transform.localPosition = Vector3.Lerp(startLocalPos, targetLocalPos, t);
+
+            // Fade alpha out in the last 40% of duration
+            float alpha = t > 0.6f ? Mathf.Lerp(1f, 0f, (t - 0.6f) / 0.4f) : 1f;
+            promptTextMesh.color = new Color(baseColor.r, baseColor.g, baseColor.b, alpha);
+
+            yield return null;
+        }
+
+        SetPromptVisible(false);
+        promptUI.transform.localPosition = promptOffset;
+    }
+
+    private void SetPromptVisible(bool visible)
+    {
+        if (promptUI != null)
+        {
+            promptUI.SetActive(visible);
+        }
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        Gizmos.color = new Color(0.2f, 1f, 0.4f, 0.5f);
+        Gizmos.DrawWireSphere(transform.position, healRadius);
+    }
+}

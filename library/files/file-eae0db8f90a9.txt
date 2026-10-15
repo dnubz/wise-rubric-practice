@@ -1,0 +1,860 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+using UnityEngine.Rendering;
+
+/// <summary>Keeps the seeded room graph, with isolated rooms connected by doorway teleports.</summary>
+public sealed class DungeonGenerator : MonoBehaviour
+{
+    public DungeonLayout Layout { get; private set; }
+    public int OriginalKeys { get; private set; }
+    public int BossKeys { get; private set; }
+    public int CurrentRoom { get; private set; } = -1;
+    public bool Exploring { get; private set; }
+    public bool IsRoomTransitioning { get; private set; }
+    public const int CoinValue = 10;
+    public Vector3 Origin => new Vector3(0, -500, 0);
+    const float DoorWidth = 5, BoundaryHeight = 12, EntranceInset = 5;
+    float transitionReadyAt;
+    enum InteractionKind { KeyChest, Door, Exit, Treasure, Boss, Breakable }
+    sealed class Interaction
+    {
+        public InteractionKind Kind;
+        public int Room;
+        public Vector3 Position;
+        public DungeonKeyKind Key;
+        public GameObject Visual;
+        public Transform Lid;
+        public bool Done;
+        public DoorConnection Door;
+        public DungeonBreakable Breakable;
+        public DungeonRoomExit Exit;
+        public DungeonDoorUI LockUI;
+        public DungeonDoorHighlight Highlight;
+    }
+    sealed class DoorConnection
+    {
+        public DungeonDoorData Data;
+        public bool Unlocked;
+        public readonly List<Interaction> Ends = new List<Interaction>();
+    }
+    readonly List<Interaction> interactions = new List<Interaction>();
+    readonly List<List<GameObject>> roomCoins = new List<List<GameObject>>();
+    readonly List<GameObject> roomRoots = new List<GameObject>();
+    readonly List<DoorConnection> connections = new List<DoorConnection>();
+    readonly List<Mesh> meshes = new List<Mesh>();
+    readonly List<Material> ownedMaterials = new List<Material>();
+    DungeonSettings settings;
+    Material floorMaterial, doorMaterial, goldMaterial;
+    CameraController cameraRig;
+    DungeonMinimap minimap;
+    DungeonKeyHud keyHud;
+    DungeonInteractionUI interactionUI;
+    WorldInteractionPrompt targetPrompt;
+    DungeonDoorHighlight highlightedDoor;
+    Light playerLight;
+    AudioSource music;
+    AudioSource coinPickupAudio;
+    bool arrivalAnnounced;
+    DungeonRoomTransition roomTransition;
+    Coroutine roomTravel;
+    System.Random contentRandom;
+
+    float savedSpacing, savedFloorTileSize;
+    float Spacing => savedSpacing > 0 ? savedSpacing : Mathf.Max(settings.roomSpacing, settings.maximumRoomSize + 100);
+    public Vector3 RoomCentre(int room) => Origin + new Vector3(Layout.Rooms[room].Grid.x * Spacing, 0, Layout.Rooms[room].Grid.y * Spacing);
+
+    public IEnumerator Build(int overworldSeed, SavedDungeon saved = null, int? entranceSeed = null)
+    {
+        settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        if (settings == null) throw new InvalidOperationException("Run WiSe > Set Up Dungeon to create dungeon settings.");
+        if (settings.doorModel == null) throw new InvalidOperationException("Run WiSe > Set Up Dungeon to assign the room door prefab.");
+        if (settings.doorLockUI == null) throw new InvalidOperationException("Run WiSe > UI > Set Up Dungeon Interaction UI to assign the saved lock prefab.");
+        if (settings.floorTiles == null || settings.floorTiles.Length != 4 || Array.Exists(settings.floorTiles, tile => tile == null))
+            throw new InvalidOperationException("Run WiSe > Set Up Dungeon to assign the four floor tile prefabs.");
+        if (settings.breakableDecorations == null || settings.breakableDecorations.Length == 0 ||
+            Array.Exists(settings.breakableDecorations, prop => prop == null) ||
+            settings.floorDecorations == null || settings.floorDecorations.Length == 0 ||
+            Array.Exists(settings.floorDecorations, prop => prop == null) || settings.friendlyEnemyModel == null)
+            throw new InvalidOperationException("Run WiSe > Set Up Dungeon to assign decorations and the friendly NPC.");
+        var naming = new BerdlyChemistry(0, Table("alkane"), Table("alkyl"), Table("prefix"));
+        int seed = settings.useFixedSeed ? settings.fixedSeed : entranceSeed ?? unchecked(overworldSeed ^ 0x4D535431);
+        int minimum = Mathf.Clamp(settings.minimumRoomSize, 20, 64);
+        int maximum = Mathf.Clamp(settings.maximumRoomSize, minimum, 64);
+        int minimumRooms = Mathf.Clamp(settings.minimumRooms, 8, DungeonLayout.MaximumRooms);
+        int maximumRooms = Mathf.Clamp(settings.maximumRooms, minimumRooms, DungeonLayout.MaximumRooms);
+        Layout = saved != null ? saved.ToLayout() : DungeonLayout.Generate(seed,
+            DungeonLayout.ChooseRoomCount(seed, minimumRooms, maximumRooms), minimum, maximum, naming);
+        seed = Layout.Seed; savedSpacing = saved != null ? saved.spacing : 0;
+        savedFloorTileSize = saved != null ? saved.floorTileSize : settings.floorTileSize;
+        contentRandom = new System.Random(unchecked(seed ^ 0x434F494E));
+        floorMaterial = settings.floorMaterial != null ? settings.floorMaterial : MaterialFor(new Color(.32f, .31f, .38f));
+        doorMaterial = settings.doorMaterial != null ? settings.doorMaterial : MaterialFor(new Color(.42f, .23f, .13f));
+        goldMaterial = CreateGoldMaterial();
+        for (int i = 0; i < Layout.Rooms.Count; i++)
+        {
+            BuildRoom(i);
+            // Keep loading responsive. Exploration performs no further room generation or per-tile Update calls.
+            if (i % 2 == 1) yield return null;
+        }
+        foreach (DungeonDoorData door in Layout.Doors) BuildDoorways(door);
+        BuildLandmarks(); BuildHUD();
+        foreach (GameObject root in gameObject.scene.GetRootGameObjects())
+            if (root.TryGetComponent(out DungeonInteractionUI indicator)) interactionUI = indicator;
+        targetPrompt = WorldInteractionPrompt.Create(transform);
+        if (saved != null) RestoreProgress(saved);
+        cameraRig = FindFirstObjectByType<CameraController>();
+        Debug.Log($"Dungeon {Layout.Seed}: {Layout.Rooms.Count} rooms, {Layout.MaximumDegree} degrees, {Layout.Name}");
+    }
+
+    static string Table(string name)
+    {
+        var asset = Resources.Load<TextAsset>("BerdlyNaming/" + name);
+        if (asset == null) throw new InvalidOperationException("Missing Berdly naming table: " + name);
+        return asset.text;
+    }
+
+    public void BeginExploration(bool announceArrival = true)
+    {
+        if (Exploring) return;
+        Exploring = true;
+        if (cameraRig != null) cameraRig.SetDungeonView(true);
+        var lamp = new GameObject("PlayerLight"); lamp.transform.SetParent(transform, false);
+        playerLight = lamp.AddComponent<Light>(); playerLight.type = LightType.Spot;
+        playerLight.color = new Color(1, .72f, .40f); playerLight.intensity = settings.playerLightIntensity;
+        playerLight.range = 28; playerLight.spotAngle = 95; playerLight.innerSpotAngle = 50;
+        playerLight.shadows = LightShadows.None; lamp.transform.rotation = Quaternion.Euler(90, 0, 0);
+        if (settings.music != null)
+        {
+            music = gameObject.AddComponent<AudioSource>(); GameAudio.RouteMusic(music); music.clip = settings.music; music.loop = true; music.volume = .45f; music.Play();
+        }
+        VisitRoom(Layout.SpawnRoom);
+        if (settings.roomTransitionPrefab != null)
+            roomTransition = Instantiate(settings.roomTransitionPrefab, transform);
+        if (announceArrival) ShowArrival();
+    }
+
+    public void ShowArrival()
+    {
+        if (arrivalAnnounced) return;
+        arrivalAnnounced = true;
+        if (settings.areaTitlePrefab != null)
+            Instantiate(settings.areaTitlePrefab, transform).Play(settings.areaEnterSound);
+    }
+
+    public SavedDungeon CaptureSave()
+    {
+        var opened = new List<int>(); var unlocked = new List<int>(); var broken = new List<int>();
+        for (int i = 0; i < interactions.Count; i++)
+        {
+            var item = interactions[i];
+            if ((item.Kind == InteractionKind.KeyChest || item.Kind == InteractionKind.Treasure) && item.Done) opened.Add(i);
+            if (item.Kind == InteractionKind.Breakable && (item.Breakable == null || item.Breakable.IsBroken)) broken.Add(i);
+        }
+        for (int i = 0; i < connections.Count; i++) if (connections[i].Unlocked) unlocked.Add(i);
+        var coins = new Vector3[roomCoins.Count][];
+        for (int i = 0; i < coins.Length; i++)
+        {
+            var positions = new List<Vector3>();
+            foreach (var coin in roomCoins[i]) if (coin != null && coin.activeSelf) positions.Add(coin.transform.position);
+            coins[i] = positions.ToArray();
+        }
+        return new SavedDungeon { seed = Layout.Seed, spawn = Layout.SpawnRoom, boss = Layout.BossRoom,
+            berdly = Layout.BerdlyRoom, maximumDegree = Layout.MaximumDegree, name = Layout.Name, scene = gameObject.scene.name,
+            spacing = Spacing, floorTileSize = savedFloorTileSize, rooms = Layout.Rooms.ToArray(), doors = Layout.Doors.ToArray(),
+            chains = Layout.Chains.ConvertAll(chain => chain.ToArray()).ToArray(), originalKeys = OriginalKeys, bossKeys = BossKeys,
+            openedChests = opened.ToArray(), unlockedDoors = unlocked.ToArray(), brokenProps = broken.ToArray(), remainingCoins = coins };
+    }
+
+    void RestoreProgress(SavedDungeon saved)
+    {
+        OriginalKeys = saved.originalKeys; BossKeys = saved.bossKeys; keyHud.Refresh(OriginalKeys, BossKeys);
+        foreach (int i in saved.openedChests ?? new int[0])
+        {
+            if (i < 0 || i >= interactions.Count) continue;
+            var item = interactions[i]; item.Done = true;
+            if (item.Lid != null) item.Lid.localRotation = Quaternion.Euler(-85, 0, 0);
+        }
+        foreach (int i in saved.unlockedDoors ?? new int[0])
+        {
+            if (i < 0 || i >= connections.Count) continue;
+            var door = connections[i]; door.Unlocked = true;
+            foreach (var end in door.Ends) if (end.LockUI != null) end.LockUI.SetLock(door.Data.Lock, false);
+        }
+        foreach (int i in saved.brokenProps ?? new int[0])
+            if (i >= 0 && i < interactions.Count && interactions[i].Breakable != null)
+            { interactions[i].Breakable.gameObject.SetActive(false); Destroy(interactions[i].Breakable.gameObject); }
+        for (int i = 0; i < roomCoins.Count; i++)
+        {
+            foreach (var coin in roomCoins[i]) if (coin != null) { coin.SetActive(false); Destroy(coin); }
+            roomCoins[i].Clear();
+            foreach (var position in saved.remainingCoins[i]) SpawnCoin(i, position);
+        }
+    }
+
+    void BuildRoom(int index)
+    {
+        DungeonRoomData room = Layout.Rooms[index];
+        Vector3 centre = RoomCentre(index);
+        var root = new GameObject($"Room_{index}_Degree{room.Degree}_{room.Number}_{room.Kind}"); root.transform.SetParent(transform, false);
+        root.transform.position = centre;
+        roomRoots.Add(root);
+        roomCoins.Add(new List<GameObject>());
+        // A single flat collider avoids seams and bumps between the decorative floor meshes.
+        var floorCollider = root.AddComponent<BoxCollider>(); floorCollider.center = Vector3.down * .25f;
+        floorCollider.size = new Vector3(room.Size.x, .5f, room.Size.y);
+        BuildFloor(index, root.transform);
+        for (int side = 0; side < 4; side++)
+        {
+            Vector3 direction = side == 0 ? Vector3.forward : side == 1 ? Vector3.right : side == 2 ? Vector3.back : Vector3.left;
+            bool alongX = side % 2 == 0;
+            float length = alongX ? room.Size.x : room.Size.y;
+            float depth = alongX ? room.Size.y : room.Size.x;
+            // No wall mesh: these colliders contain the player, including at locked exits.
+            // Doorway triggers sit just inside them and teleport before the player reaches the edge.
+            var boundary = new GameObject("InvisibleBoundary"); boundary.transform.SetParent(root.transform, false);
+            boundary.transform.position = centre + direction * (depth / 2 + .2f) + Vector3.up * (BoundaryHeight / 2);
+            boundary.AddComponent<BoxCollider>().size = alongX ?
+                new Vector3(length + .8f, BoundaryHeight, .4f) : new Vector3(.4f, BoundaryHeight, length + .8f);
+        }
+        if (room.Key != DungeonKeyKind.None) CreateChest(index, centre + new Vector3(4, 0, 4), room.Key, InteractionKind.KeyChest);
+        if (room.Kind == DungeonRoomKind.Treasure) CreateChest(index, centre + new Vector3(-4, 0, 4), DungeonKeyKind.None, InteractionKind.Treasure);
+        List<Vector3> decorations = BuildDecorations(index);
+        // Coins are lightweight pickups; keep all entrances and the central path clear.
+        // Normal rooms have decorations and an occasional friendly NPC, with no loose loot.
+        int coinStep = Mathf.CeilToInt(settings.coinSize + .35f);
+        if (room.Kind == DungeonRoomKind.Treasure || room.Kind == DungeonRoomKind.Enemy)
+        for (int x = -(room.Size.x / 2) + 2; x <= room.Size.x / 2 - 2; x += coinStep)
+            for (int z = -(room.Size.y / 2) + 2; z <= room.Size.y / 2 - 2; z += coinStep)
+            {
+                if (Mathf.Abs(x) < 2 || Mathf.Abs(z) < 2) continue;
+                float chestClearance = settings.chestWidth / 2 + settings.coinSize / 2 + .5f;
+                if (room.Key != DungeonKeyKind.None && Mathf.Abs(x - 4) < chestClearance && Mathf.Abs(z - 4) < chestClearance) continue;
+                if (room.Kind == DungeonRoomKind.Treasure && Mathf.Abs(x + 4) < chestClearance && Mathf.Abs(z - 4) < chestClearance) continue;
+                if (index == Layout.BerdlyRoom && Mathf.Abs(x + 3.5f) < 2 && Mathf.Abs(z - 3.5f) < 2) continue;
+                Vector3 position = centre + new Vector3(x, 0, z);
+                if (decorations.Exists(p => HorizontalDistance(p, position) < 2.5f)) continue;
+                // Spread a similar number of pickups over the larger floor instead of multiplying object counts.
+                float chance = (room.Kind == DungeonRoomKind.Treasure ? .28f : .025f) * 81f * coinStep * coinStep / ((room.Size.x - 4) * (room.Size.y - 4));
+                if (contentRandom.NextDouble() >= chance) continue;
+                SpawnCoin(index, position);
+            }
+        SpawnRoomEnemies(index);
+        root.AddComponent<ExplorationNavigation>();
+        root.SetActive(false);
+    }
+
+    void SpawnRoomEnemies(int index)
+    {
+        var battle = Resources.Load<BattleSettings>("Battle/Settings");
+        var room = Layout.Rooms[index];
+        if (battle == null || room.Kind != DungeonRoomKind.Enemy && room.Kind != DungeonRoomKind.Boss) return;
+        bool boss = room.Kind == DungeonRoomKind.Boss;
+        var random = new System.Random(unchecked(Layout.Seed ^ index * 7919));
+        for (int i = 0; i < (boss ? 1 : 2); i++)
+        {
+            string id = "dungeon:" + Layout.Seed + ":" + index + ":" + i;
+            if (BattleSession.Instance != null && BattleSession.Instance.IsDefeated(id)) continue;
+            Vector3 position = RoomCentre(index) + new Vector3(boss ? 0 : i == 0 ? -6 : 6, 0, 5);
+            Physics.SyncTransforms();
+            for (int attempt = 0; attempt < 24 && Physics.CheckCapsule(position + Vector3.up, position + Vector3.up * 2.2f, .7f, 1 << 0, QueryTriggerInteraction.Ignore); attempt++)
+                position = RoomCentre(index) + new Vector3(((float)random.NextDouble() * 2 - 1) * room.Size.x * .3f, 0, ((float)random.NextDouble() * 2 - 1) * room.Size.y * .3f);
+            if (Physics.CheckCapsule(position + Vector3.up, position + Vector3.up * 2.2f, .7f, 1 << 0, QueryTriggerInteraction.Ignore)) continue;
+            var data = boss ? battle.boss : battle.enemies[random.Next(battle.enemies.Length)];
+            var enemy = Instantiate(data.prefab, position, Quaternion.Euler(0, 180, 0), roomRoots[index].transform);
+            var encounter = enemy.GetComponent<EncounterEnemy>(); encounter.Configure(data, id, true);
+            encounter.roamRadius = Mathf.Min(room.Size.x, room.Size.y) * .25f;
+        }
+    }
+
+    List<Vector3> BuildDecorations(int index)
+    {
+        var positions = new List<Vector3>();
+        DungeonRoomData room = Layout.Rooms[index];
+        if (room.Kind == DungeonRoomKind.Boss) return positions;
+        // Separate content seed keeps decorations repeatable without changing the room graph or floor WFC.
+        var random = new System.Random(unchecked(Layout.Seed ^ (index * 19349663) ^ 0x4445434F));
+        Transform parent = roomRoots[index].transform;
+        int minimum = Mathf.Clamp(settings.minimumBreakables, 1, 20);
+        int count = random.Next(minimum, Mathf.Clamp(settings.maximumBreakables, minimum, 20) + 1);
+        for (int i = 0; i < count; i++)
+        {
+            if (!DecorationPosition(index, random, positions, out Vector3 position)) break;
+            var prop = new GameObject("BreakableDecoration"); prop.transform.SetParent(parent, false); prop.transform.position = position;
+            var prefab = settings.breakableDecorations[random.Next(settings.breakableDecorations.Length)];
+            var model = Instantiate(prefab, position, Quaternion.Euler(0, random.Next(4) * 90, 0) * prefab.transform.rotation, prop.transform);
+            prop.name = "Breakable_" + prefab.name;
+            FitModel(model, 1.8f, true, true);
+            foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            // One simple collider on the wrapper, fitted to the visible model.
+            Renderer[] renderers = model.GetComponentsInChildren<Renderer>(true);
+            Bounds bounds = renderers[0].bounds; foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+            var blocker = prop.AddComponent<BoxCollider>(); blocker.center = bounds.center - position; blocker.size = bounds.size;
+            var breakable = prop.AddComponent<DungeonBreakable>();
+            breakable.Initialize(this, index, random.NextDouble() < Mathf.Clamp01(settings.decorationCoinChance));
+            interactions.Add(new Interaction { Kind = InteractionKind.Breakable, Room = index, Position = position, Visual = prop, Breakable = breakable });
+            positions.Add(position);
+        }
+        int scatterCount = random.Next(5, 9);
+        for (int i = 0; i < scatterCount; i++)
+        {
+            if (!DecorationPosition(index, random, positions, out Vector3 position)) break;
+            var prefab = settings.floorDecorations[random.Next(settings.floorDecorations.Length)];
+            var model = Instantiate(prefab, position + Vector3.up * .01f,
+                Quaternion.Euler(0, random.Next(4) * 90, 0) * prefab.transform.rotation, parent);
+            model.name = "FloorDecoration_" + prefab.name; FitModel(model, 2.2f, true, true);
+            foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            positions.Add(position);
+        }
+        if (room.Kind == DungeonRoomKind.Normal && index != Layout.BerdlyRoom &&
+            random.NextDouble() < Mathf.Clamp01(settings.friendlyEnemyChance) &&
+            DecorationPosition(index, random, positions, out Vector3 npcPosition))
+        {
+            var model = Instantiate(settings.dungeonFriendlyNPC != null ? settings.dungeonFriendlyNPC : settings.friendlyEnemyModel,
+                npcPosition, Quaternion.Euler(0, 180, 0), parent);
+            model.name = "FriendlyEnemyNPC"; FitModel(model, 1.8f, false, true);
+            foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            if (model.TryGetComponent<NormalNPC>(out var visitor))
+            {
+                visitor.SetDialogue("Friendly Minion", "I'm taking a break here. You won't have to fight me!");
+                visitor.RefreshSpeechBubble();
+            }
+            positions.Add(npcPosition);
+        }
+        return positions;
+    }
+
+    bool DecorationPosition(int index, System.Random random, List<Vector3> occupied, out Vector3 position)
+    {
+        DungeonRoomData room = Layout.Rooms[index];
+        Vector3 centre = RoomCentre(index);
+        for (int attempt = 0; attempt < 80; attempt++)
+        {
+            float x = (float)(random.NextDouble() - .5) * (room.Size.x - 6);
+            float z = (float)(random.NextDouble() - .5) * (room.Size.y - 6);
+            position = centre + new Vector3(x, 0, z);
+            // Wide crossing connects every doorway and landing point; leave chests and Berdly accessible.
+            if (Mathf.Abs(x) < 3 || Mathf.Abs(z) < 3) continue;
+            if (index == Layout.SpawnRoom && HorizontalDistance(position, centre + new Vector3(-2.5f, 0, -2.5f)) < 3.2f) continue;
+            if (room.Key != DungeonKeyKind.None && HorizontalDistance(position, centre + new Vector3(4, 0, 4)) < 3.5f) continue;
+            if (room.Kind == DungeonRoomKind.Treasure && HorizontalDistance(position, centre + new Vector3(-4, 0, 4)) < 3.5f) continue;
+            if (index == Layout.BerdlyRoom && HorizontalDistance(position, centre + new Vector3(-3.5f, 0, 3.5f)) < 3) continue;
+            Vector3 candidate = position;
+            if (occupied.Exists(p => HorizontalDistance(p, candidate) < 3)) continue;
+            return true;
+        }
+        position = centre;
+        return false;
+    }
+
+    public void SpawnCoin(int room, Vector3 position)
+    {
+        if (room < 0 || room >= roomRoots.Count) return;
+        var coin = settings.coinPrefab != null ? Instantiate(settings.coinPrefab) : GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        coin.name = "Coin_" + CoinValue;
+        coin.transform.SetParent(roomRoots[room].transform, false);
+        coin.transform.position = new Vector3(position.x, Origin.y + settings.coinSize / 2 + .25f, position.z);
+        coin.transform.localScale = Vector3.one * settings.coinSize;
+        foreach (var renderer in coin.GetComponentsInChildren<Renderer>()) renderer.sharedMaterial = goldMaterial;
+        roomCoins[room].Add(coin);
+        // Offset the saved looping animation so the whole room does not bob in sync.
+        float phase = Mathf.Repeat(room * 2.3999632f + position.x * .7548777f + position.z * .5698403f, Mathf.PI * 2);
+        var animation = coin.GetComponent<Animation>();
+        if (animation != null && animation.clip != null)
+        {
+            animation.Play(); animation[animation.clip.name].time = phase / (Mathf.PI * 2) * animation.clip.length; animation.Sample();
+        }
+        else
+        {
+            coin.transform.rotation = Quaternion.Euler(90, 0, 0);
+            coin.transform.localScale = new Vector3(settings.coinSize, .16f, settings.coinSize);
+            var collider = coin.GetComponent<Collider>();
+            if (collider != null) { collider.enabled = false; if (Application.isPlaying) Destroy(collider); else DestroyImmediate(collider); }
+            coin.AddComponent<SpriteItemBobber>().Initialize(.18f, 3.4f, coin.transform.position.y, phase, true, 200f);
+        }
+    }
+
+    void BuildDoorways(DungeonDoorData door)
+    {
+        var connection = new DoorConnection { Data = door, Unlocked = door.Lock == DungeonKeyKind.None };
+        connections.Add(connection);
+        BuildExit(door.A, door.B, connection);
+        BuildExit(door.B, door.A, connection);
+    }
+
+    void BuildExit(int source, int destination, DoorConnection connection)
+    {
+        Vector3 direction = (RoomCentre(destination) - RoomCentre(source)).normalized;
+        bool alongX = Mathf.Abs(direction.x) > .5f;
+        DungeonRoomData room = Layout.Rooms[source];
+        float halfSize = (alongX ? room.Size.x : room.Size.y) / 2f;
+        // Keep the gate just inside the invisible room boundary.
+        Vector3 position = RoomCentre(source) + direction * (halfSize - .35f);
+        var exit = new GameObject($"Exit_ToRoom_{destination}");
+        exit.transform.SetParent(roomRoots[source].transform, false);
+        exit.transform.position = position + Vector3.up * 1.5f;
+        var trigger = exit.AddComponent<BoxCollider>(); trigger.isTrigger = true;
+        trigger.size = alongX ? new Vector3(2, 3, DoorWidth) : new Vector3(DoorWidth, 3, 2);
+        // A kinematic body ensures trigger callbacks also work with the existing CharacterController.
+        var body = exit.AddComponent<Rigidbody>(); body.isKinematic = true; body.useGravity = false;
+        var roomExit = exit.AddComponent<DungeonRoomExit>();
+        GameObject gatePrefab = settings.steelGateModel != null ? settings.steelGateModel : settings.doorModel;
+        var model = Instantiate(gatePrefab, position,
+            Quaternion.LookRotation(-direction) * gatePrefab.transform.rotation, exit.transform);
+        model.name = "SteelRoomGate";
+        FitModel(model, settings.doorHeight, false, true);
+        // The gate stays closed until its lift finishes; its invisible collider blocks the doorway.
+        foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+        foreach (Canvas canvas in model.GetComponentsInChildren<Canvas>(true)) canvas.gameObject.SetActive(false);
+        var blockerObject = new GameObject("SteelGateBlocker");
+        blockerObject.transform.SetParent(roomRoots[source].transform, true);
+        blockerObject.transform.SetPositionAndRotation(position + Vector3.up * (settings.doorHeight / 2f), model.transform.rotation);
+        var blocker = blockerObject.AddComponent<BoxCollider>();
+        blocker.size = new Vector3(DoorWidth, settings.doorHeight, .55f);
+        var gate = exit.AddComponent<DungeonGateLift>();
+        gate.Initialize(this, source, destination, model.transform, blocker, settings.steelGateLiftHeight,
+            settings.steelGateOpenRange, settings.steelGateLiftSpeed, settings.gateLiftSound, settings.gateLiftStartSeconds);
+        roomExit.Initialize(this, source, destination, gate);
+        // This is a saved Canvas/Image prefab, editable normally in Unity.
+        DungeonDoorUI lockUI = Instantiate(settings.doorLockUI, exit.transform, false);
+        lockUI.transform.position = position + Vector3.up * (settings.doorHeight + .8f);
+        lockUI.SetLock(connection.Data.Lock, !connection.Unlocked);
+        if (!connection.Unlocked)
+        {
+            var tint = new MaterialPropertyBlock();
+            Color color = DungeonKeyHud.KeyColour(connection.Data.Lock);
+            foreach (Renderer renderer in model.GetComponentsInChildren<Renderer>(true))
+            {
+                tint.SetColor("_BaseColor", color); tint.SetColor("_Color", color);
+                renderer.SetPropertyBlock(tint);
+            }
+        }
+        var item = new Interaction { Kind = InteractionKind.Door, Room = source, Position = position,
+            Key = connection.Data.Lock, Visual = model, Door = connection, Exit = roomExit, LockUI = lockUI,
+            Highlight = model.GetComponent<DungeonDoorHighlight>() };
+        connection.Ends.Add(item); interactions.Add(item);
+    }
+
+    void BuildLandmarks()
+    {
+        Vector3 exit = RoomCentre(Layout.SpawnRoom) + new Vector3(-2.5f, 0, -2.5f);
+        var marker = GameObject.CreatePrimitive(PrimitiveType.Cylinder); marker.name = "ReturnToSurface";
+        marker.transform.SetParent(roomRoots[Layout.SpawnRoom].transform, false); marker.transform.position = exit + Vector3.up * .12f; marker.transform.localScale = new Vector3(2, .12f, 2);
+        marker.GetComponent<Renderer>().sharedMaterial = goldMaterial;
+        interactions.Add(new Interaction { Kind = InteractionKind.Exit, Room = Layout.SpawnRoom, Position = exit });
+        Vector3 berdlyPosition = RoomCentre(Layout.BerdlyRoom) + new Vector3(-3.5f, 0, 3.5f);
+        if (settings.berdlyModel != null)
+        {
+            var model = Instantiate(settings.dungeonGuideNPC != null ? settings.dungeonGuideNPC : settings.berdlyModel, berdlyPosition, Quaternion.Euler(0, 180, 0),
+                roomRoots[Layout.BerdlyRoom].transform); model.name = "DungeonBerdly";
+            // The guide tells the room-graph name; it must not open the overworld challenge again.
+            foreach (ObjectHighlight highlight in model.GetComponentsInChildren<ObjectHighlight>(true)) highlight.enabled = false;
+            foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            if (settings.berdlyMaterial != null)
+                foreach (Renderer renderer in model.GetComponentsInChildren<Renderer>(true))
+                {
+                    var materials = renderer.sharedMaterials;
+                    for (int i = 0; i < materials.Length; i++) materials[i] = settings.berdlyMaterial;
+                    renderer.sharedMaterials = materials;
+                }
+            FitModel(model, 2.1f, false);
+            if (model.TryGetComponent<NormalNPC>(out var guide))
+            {
+                guide.SetDialogue("Berdly", "Rooms as carbons, doors as bonds.\n(<color=#5C8EAF>" + Layout.Name + "</color>).");
+                guide.RefreshSpeechBubble();
+            }
+        }
+    }
+
+    void CreateChest(int room, Vector3 position, DungeonKeyKind key, InteractionKind kind)
+    {
+        Transform parent = roomRoots[room].transform;
+        var chest = new GameObject(key == DungeonKeyKind.None ? "TreasureChest" : key + "KeyChest");
+        chest.transform.SetParent(parent, false); chest.transform.position = position;
+        GameObject model;
+        if (settings.chestModel != null) model = Instantiate(settings.chestModel, chest.transform, false);
+        else
+        {
+            model = GameObject.CreatePrimitive(PrimitiveType.Cube); model.transform.SetParent(chest.transform, false);
+            model.transform.localPosition = Vector3.up * .5f; model.transform.localScale = new Vector3(2, 1, 1.5f);
+            model.GetComponent<Renderer>().sharedMaterial = doorMaterial;
+        }
+        model.name = "Body";
+        foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+        Bounds bodyBounds = ModelBounds(model);
+        Transform lid = null;
+        if (settings.chestLidModel != null)
+        {
+            var hinge = new GameObject("LidHinge"); hinge.transform.SetParent(chest.transform, false);
+            // KayKit's lid is authored around its rear hinge; the body rim is at y = .6.
+            // Body bounds also include the taller coins, so do not use bounds.max.y as the rim.
+            hinge.transform.position = model.transform.TransformPoint(new Vector3(0, .6f, -.55f));
+            var top = Instantiate(settings.chestLidModel, hinge.transform, false);
+            lid = hinge.transform;
+            foreach (Collider collider in top.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+        }
+        // Assemble both parts before scaling, preserving the model's hinge and latch offsets.
+        FitModel(chest, settings.chestWidth, true, true);
+        bodyBounds = ModelBounds(model);
+        var blocker = chest.AddComponent<BoxCollider>(); blocker.isTrigger = false;
+        blocker.center = chest.transform.InverseTransformPoint(bodyBounds.center);
+        blocker.size = bodyBounds.size / chest.transform.lossyScale.x;
+        interactions.Add(new Interaction { Kind = kind, Room = room, Position = position, Key = key, Visual = chest, Lid = lid });
+    }
+
+    static Bounds ModelBounds(GameObject model)
+    {
+        Renderer[] renderers = model.GetComponentsInChildren<Renderer>(true);
+        Bounds bounds = renderers[0].bounds;
+        foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+        return bounds;
+    }
+
+    static void FitModel(GameObject model, float target, bool width, bool centre = false)
+    {
+        Renderer[] renderers = model.GetComponentsInChildren<Renderer>(true); if (renderers.Length == 0) return;
+        Bounds bounds = renderers[0].bounds; foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+        float dimension = width ? Mathf.Max(bounds.size.x, bounds.size.z) : bounds.size.y;
+        if (dimension > .001f) model.transform.localScale *= target / dimension;
+        bounds = renderers[0].bounds; foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+        model.transform.position += new Vector3(0, model.transform.position.y - bounds.min.y, 0);
+        if (centre) model.transform.position += new Vector3(model.transform.position.x - bounds.center.x, 0, model.transform.position.z - bounds.center.z);
+    }
+
+    void BuildFloor(int index, Transform parent)
+    {
+        Vector2Int size = Layout.Rooms[index].Size;
+        int width = Mathf.CeilToInt(size.x / savedFloorTileSize), depth = Mathf.CeilToInt(size.y / savedFloorTileSize);
+        int[] tiles = DungeonFloorWFC.Generate(width, depth, unchecked(Layout.Seed ^ (index * 73856093)));
+        float tileWidth = size.x / (float)width, tileDepth = size.y / (float)depth;
+        var groups = new Dictionary<Material, List<CombineInstance>>();
+        var temporary = new GameObject("FloorTilesToBatch"); temporary.transform.SetParent(parent, false);
+        for (int z = 0; z < depth; z++)
+            for (int x = 0; x < width; x++)
+            {
+                // Instantiate the prefab selected by WFC, preserving its actual mesh and materials.
+                var tile = Instantiate(settings.floorTiles[tiles[z * width + x]], temporary.transform, false);
+                tile.transform.localPosition = new Vector3(-size.x / 2f + (x + .5f) * tileWidth, 0, -size.y / 2f + (z + .5f) * tileDepth);
+                tile.transform.localScale = new Vector3(tileWidth / 2, 1, tileDepth / 2);
+                foreach (MeshFilter filter in tile.GetComponentsInChildren<MeshFilter>())
+                {
+                    var renderer = filter.GetComponent<MeshRenderer>(); if (renderer == null) continue;
+                    var materials = renderer.sharedMaterials;
+                    for (int sub = 0; sub < filter.sharedMesh.subMeshCount; sub++)
+                    {
+                        Material material = sub < materials.Length && materials[sub] != null ? materials[sub] : floorMaterial;
+                        if (!groups.TryGetValue(material, out var parts)) { parts = new List<CombineInstance>(); groups.Add(material, parts); }
+                        parts.Add(new CombineInstance { mesh = filter.sharedMesh, subMeshIndex = sub,
+                            transform = parent.worldToLocalMatrix * filter.transform.localToWorldMatrix });
+                    }
+                }
+            }
+        foreach (var group in groups) Batch("Floor_" + group.Key.name, parent, group.Value, group.Key);
+        // Only the combined material meshes remain; no per-tile colliders or Update scripts run.
+        temporary.SetActive(false); Destroy(temporary);
+    }
+    void Batch(string name, Transform parent, List<CombineInstance> boxes, Material material)
+    {
+        var obj = new GameObject(name); obj.transform.SetParent(parent, false);
+        var mesh = new Mesh { name = "Dungeon " + name, indexFormat = IndexFormat.UInt32 }; mesh.CombineMeshes(boxes.ToArray(), true, true); meshes.Add(mesh);
+        obj.AddComponent<MeshFilter>().sharedMesh = mesh; obj.AddComponent<MeshRenderer>().sharedMaterial = material;
+    }
+    Material MaterialFor(Color color)
+    {
+        Shader shader = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard");
+        var material = new Material(shader); material.color = color; ownedMaterials.Add(material); return material;
+    }
+
+    Material CreateGoldMaterial()
+    {
+        Material material = MaterialFor(new Color(1, .72f, .12f));
+        material.EnableKeyword("_EMISSION");
+        material.SetColor("_EmissionColor", new Color(1, .34f, .045f) * 1.8f);
+        material.SetFloat("_Metallic", .25f); material.SetFloat("_Smoothness", .45f);
+        return material;
+    }
+
+    void BuildHUD()
+    {
+        var ui = new GameObject("DungeonHUD", typeof(RectTransform)); ui.transform.SetParent(transform, false);
+        var canvas = ui.AddComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = 90;
+        var scaler = ui.AddComponent<CanvasScaler>(); scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize; scaler.referenceResolution = new Vector2(1280, 720);
+        minimap = ui.AddComponent<DungeonMinimap>(); minimap.Initialize(this, ui.transform);
+        keyHud = ui.AddComponent<DungeonKeyHud>(); keyHud.Initialize(ui.transform);
+    }
+
+    void Update()
+    {
+        if (!Exploring || IsRoomTransitioning) return;
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null || NPCChallengePrompt.BlocksGameplayInput) return;
+        // The portal sets CurrentRoom; world-space grid guesses are unnecessary with isolated rooms.
+        if (CurrentRoom < 0) return;
+        List<GameObject> coins = roomCoins[CurrentRoom];
+        for (int i = coins.Count - 1; i >= 0; i--)
+            if (coins[i] != null && HorizontalDistance(player.position, coins[i].transform.position) < Mathf.Max(.9f, settings.coinSize))
+            { PlayerInventory.Instance.AddGold(CoinValue); PlayCoinPickup(); coins[i].SetActive(false); Destroy(coins[i]); coins.RemoveAt(i); }
+        if (Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame) TryInteractNearest();
+        if (player.position.y < Origin.y - 20)
+            TeleportToRoom(CurrentRoom, RoomCentre(CurrentRoom) + Vector3.up * .15f, player.rotation);
+    }
+
+    void PlayCoinPickup()
+    {
+        if (settings.coinPickupSound == null) return;
+        if (coinPickupAudio == null)
+        {
+            coinPickupAudio = gameObject.AddComponent<AudioSource>();
+            coinPickupAudio.playOnAwake = false; coinPickupAudio.loop = false;
+            coinPickupAudio.spatialBlend = 0; coinPickupAudio.volume = .8f;
+            coinPickupAudio.clip = settings.coinPickupSound; GameAudio.RouteSFX(coinPickupAudio);
+        }
+        coinPickupAudio.PlayOneShot(settings.coinPickupSound);
+    }
+
+    public bool TryInteractNearest()
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (!Exploring || IsRoomTransitioning || CurrentRoom < 0 || player == null || NPCChallengePrompt.BlocksGameplayInput) return false;
+        Interaction nearest = FindNearestInteraction(player);
+        if (nearest == null) return false;
+        Interact(nearest);
+        return true;
+    }
+
+
+    public bool CanInteractNearby()
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        return Exploring && !IsRoomTransitioning && CurrentRoom >= 0 && player != null && !NPCChallengePrompt.BlocksGameplayInput &&
+            FindNearestInteraction(player) != null;
+    }
+
+    Interaction FindNearestInteraction(Transform player)
+    {
+        if (player.TryGetComponent<CharacterMovement>(out var movement) && movement.IsBreakingDecoration) return null;
+        Interaction nearest = null; float distance = 3f;
+        foreach (Interaction item in interactions)
+        {
+            if (item.Done || item.Room != CurrentRoom) continue;
+            if (item.Kind == InteractionKind.Breakable && (item.Breakable == null || item.Breakable.IsBroken || item.Breakable.IsBreaking || player.GetComponentInChildren<WiSe>() == null)) continue;
+            if (item.Kind == InteractionKind.Door && (Time.unscaledTime < transitionReadyAt ||
+                (item.Door.Unlocked ? item.Exit == null || !item.Exit.IsReady : !HasKey(item.Door.Data.Lock)))) continue;
+            float d = HorizontalDistance(player.position, item.Position);
+            if (d < distance) { nearest = item; distance = d; }
+        }
+        return nearest;
+    }
+
+    static float HorizontalDistance(Vector3 a, Vector3 b) { a.y = b.y = 0; return Vector3.Distance(a, b); }
+    void Interact(Interaction item)
+    {
+        if (item.Done) return;
+        switch (item.Kind)
+        {
+            case InteractionKind.KeyChest:
+                if (item.Key == DungeonKeyKind.Original) OriginalKeys++; else BossKeys++;
+                keyHud.Refresh(OriginalKeys, BossKeys);
+                OpenChest(item); break;
+            case InteractionKind.Treasure: PlayerInventory.Instance.AddGold(50); OpenChest(item); break;
+            case InteractionKind.Door:
+                item.Exit.Interact();
+                break;
+            case InteractionKind.Exit: DungeonSession.ReturnToSurface(); break;
+            case InteractionKind.Boss: DungeonSession.ShowMessage("Boss Room", "You reached the boss room. Jevil's battle will be connected in the battle stage."); break;
+            case InteractionKind.Breakable:
+                if (item.Breakable != null) item.Breakable.TryBreak(CharacterSwitchManager.CurrentCharacterTransform.GetComponentInChildren<CharacterBase>());
+                break;
+        }
+    }
+    void OpenChest(Interaction item)
+    {
+        item.Done = true;
+        if (settings.diamondChestLoot != null && contentRandom.NextDouble() < settings.diamondChestChance)
+            PlayerInventory.Instance.AddItem(settings.diamondChestLoot);
+        if (item.Lid != null) item.Lid.localRotation = Quaternion.Euler(-85, 0, 0);
+        else foreach (Renderer renderer in item.Visual.GetComponentsInChildren<Renderer>()) renderer.sharedMaterial = goldMaterial;
+    }
+    public void RevealMainPath() => minimap.RevealMainPath();
+    public void RevealAllRooms() => minimap.RevealAllRooms();
+    public void SkipToBoss()
+    {
+        var main = Layout.Chains[0];
+        int room = main[main.Count - 2];
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null) return;
+        BossKeys = Mathf.Max(1, BossKeys);
+        keyHud.Refresh(OriginalKeys, BossKeys);
+        TeleportToRoom(room, RoomCentre(room) + Vector3.up * .15f, player.rotation);
+    }
+
+    bool UnlockDoor(DoorConnection connection)
+    {
+        if (connection.Unlocked) return true;
+        DungeonKeyKind key = connection.Data.Lock;
+        if (!HasKey(key)) return false;
+        // Pay once for a yellow lock; both sides then stay unlocked.
+        if (key == DungeonKeyKind.Original)
+        {
+            OriginalKeys--;
+            keyHud?.Refresh(OriginalKeys, BossKeys);
+        }
+        connection.Unlocked = true;
+        foreach (Interaction end in connection.Ends)
+            if (end.LockUI != null) end.LockUI.SetLock(connection.Data.Lock, false);
+        return true;
+    }
+
+    bool HasKey(DungeonKeyKind key) => key == DungeonKeyKind.Original ? OriginalKeys > 0 :
+        key == DungeonKeyKind.Boss ? BossKeys > 0 : true;
+
+    DoorConnection FindConnection(int source, int destination) => connections.Find(door =>
+        door.Data.A == source && door.Data.B == destination || door.Data.B == source && door.Data.A == destination);
+
+    public bool TryUnlockExit(int source, int destination)
+    {
+        if (!Exploring || CurrentRoom != source || NPCChallengePrompt.BlocksGameplayInput) return false;
+        DoorConnection connection = FindConnection(source, destination);
+        return connection != null && UnlockDoor(connection);
+    }
+
+    /// <summary>Having a key is not enough: F must explicitly unlock the gate first.</summary>
+    public bool CanOpenExit(int source, int destination)
+    {
+        DoorConnection connection = FindConnection(source, destination);
+        return connection != null && connection.Unlocked;
+    }
+
+    public bool TryUseExit(int source, int destination)
+    {
+        if (!Exploring || IsRoomTransitioning || CurrentRoom != source || Time.unscaledTime < transitionReadyAt || NPCChallengePrompt.BlocksGameplayInput) return false;
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null) return false;
+        DoorConnection connection = FindConnection(source, destination);
+        if (connection == null || !connection.Unlocked) return false;
+        Interaction exit = connection.Ends.Find(end => end.Room == source);
+        if (exit == null || exit.Exit == null || !exit.Exit.IsReady) return false;
+        Vector3 outward = (RoomCentre(source) - RoomCentre(destination)).normalized;
+        DungeonRoomData room = Layout.Rooms[destination];
+        float halfSize = (Mathf.Abs(outward.x) > .5f ? room.Size.x : room.Size.y) / 2f;
+        Vector3 entrance = RoomCentre(destination) + outward * (halfSize - EntranceInset) + Vector3.up * .15f;
+        if (Application.isPlaying && roomTransition != null)
+        {
+            IsRoomTransitioning = true;
+            roomTravel = StartCoroutine(ChangeRoom(destination, entrance, Quaternion.LookRotation(-outward)));
+        }
+        else TeleportToRoom(destination, entrance, Quaternion.LookRotation(-outward));
+        return true;
+    }
+
+    IEnumerator ChangeRoom(int destination, Vector3 position, Quaternion rotation)
+    {
+        try
+        {
+            yield return roomTransition.FadeTo(1, settings.roomFadeOutSeconds);
+            TeleportToRoom(destination, position, rotation, false);
+            // Let the new room, lighting and snapped camera settle behind the cover.
+            yield return new WaitForSecondsRealtime(.04f);
+            yield return roomTransition.FadeTo(0, settings.roomFadeInSeconds);
+        }
+        finally
+        {
+            if (roomTransition != null) roomTransition.Clear();
+            IsRoomTransitioning = false; roomTravel = null;
+        }
+        PresentBossRoom();
+    }
+    void OnDisable()
+    {
+        if (roomTravel != null) StopCoroutine(roomTravel);
+        roomTravel = null; IsRoomTransitioning = false;
+        if (roomTransition != null) roomTransition.Clear();
+    }
+
+    public void TeleportToRoom(int room, Vector3 position, Quaternion rotation, bool showBossDialogue = true)
+    {
+        if (room < 0 || room >= roomRoots.Count) return;
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null) return;
+        VisitRoom(room);
+        var movement = player.GetComponent<CharacterMovement>();
+        if (movement != null) movement.Teleport(position, rotation);
+        else
+        {
+            var controller = player.GetComponent<CharacterController>(); bool enabled = controller != null && controller.enabled;
+            if (enabled) controller.enabled = false;
+            player.SetPositionAndRotation(position, rotation);
+            if (enabled) controller.enabled = true;
+        }
+        transitionReadyAt = Time.unscaledTime + .35f;
+        if (cameraRig == null) cameraRig = FindFirstObjectByType<CameraController>();
+        if (cameraRig != null) { cameraRig.SetTarget(player); cameraRig.SnapToTarget(); }
+        MovePlayerLight();
+        Physics.SyncTransforms();
+        if (showBossDialogue) PresentBossRoom();
+    }
+    void PresentBossRoom()
+    {
+        if (Layout.Rooms[CurrentRoom].Kind == DungeonRoomKind.Boss)
+        {
+            var boss = roomRoots[CurrentRoom].GetComponentInChildren<EncounterEnemy>();
+            if (boss != null && !BattleBossDialogue.IsOpen) BattleController.OpenBossDialogue(boss);
+        }
+    }
+    public void VisitRoom(int room)
+    {
+        if (room < 0 || room >= roomRoots.Count || CurrentRoom == room) return;
+        if (CurrentRoom >= 0) roomRoots[CurrentRoom].SetActive(false);
+        CurrentRoom = room;
+        roomRoots[room].SetActive(true);
+        if (minimap != null) minimap.Visit(room);
+    }
+    void OnDestroy()
+    {
+        foreach (Mesh mesh in meshes) if (mesh != null) Destroy(mesh);
+        foreach (Material material in ownedMaterials) if (material != null) Destroy(material);
+    }
+    void LateUpdate()
+    {
+        if (Exploring) MovePlayerLight();
+        RefreshInteractionFeedback();
+    }
+
+    void RefreshInteractionFeedback()
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        Interaction nearest = Exploring && !IsRoomTransitioning && CurrentRoom >= 0 && player != null && !NPCChallengePrompt.BlocksGameplayInput ?
+            FindNearestInteraction(player) : null;
+        DungeonDoorHighlight nextDoor = nearest != null ? nearest.Highlight : null;
+        if (highlightedDoor != nextDoor)
+        {
+            if (highlightedDoor != null) highlightedDoor.SetHighlighted(false);
+            highlightedDoor = nextDoor;
+            if (highlightedDoor != null) highlightedDoor.SetHighlighted(true);
+        }
+        if (targetPrompt != null)
+        {
+            if (nearest == null) targetPrompt.Show(false);
+            else
+            {
+                // Tall gates use the doorway centre, so the marker stays near the player.
+                bool gate = nearest.Kind == InteractionKind.Door;
+                targetPrompt.SetTarget(null, nearest.Visual, nearest.Position + Vector3.up * 2.8f, !gate);
+                string action = nearest.Kind == InteractionKind.Door ? (nearest.Door.Unlocked ? "Enter room" : "Unlock gate") :
+                    nearest.Kind == InteractionKind.Breakable ? "Break" :
+                    nearest.Kind == InteractionKind.Exit ? "Leave dungeon" : nearest.Kind == InteractionKind.Boss ? "Enter boss room" : "Open chest";
+                targetPrompt.Show(true, action);
+            }
+        }
+        if (interactionUI != null)
+            interactionUI.ShowFor(player, nearest != null, cameraRig != null ? cameraRig.ActiveCamera : null);
+    }
+    void MovePlayerLight()
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (playerLight != null && player != null) playerLight.transform.position = player.position + Vector3.up * 9;
+    }
+}

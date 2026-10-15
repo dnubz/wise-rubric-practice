@@ -1,0 +1,170 @@
+using UnityEngine;
+using TMPro;
+
+[DefaultExecutionOrder(200)]
+public class NPCSpeechBubble : MonoBehaviour
+{
+    [Header("UI Elements")]
+    [SerializeField] private TextMeshProUGUI dialogueText;
+    [SerializeField] private GameObject speechBubbleRoot;
+    [SerializeField] private GameObject interactPrompt; // e.g. [F] icon or text
+
+    [Header("Settings")]
+    [SerializeField] private bool faceCamera = true;
+    [SerializeField] private Vector3 offsetFromNpc = new Vector3(0, 2.2f, 0);
+    [SerializeField] private bool useFixedWorldScale = true;
+    [SerializeField, Min(0.0001f)] private float fixedWorldScale = 0.025f;
+    [SerializeField, Min(0f)] private float clearanceAboveNpc = 1f;
+
+    private Transform targetNpc;
+    private float visualTopOffset;
+    private Bounds visualBounds;
+
+    private void Awake()
+    {
+        if (speechBubbleRoot == null)
+        {
+            speechBubbleRoot = gameObject;
+        }
+        if (dialogueText == null)
+        {
+            dialogueText = GetComponentInChildren<TextMeshProUGUI>(true);
+        }
+    }
+
+    public void Initialize(Transform npcTransform)
+    {
+        targetNpc = npcTransform;
+        visualTopOffset = 0f;
+        bool hasBounds = false;
+
+        if (targetNpc != null)
+        {
+            foreach (Renderer renderer in targetNpc.GetComponentsInChildren<Renderer>(true))
+            {
+                if (renderer.enabled && renderer.gameObject.activeInHierarchy &&
+                    (renderer is MeshRenderer || renderer is SkinnedMeshRenderer))
+                {
+                    visualTopOffset = Mathf.Max(visualTopOffset, renderer.bounds.max.y - targetNpc.position.y);
+                    if (!hasBounds) { visualBounds = renderer.bounds; hasBounds = true; }
+                    else visualBounds.Encapsulate(renderer.bounds);
+                }
+            }
+        }
+        if (hasBounds) visualBounds.center -= targetNpc.position;
+
+        ApplyWorldScale();
+    }
+
+    private void LateUpdate()
+    {
+        RefreshPosition();
+    }
+
+    public void RefreshPosition()
+    {
+        ApplyWorldScale();
+        Camera camera = Camera.main;
+        if (targetNpc != null)
+        {
+            Vector3 bubblePosition = targetNpc.position + offsetFromNpc;
+            if (camera != null && transform is RectTransform rect)
+            {
+                Vector3 up = camera.transform.up;
+                Vector3 head = visualBounds.center + Vector3.up * visualBounds.extents.y;
+                float top = Vector3.Dot(up,head);
+                bubblePosition += up * (top + clearanceAboveNpc + rect.rect.height * transform.lossyScale.y * .5f);
+                // The tail sits on the lower-right side of the oval, directly above the speaker.
+                bubblePosition -= camera.transform.right * (rect.rect.width * transform.lossyScale.x * .34f);
+            }
+            else bubblePosition.y += visualTopOffset + clearanceAboveNpc;
+            transform.position = bubblePosition;
+        }
+
+        if (faceCamera && camera != null)
+        {
+            // Billboard effect so speech bubble always faces the camera
+            transform.rotation = camera.transform.rotation;
+            if (TryGetComponent<Canvas>(out var canvas)) canvas.worldCamera = camera;
+        }
+    }
+
+    private void ApplyWorldScale()
+    {
+        if (!useFixedWorldScale)
+        {
+            return;
+        }
+
+        Vector3 parentScale = transform.parent != null ? transform.parent.lossyScale : Vector3.one;
+        if (Mathf.Abs(parentScale.x) < 0.0001f ||
+            Mathf.Abs(parentScale.y) < 0.0001f ||
+            Mathf.Abs(parentScale.z) < 0.0001f)
+        {
+            return;
+        }
+
+        float worldScale = Mathf.Max(0.0001f, fixedWorldScale);
+        Vector3 localScale = new Vector3(
+            worldScale / parentScale.x,
+            worldScale / parentScale.y,
+            worldScale / parentScale.z);
+
+        if (transform.localScale != localScale)
+        {
+            transform.localScale = localScale;
+        }
+    }
+
+    public void Show()
+    {
+        if (speechBubbleRoot != null)
+        {
+            speechBubbleRoot.SetActive(true);
+            RefreshPosition();
+        }
+    }
+
+    public void Hide()
+    {
+        if (speechBubbleRoot != null)
+        {
+            speechBubbleRoot.SetActive(false);
+        }
+    }
+
+    public void SetText(string text)
+    {
+        if (dialogueText != null)
+        {
+            dialogueText.text = text;
+            dialogueText.maxVisibleCharacters = int.MaxValue;
+        }
+    }
+
+    public void SetInteractPromptVisible(bool visible)
+    {
+        if (interactPrompt != null)
+        {
+            interactPrompt.SetActive(visible);
+        }
+    }
+
+    public int PrepareTyping(string text)
+    {
+        if (dialogueText == null) return text.Length;
+        dialogueText.text = text; dialogueText.maxVisibleCharacters = 0;
+        dialogueText.ForceMeshUpdate(true);
+        return dialogueText.textInfo.characterCount;
+    }
+
+    public void ShowCharacters(int count)
+    {
+        if (dialogueText != null) dialogueText.maxVisibleCharacters = count;
+    }
+
+    public bool IsVisible()
+    {
+        return speechBubbleRoot != null && speechBubbleRoot.activeSelf;
+    }
+}

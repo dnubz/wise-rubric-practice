@@ -1,0 +1,19 @@
+using System;
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "CharacterHudEvents", menuName = "Events/Character HUD Event Channel")]
+public sealed class CharacterHudEventChannel : ScriptableObject
+{
+    public event Action<CharacterBase> CharacterSelected;
+    public event Action<CharacterBase> CharacterStatsChanged;
+
+    public void RaiseCharacterSelected(CharacterBase character)
+    {
+        CharacterSelected?.Invoke(character);
+    }
+
+    public void RaiseCharacterStatsChanged(CharacterBase character)
+    {
+        CharacterStatsChanged?.Invoke(character);
+    }
+}

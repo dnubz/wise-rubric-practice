@@ -1,0 +1,205 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class WiseSwordSetup
+{
+    const string Folder = "Temp/WiseSword";
+    const string ModelPath = "Assets/Imported Assets/sword/source/Sword_Low_Done.FBX";
+    public const string PrefabPath = "Assets/Imported Assets/sword/WiSeSword.prefab";
+    static double next;
+    static WiseSwordSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        bool report = File.Exists(Folder + "/report.request");
+        bool pose = File.Exists(Folder + "/pose.request");
+        bool live = File.Exists(Folder + "/saved-grip.request");
+        if (!report && !pose && !live && !File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + (report ? "/report.request" : pose ? "/pose.request" : live ? "/saved-grip.request" : "/setup.request"));
+        try { if (report) Report(); else if (pose) UprightPose(); else if (live) SaveLiveGrip(); else Build(); File.WriteAllText(Folder + "/setup-result.txt", report ? "PASS: model report saved." : live ? "PASS: actual Play-mode sword grip saved in GameScene." : pose ? "PASS: upright sword grip saved and checked against WiSe's idle hand pose." : "PASS: imported textured sword prefab attached to WiSe's right-hand bone; existing one-handed slash state and tree swing sound saved."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    static Bounds Bounds(GameObject model)
+    {
+        var renderers = model.GetComponentsInChildren<MeshRenderer>();
+        var bounds = renderers[0].bounds; foreach (var renderer in renderers) bounds.Encapsulate(renderer.bounds);
+        return bounds;
+    }
+    static WiSe Hero() => Object.FindObjectsByType<WiSe>(FindObjectsInactive.Include).First(w => w.gameObject.scene.path == "Assets/Scenes/GameScene.unity");
+    static void Report()
+    {
+        var model = Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>(ModelPath));
+        var hero = Object.Instantiate(Hero().gameObject);
+        try
+        {
+            hero.SetActive(true); var animator = hero.GetComponentInChildren<Animator>(); animator.Rebind(); animator.Update(0);
+            var log = new StringBuilder(); log.AppendLine("Model bounds: " + Bounds(model));
+            foreach (var mesh in model.GetComponentsInChildren<MeshFilter>())
+            {
+                log.AppendLine(mesh.name + ": local=" + mesh.sharedMesh.bounds + ", scale=" + mesh.transform.lossyScale);
+                var vertices = mesh.sharedMesh.vertices;
+                for (int i = 0; i < vertices.Length; i += Math.Max(1, vertices.Length / 50)) log.AppendLine("vertex=" + mesh.transform.TransformPoint(vertices[i]));
+            }
+            var hand = animator.GetBoneTransform(HumanBodyBones.RightHand);
+            log.AppendLine("Hero height=" + hero.GetComponent<CharacterController>().bounds.size.y);
+            log.AppendLine("Hand path=" + AnimationUtility.CalculateTransformPath(hand, hero.transform));
+            log.AppendLine("Hand basis: right=" + hand.right + ", up=" + hand.up + ", forward=" + hand.forward);
+            var sword = hand.Find("WiSeSword");
+            if (sword != null)
+            {
+                log.AppendLine("Sword up=" + sword.up + "; local rotation=" + sword.localEulerAngles);
+                foreach (var filter in sword.GetComponentsInChildren<MeshFilter>())
+                {
+                    var points = filter.sharedMesh.vertices.Select(v => sword.InverseTransformPoint(filter.transform.TransformPoint(v))).ToArray();
+                    var actual = new Bounds(points[0], Vector3.zero); foreach (var point in points) actual.Encapsulate(point);
+                    log.AppendLine("Actual sword-space geometry=" + actual + "; model=" + filter.transform.localEulerAngles);
+                    File.WriteAllLines(Folder + "/sword-vertices.txt", points.Select(p => p.x + "," + p.y + "," + p.z));
+                }
+            }
+            File.WriteAllText(Folder + "/model-report.txt", log.ToString());
+        }
+        finally { Object.DestroyImmediate(model); Object.DestroyImmediate(hero); }
+    }
+    public static void Build()
+    {
+        var material = SwordMaterial();
+        var root = new GameObject("WiSeSword");
+        GameObject prefab;
+        try
+        {
+            var model = (GameObject)PrefabUtility.InstantiatePrefab(AssetDatabase.LoadAssetAtPath<GameObject>(ModelPath));
+            model.transform.SetParent(root.transform, false);
+            foreach (var renderer in model.GetComponentsInChildren<MeshRenderer>()) renderer.sharedMaterial = material;
+            foreach (var collider in model.GetComponentsInChildren<Collider>()) Object.DestroyImmediate(collider);
+            // Model coordinates are normalized once in the saved prefab. The
+            // root represents the grip, not the middle of the blade.
+            var bounds = Bounds(model); Vector3 size = bounds.size;
+            Vector3 axis = size.y >= size.x && size.y >= size.z ? Vector3.up : size.x >= size.z ? Vector3.right : Vector3.forward;
+            // This imported mesh points its blade toward negative Y; preserve
+            // the FBX axis conversion while turning the tip toward prefab +Y.
+            model.transform.rotation = Quaternion.FromToRotation(-axis, Vector3.up) * model.transform.rotation;
+            bounds = Bounds(model); model.transform.localScale *= 3f / bounds.size.y;
+            bounds = Bounds(model);
+            model.transform.position -= new Vector3(bounds.center.x, bounds.min.y + bounds.size.y * .12f, bounds.center.z);
+            prefab = PrefabUtility.SaveAsPrefabAsset(root, PrefabPath);
+        }
+        finally { Object.DestroyImmediate(root); }
+        var source = Hero();
+        var sample = Object.Instantiate(source.gameObject);
+        string handPath;
+        try
+        {
+            sample.SetActive(true); var animator = sample.GetComponentInChildren<Animator>(); animator.Rebind(); animator.Update(0);
+            handPath = AnimationUtility.CalculateTransformPath(animator.GetBoneTransform(HumanBodyBones.RightHand), sample.transform);
+        }
+        finally { Object.DestroyImmediate(sample); }
+        var hand = source.transform.Find(handPath);
+        if (hand == null) throw new Exception("WiSe's right-hand bone is missing.");
+        var old = hand.Find("WiSeSword"); if (old != null) Object.DestroyImmediate(old.gameObject);
+        var weapon = (GameObject)PrefabUtility.InstantiatePrefab(prefab, hand);
+        weapon.transform.localPosition = Vector3.zero;
+        ApplyReadyGrip(source, weapon.transform);
+        Vector3 parentScale = hand.lossyScale;
+        weapon.transform.localScale = new Vector3(1 / Mathf.Abs(parentScale.x), 1 / Mathf.Abs(parentScale.y), 1 / Mathf.Abs(parentScale.z));
+        var fields = new SerializedObject(source);
+        fields.FindProperty("cuttingSwingSound").objectReferenceValue = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/SFX/Combat/sword_swing_01.wav");
+        fields.ApplyModifiedPropertiesWithoutUndo();
+        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>("Assets/Animations/PlayerAnimatorController.controller");
+        var state = controller.layers[0].stateMachine.states.Select(s => s.state).First(s => s.name == "BreakDecoration");
+        state.motion = AssetDatabase.LoadAllAssetsAtPath("Assets/Blink/Art/Animations/Combat/MeeleeAttack_OneHanded.fbx").OfType<AnimationClip>().First(c => c.name == "MeeleeAttack_OneHanded");
+        state.speed = 1.2f;
+        EditorUtility.SetDirty(state); EditorUtility.SetDirty(controller); AssetDatabase.SaveAssetIfDirty(controller);
+        EditorSceneManager.MarkSceneDirty(source.gameObject.scene); EditorSceneManager.SaveScene(source.gameObject.scene);
+    }
+    static void UprightPose()
+    {
+        var source = Hero();
+        var sword = source.GetComponentsInChildren<Transform>(true).Single(t => t.name == "WiSeSword");
+        ApplyReadyGrip(source, sword);
+        PrefabUtility.RecordPrefabInstancePropertyModifications(sword);
+        EditorSceneManager.MarkSceneDirty(source.gameObject.scene);
+        EditorSceneManager.SaveScene(source.gameObject.scene);
+        var sample = Object.Instantiate(source.gameObject);
+        try
+        {
+            sample.SetActive(true); var animator = SampleAnimator(sample);
+            animator.Play("Base Layer.Idle", 0, 0); animator.Update(.001f);
+            var weapon = animator.GetBoneTransform(HumanBodyBones.RightHand).Find("WiSeSword");
+            var log = new StringBuilder();
+            foreach (float phase in new[] { 0f, .25f, .5f, .75f })
+            {
+                animator.Play("Base Layer.Idle", 0, phase); animator.Update(0);
+                float upward = Vector3.Dot(weapon.up, Vector3.up);
+                if (upward < .75f) throw new Exception("Sword leans sideways during idle at " + phase + ": " + upward);
+                log.AppendLine("Idle phase=" + phase + "; blade=" + weapon.up + "; grip=" + weapon.position + "; hand=" + weapon.parent.position);
+            }
+            File.WriteAllText(Folder + "/upright-pose.txt", log.ToString());
+        }
+        finally { Object.DestroyImmediate(sample); }
+    }
+    static void ApplyReadyGrip(WiSe source, Transform sword)
+    {
+        const string path = "Assets/Animations/WiSeSwordAnimator.overrideController";
+        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>("Assets/Animations/PlayerAnimatorController.controller");
+        var idle = (AnimationClip)controller.layers[0].stateMachine.states.First(s => s.state.name == "Idle").state.motion;
+        var ready = AssetDatabase.LoadAllAssetsAtPath("Assets/Blink/Art/Animations/Combat/IdleCombat.fbx").OfType<AnimationClip>().First(c => c.name == "IdleCombat");
+        var equipped = AssetDatabase.LoadAssetAtPath<AnimatorOverrideController>(path);
+        if (equipped == null) { equipped = new AnimatorOverrideController(controller); AssetDatabase.CreateAsset(equipped, path); }
+        equipped.runtimeAnimatorController = controller; equipped[idle] = ready;
+        EditorUtility.SetDirty(equipped); AssetDatabase.SaveAssetIfDirty(equipped);
+        var body = source.GetComponentInChildren<Animator>(); body.runtimeAnimatorController = equipped;
+        PrefabUtility.RecordPrefabInstancePropertyModifications(body);
+        var sample = Object.Instantiate(source.gameObject);
+        try
+        {
+            sample.SetActive(true); var animator = SampleAnimator(sample);
+            animator.Play("Base Layer.Idle", 0, 0); animator.Update(.001f);
+            var hand = animator.GetBoneTransform(HumanBodyBones.RightHand);
+            // The prefab's blade is +Y. Set its ready direction from the actual
+            // animated hand, rather than guessing wrist Euler angles.
+            sword.localRotation = Quaternion.Inverse(hand.rotation) * sample.transform.rotation * Quaternion.Euler(20, 0, 0);
+            var knuckle = animator.GetBoneTransform(HumanBodyBones.RightMiddleProximal);
+            sword.localPosition = knuckle != null ? hand.InverseTransformPoint(knuckle.position) * .55f : Vector3.zero;
+        }
+        finally { Object.DestroyImmediate(sample); }
+    }
+    static Animator SampleAnimator(GameObject sample)
+    {
+        var animator = sample.GetComponentInChildren<Animator>();
+        animator.enabled = true; animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+        animator.applyRootMotion = false; animator.Rebind();
+        return animator;
+    }
+    static void SaveLiveGrip()
+    {
+        var source = Hero(); var sword = source.GetComponentsInChildren<Transform>(true).Single(t => t.name == "WiSeSword");
+        sword.localRotation = JsonUtility.FromJson<Quaternion>(File.ReadAllText(Folder + "/live-local-rotation.json"));
+        PrefabUtility.RecordPrefabInstancePropertyModifications(sword);
+        EditorSceneManager.MarkSceneDirty(source.gameObject.scene); EditorSceneManager.SaveScene(source.gameObject.scene);
+    }
+    static Material SwordMaterial()
+    {
+        const string path = "Assets/Imported Assets/sword/Sword.mat";
+        var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+        if (material == null) { material = new Material(Shader.Find("Universal Render Pipeline/Lit")); AssetDatabase.CreateAsset(material, path); }
+        const string textures = "Assets/Imported Assets/sword/textures/";
+        var normal = (TextureImporter)AssetImporter.GetAtPath(textures + "Sword_Normal_DirectX.png");
+        normal.textureType = TextureImporterType.NormalMap; normal.flipGreenChannel = true; normal.SaveAndReimport();
+        material.SetTexture("_BaseMap", AssetDatabase.LoadAssetAtPath<Texture2D>(textures + "Sword_Base_Color.png"));
+        material.SetTexture("_BumpMap", AssetDatabase.LoadAssetAtPath<Texture2D>(textures + "Sword_Normal_DirectX.png"));
+        material.EnableKeyword("_NORMALMAP");
+        material.SetTexture("_MetallicGlossMap", AssetDatabase.LoadAssetAtPath<Texture2D>(textures + "Sword_Metallic.png"));
+        material.EnableKeyword("_METALLICSPECGLOSSMAP"); material.SetFloat("_Metallic", 1); material.SetFloat("_Smoothness", .35f);
+        material.SetTexture("_OcclusionMap", AssetDatabase.LoadAssetAtPath<Texture2D>(textures + "Sword_occlusion.png"));
+        EditorUtility.SetDirty(material); AssetDatabase.SaveAssetIfDirty(material); return material;
+    }
+}

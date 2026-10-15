@@ -1,0 +1,75 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class CharacterHighlightChecks
+{
+    const string Folder = "Temp/CharacterHighlight";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static CharacterHighlightChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: white highlights return across repeated activation cycles for all three character fixtures at overworld/dungeon heights; mesh and skinned outlines restore; rapid switches immediately hide old copies and create no nested/duplicate live outlines; manual/proximity highlights remain opt-in. Live party untouched."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); }
+    }
+    [MenuItem("WiSe/Characters/Check Highlight Reactivation")]
+    public static void Run()
+    {
+        var root = new GameObject("HighlightFixtures"); root.hideFlags = HideFlags.HideAndDontSave;
+        root.SetActive(false); root.transform.position = Vector3.one * 100000;
+        var mesh = new Mesh { vertices = new[] { Vector3.zero, Vector3.right, Vector3.up }, triangles = new[] { 0, 1, 2 } };
+        mesh.RecalculateNormals(); mesh.RecalculateBounds();
+        var shader = Shader.Find("Custom/URP_WhiteOutline"); Require(shader != null, "White outline shader is missing.");
+        var material = new Material(shader);
+        var party = new ObjectHighlight[3];
+        try
+        {
+            for (int i = 0; i < party.Length; i++)
+            {
+                var character = new GameObject("Character" + i); character.transform.SetParent(root.transform, false);
+                var body = new GameObject("Body"); body.transform.SetParent(character.transform, false);
+                body.AddComponent<MeshFilter>().sharedMesh = mesh; body.AddComponent<MeshRenderer>().sharedMaterial = material;
+                var cape = new GameObject("SkinnedBody"); cape.transform.SetParent(character.transform, false);
+                var skinned = cape.AddComponent<SkinnedMeshRenderer>(); skinned.sharedMesh = mesh; skinned.sharedMaterial = material;
+                party[i] = character.AddComponent<ObjectHighlight>(); Set(party[i], "outlineMaterial", material);
+            }
+            // Start is deliberately never called: returning to a character must use OnEnable.
+            foreach (float height in new[] { 0f, -500f })
+            for (int cycle = 0; cycle < 3; cycle++)
+            foreach (var highlight in party)
+            {
+                highlight.transform.localPosition = Vector3.up * height;
+                Call(highlight, "OnEnable");
+                var active = Field<List<GameObject>>(highlight, "outlineObjects");
+                Require(active.Count == 2 && active.TrueForAll(g => g != null && g.activeSelf), "Reactivated character lost a mesh/skinned highlight.");
+                Require(Field<Material>(highlight, "runtimeOutlineMat").GetColor("_OutlineColor") == Color.white, "Highlight is not white.");
+                Call(highlight, "OnEnable"); Require(active.Count == 2, "Re-enabling duplicates outlines.");
+                var old = active.ToArray(); Call(highlight, "OnDisable");
+                Require(active.Count == 0 && Array.TrueForAll(old, g => g == null || !g.activeSelf), "Disabled outlines remain visible until frame-end.");
+            }
+            foreach (var highlight in party)
+            {
+                Set(highlight, "highlightOnStart", false); Call(highlight, "OnEnable");
+                Require(Field<List<GameObject>>(highlight, "outlineObjects").Count == 0, "Manual highlight became automatic.");
+                Set(highlight, "highlightOnStart", true); Set(highlight, "useProximity", true); Call(highlight, "OnEnable");
+                Require(Field<List<GameObject>>(highlight, "outlineObjects").Count == 0, "Proximity highlight was forced on.");
+            }
+        }
+        finally
+        {
+            foreach (var highlight in party) if (highlight != null) Call(highlight, "OnDestroy");
+            Object.DestroyImmediate(root); Object.DestroyImmediate(mesh); Object.DestroyImmediate(material);
+        }
+    }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static void Set(object owner, string name, object value) => owner.GetType().GetField(name, Private).SetValue(owner, value);
+    static void Call(object owner, string name) => owner.GetType().GetMethod(name, Private).Invoke(owner, null);
+    static void Require(bool value, string message) { if (!value) throw new Exception(message); }
+}

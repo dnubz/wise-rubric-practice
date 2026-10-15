@@ -1,0 +1,185 @@
+using System;
+using UnityEngine;
+
+public static class CheatCodes
+{
+    public enum Area { Overworld, Dungeon, Battle }
+    public sealed class Definition
+    {
+        public readonly string Code, Description;
+        public readonly Area Location;
+        public Definition(string code, string description, Area location)
+        { Code = code; Description = description; Location = location; }
+    }
+    public static readonly Definition[] Definitions =
+    {
+        new Definition("Nerdlumarco", "Teleport to the nearest Berdly.", Area.Overworld),
+        new Definition("Nerdluryuu", "Teleport to the nearest Berdly.", Area.Overworld),
+        new Definition("wibulupaul", "Teleport to the nearest Pink.", Area.Overworld),
+        new Definition("cashgrab", "Gain 1,000 gold.", Area.Overworld),
+        new Definition("equipment", "Receive one of every equipment item.", Area.Overworld),
+        new Definition("drain", "Set every party member's HP to 1.", Area.Overworld),
+        new Definition("luluspresent", "Unlock WiSe's ultimate.", Area.Overworld),
+        new Definition("lastday", "Unlock Druid's ultimate.", Area.Overworld),
+        new Definition("724", "Teleport to the nearest dungeon entrance.", Area.Overworld),
+        new Definition("spawnpoint", "Teleport to the overworld origin.", Area.Overworld),
+        new Definition("ptyusari", "Teleport to the nearest shop.", Area.Overworld),
+        new Definition("showmain", "Reveal the degree 1 path on the dungeon map.", Area.Dungeon),
+        new Definition("revealall", "Reveal every room, coloured by chain degree.", Area.Dungeon),
+        new Definition("skipskip", "Teleport to the room before the boss and receive a Boss Key.", Area.Dungeon),
+        new Definition("tpagacor", "Defeat all enemies in the current battle.", Area.Battle),
+        new Definition("evalcore", "Set every party member's HP to 1.", Area.Battle)
+    };
+
+    public static Definition Find(string code)
+    {
+        string value = (code ?? "").Trim();
+        foreach (var definition in Definitions)
+            if (string.Equals(definition.Code, value, StringComparison.OrdinalIgnoreCase)) return definition;
+        return null;
+    }
+
+    public static bool Execute(string code, out string message)
+    {
+        var definition = Find(code);
+        if (definition == null) { message = "Unknown code. Check the spelling and try again."; return false; }
+        if (DungeonSession.IsTransitioning) { message = "Wait for dungeon travel to finish."; return false; }
+        Area current = BerdlyBattleController.IsOpen || BattleSession.IsActive ? Area.Battle : DungeonSession.IsInside ? Area.Dungeon : Area.Overworld;
+        if (PinkRhythmController.IsOpen) { message = "Close Pink's rhythm challenge before using this code."; return false; }
+        if (definition.Location != current)
+        { message = "Use this code in the " + definition.Location.ToString().ToLowerInvariant() + "."; return false; }
+        switch (definition.Code.ToLowerInvariant())
+        {
+            case "luluspresent":
+                if (!Unlock<WiSe>()) { message = "WiSe is not in the current party."; return false; }
+                break;
+            case "lastday":
+                if (!Unlock<Druid>()) { message = "Druid is not in the current party."; return false; }
+                break;
+            case "cashgrab": PlayerInventory.Instance.AddGold(1000); break;
+            case "equipment":
+                var catalog = Resources.Load<CheatEquipmentCatalog>("Cheats/Equipment");
+                var inventory = UnityEngine.Object.FindFirstObjectByType<Inventory>();
+                if (catalog == null || catalog.equipment == null || catalog.equipment.Length == 0 || inventory == null)
+                { message = "Equipment inventory or catalogue is unavailable."; return false; }
+                foreach (var item in catalog.equipment) if (item != null) PlayerInventory.Instance.AddItem(item);
+                foreach (var ui in UnityEngine.Object.FindObjectsByType<EquipmentUI>()) ui.RefreshUI();
+                break;
+            case "drain": DrainParty(); break;
+            case "evalcore":
+                if (BattleSession.IsActive) { DrainParty(); BattleController.Instance?.RefreshHUD(); break; }
+                if (!BerdlyBattleController.CheatDrainHP()) { message = "This battle has already finished."; return false; }
+                DrainParty(); break;
+            case "tpagacor":
+                if (BattleSession.IsActive) { if (!BattleSession.Instance.CheatWin()) { message = "This battle has already finished."; return false; } break; }
+                if (!BerdlyBattleController.CheatWin()) { message = "This battle has already finished."; return false; }
+                break;
+            case "showmain": DungeonSession.Generator.RevealMainPath(); break;
+            case "revealall": DungeonSession.Generator.RevealAllRooms(); break;
+            case "skipskip": DungeonSession.Generator.SkipToBoss(); break;
+            case "spawnpoint": return TeleportOrigin(out message);
+            case "nerdlumarco": case "nerdluryuu":
+                return TeleportNearest<MinigameNPC>(n => n.isActiveAndEnabled && n.Kind == MinigameNPC.MinigameKind.BerdlyChemistry, "Berdly", out message);
+            case "wibulupaul":
+                return TeleportNearest<MinigameNPC>(n => n.isActiveAndEnabled && n.Kind == MinigameNPC.MinigameKind.PinkRhythm, "Pink", out message);
+            case "724":
+                return TeleportDungeon(out message);
+            case "ptyusari":
+                return TeleportNearest<InteractableNPC>(n => n.isActiveAndEnabled && n.IsShop, "shop", out message);
+        }
+        message = definition.Description; return true;
+    }
+
+    static bool Unlock<T>() where T : CharacterBase
+    {
+        bool found = false;
+        foreach (var character in UnityEngine.Object.FindObjectsByType<T>(FindObjectsInactive.Include))
+        { character.UnlockUltimate(); found = true; }
+        if (found) DungeonSession.RefreshEntryRequirements();
+        return found;
+    }
+    static void DrainParty()
+    {
+        foreach (var character in UnityEngine.Object.FindObjectsByType<CharacterBase>(FindObjectsInactive.Include))
+            character.SetCurrentHP(1);
+    }
+    static bool TeleportDungeon(out string message)
+    {
+        bool found = false;
+        foreach (var entrance in UnityEngine.Object.FindObjectsByType<DungeonEntrance>())
+            if (entrance.isActiveAndEnabled && entrance.TargetSceneName == "DungeonScene") { found = true; break; }
+        if (!found)
+        {
+            var world = WFCWorldManager.Instance;
+            if (world == null || !world.TryEnsureDungeonNearPlayer())
+            { message = "No dungeon could be placed on the loaded dry terrain. Check the dungeon prefab or explore more chunks."; return false; }
+        }
+        return TeleportNearest<DungeonEntrance>(n => n.isActiveAndEnabled && n.TargetSceneName == "DungeonScene", "dungeon entrance", out message);
+    }
+    static bool TeleportNearest<T>(Func<T, bool> accepts, string label, out string message) where T : Component
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null) { message = "Select a character first."; return false; }
+        T nearest = null; float distance = float.PositiveInfinity;
+        foreach (T target in UnityEngine.Object.FindObjectsByType<T>())
+        {
+            if (!accepts(target)) continue;
+            Vector3 delta = target.transform.position - player.position; delta.y = 0;
+            if (delta.sqrMagnitude < distance) { distance = delta.sqrMagnitude; nearest = target; }
+        }
+        if (nearest == null) { message = "No loaded " + label + " found. Explore more chunks and try again."; return false; }
+        if (!FindLanding(nearest.transform.position, player, false, out Vector3 landing))
+        { message = "No safe ground near this " + label + "."; return false; }
+        Move(player, landing);
+        message = "Teleported to the nearest " + label + "."; return true;
+    }
+    static bool TeleportOrigin(out string message)
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        var world = WFCWorldManager.Instance;
+        if (player == null || world == null || !world.isActiveAndEnabled)
+        { message = "The overworld is unavailable."; return false; }
+        Vector3 old = player.position;
+        // Stream the destination through the existing seeded WFC system before sampling its terrain.
+        Move(player, new Vector3(0, old.y, 0)); world.RefreshWorldAroundPlayer(); Physics.SyncTransforms();
+        if (!FindLanding(Vector3.zero, player, true, out Vector3 landing))
+        { Move(player, old); world.RefreshWorldAroundPlayer(); message = "No safe ground at the overworld origin."; return false; }
+        Move(player, landing); message = "Teleported to the overworld origin."; return true;
+    }
+    static bool FindLanding(Vector3 destination, Transform player, bool includeCentre, out Vector3 landing)
+    {
+        var terrain = UnityEngine.Object.FindObjectsByType<TerrainCollider>();
+        var controller = player.GetComponent<CharacterController>();
+        float radius = controller != null ? controller.radius * Mathf.Max(player.lossyScale.x, player.lossyScale.z) : .4f;
+        float height = controller != null ? controller.height * player.lossyScale.y : 2;
+        Vector3 centre = controller != null ? Vector3.Scale(controller.center, player.lossyScale) : Vector3.up;
+        for (int ring = includeCentre ? 0 : 1; ring <= 4; ring++)
+            for (int direction = 0; direction < (ring == 0 ? 1 : 8); direction++)
+            {
+                float angle = direction * Mathf.PI / 4;
+                Vector3 probe = destination + new Vector3(Mathf.Sin(angle), 0, Mathf.Cos(angle)) * (ring * 2.5f);
+                if (!ChunkSpawnUtility.TryGetGround(terrain, probe.x, probe.z, true, out Vector3 ground)) continue;
+                Vector3 feet = ground + Vector3.up * .15f;
+                float half = Mathf.Max(0, height / 2 - radius);
+                bool blocked = false;
+                foreach (var collider in Physics.OverlapCapsule(feet + centre + Vector3.up * half,
+                    feet + centre - Vector3.up * half, radius * .95f, ~0, QueryTriggerInteraction.Ignore))
+                    if (!(collider is TerrainCollider) && !collider.transform.IsChildOf(player)) { blocked = true; break; }
+                if (!blocked) { landing = feet; return true; }
+            }
+        landing = default; return false;
+    }
+    static void Move(Transform player, Vector3 position)
+    {
+        var movement = player.GetComponent<CharacterMovement>();
+        if (movement != null) movement.Teleport(position, player.rotation);
+        else
+        {
+            var controller = player.GetComponent<CharacterController>(); bool enabled = controller != null && controller.enabled;
+            if (enabled) controller.enabled = false;
+            player.position = position;
+            if (enabled) controller.enabled = true;
+        }
+        Physics.SyncTransforms();
+    }
+}

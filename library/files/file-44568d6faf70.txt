@@ -1,0 +1,466 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.EventSystems;
+using TMPro;
+
+public class EquipmentUI : MonoBehaviour
+{
+    [Header("References")]
+    [SerializeField] private Inventory playerInventory;
+    [SerializeField] private CharacterBase[] characters;
+
+    [Header("Character Selection")]
+    [SerializeField] private Button[] avatarButtons;
+    private int selectedCharacterIndex = 0;
+
+    [Header("Equipment Slots")]
+    [SerializeField] private Button[] slotButtons = new Button[2];
+    [SerializeField] private TextMeshProUGUI[] slotTexts = new TextMeshProUGUI[2];
+    [SerializeField] private Image[] slotIcons = new Image[2];
+    private int selectedSlotIndex = 0;
+
+    [Header("Avatar HP/SP Bars")]
+    [SerializeField] private Image[] hpBars;
+    [SerializeField] private TextMeshProUGUI[] hpTexts;
+    [SerializeField] private Image[] spBars;
+    [SerializeField] private TextMeshProUGUI[] spTexts;
+
+    [Header("Available Equipment List")]
+    [SerializeField] private Transform equipmentListContainer;
+    [SerializeField] private GameObject equipmentItemPrefab;
+
+    [Header("Stats & Info Display")]
+    [SerializeField] private TextMeshProUGUI nameText;
+    [SerializeField] private TextMeshProUGUI descriptionText;
+
+    [Header("Stat Texts (Base / Diff)")]
+    [SerializeField] private TextMeshProUGUI hpText;
+    [SerializeField] private TextMeshProUGUI hpDiffText;
+    [SerializeField] private TextMeshProUGUI spText;
+    [SerializeField] private TextMeshProUGUI spDiffText;
+    [SerializeField] private TextMeshProUGUI atkText;
+    [SerializeField] private TextMeshProUGUI atkDiffText;
+    [SerializeField] private TextMeshProUGUI defText;
+    [SerializeField] private TextMeshProUGUI defDiffText;
+    [SerializeField] private TextMeshProUGUI critText;
+    [SerializeField] private TextMeshProUGUI critDiffText;
+
+    private void Awake()
+    {
+        EnsureCorrectContainer();
+    }
+
+    private void EnsureCorrectContainer()
+    {
+        if (equipmentListContainer != null)
+        {
+            ScrollRect sr = equipmentListContainer.GetComponent<ScrollRect>();
+            if (sr != null && sr.content != null)
+            {
+                equipmentListContainer = sr.content;
+            }
+
+            VerticalLayoutGroup vlg = equipmentListContainer.GetComponent<VerticalLayoutGroup>();
+            if (vlg != null)
+            {
+                vlg.childForceExpandHeight = false;
+            }
+
+            RectTransform rt = equipmentListContainer as RectTransform;
+            if (rt != null)
+            {
+                rt.anchoredPosition = new Vector2(0, rt.anchoredPosition.y);
+                rt.sizeDelta = new Vector2(0, rt.sizeDelta.y);
+            }
+        }
+    }
+
+    private void Start()
+    {
+        for (int i = 0; avatarButtons != null && i < avatarButtons.Length; i++)
+        {
+            if (avatarButtons[i] == null) continue;
+            int index = i;
+            avatarButtons[i].onClick.AddListener(() => SelectCharacter(index));
+        }
+
+        for (int i = 0; slotButtons != null && i < slotButtons.Length; i++)
+        {
+            if (slotButtons[i] == null) continue;
+            int index = i;
+            slotButtons[i].onClick.AddListener(() => SelectSlot(index));
+        }
+
+        SelectCharacter(0);
+    }
+
+    private void OnEnable()
+    {
+        EnsureCorrectContainer();
+        RefreshUI();
+        ClearInfoPanel();
+        UpdateBars();
+    }
+
+    private void Update()
+    {
+        UpdateBars();
+    }
+
+    private void UpdateBars()
+    {
+        if (characters == null) return;
+        for (int i = 0; i < characters.Length; i++)
+        {
+            if (characters[i] == null) continue;
+
+            int currHP = characters[i].GetCurrHP();
+            int maxHP = characters[i].GetMaxHP();
+            int currSP = characters[i].GetCurrSP();
+            int maxSP = characters[i].GetMaxSP();
+
+            if (hpBars != null && i < hpBars.Length)
+                MenuStatBar.Set(hpBars[i], currHP, maxHP);
+
+            if (hpTexts != null && i < hpTexts.Length && hpTexts[i] != null)
+                hpTexts[i].text = currHP + "/" + maxHP;
+
+            if (spBars != null && i < spBars.Length)
+                MenuStatBar.Set(spBars[i], currSP, maxSP);
+
+            if (spTexts != null && i < spTexts.Length && spTexts[i] != null)
+                spTexts[i].text = currSP + "/" + maxSP;
+        }
+    }
+
+    public void SelectCharacter(int index)
+    {
+        if (characters == null || index < 0 || index >= characters.Length || characters[index] == null) return;
+        selectedCharacterIndex = index;
+        SelectSlot(0); // Reset to slot 0
+    }
+
+    public void SelectSlot(int index)
+    {
+        if (index < 0 || index >= 2) return;
+        selectedSlotIndex = index;
+        RefreshUI();
+        ClearInfoPanel();
+    }
+
+    public void RefreshUI()
+    {
+        if (characters == null || selectedCharacterIndex < 0 || selectedCharacterIndex >= characters.Length) return;
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+        if (selectedChar == null || selectedChar.EquippedItems == null) return;
+
+        // Update slot visuals
+        for (int i = 0; i < 2; i++)
+        {
+            Equipment equipped = i < selectedChar.EquippedItems.Length ? selectedChar.EquippedItems[i] : null;
+            Image slotIcon = (slotIcons != null && i < slotIcons.Length && slotIcons[i] != null)
+                ? slotIcons[i]
+                : (slotButtons != null && i < slotButtons.Length && slotButtons[i] != null
+                    ? slotButtons[i].transform.Find("Icon")?.GetComponent<Image>()
+                    : null);
+
+            if (equipped != null)
+            {
+                if (slotTexts != null && i < slotTexts.Length && slotTexts[i] != null)
+                    slotTexts[i].text = equipped.ItemName;
+                if (slotIcon != null)
+                {
+                    slotIcon.sprite = equipped.Icon;
+                    slotIcon.gameObject.SetActive(equipped.Icon != null);
+                }
+            }
+            else
+            {
+                if (slotTexts != null && i < slotTexts.Length && slotTexts[i] != null)
+                    slotTexts[i].text = "Empty";
+                if (slotIcon != null)
+                {
+                    slotIcon.sprite = null;
+                    slotIcon.gameObject.SetActive(false);
+                }
+            }
+        }
+
+        PopulateAvailableEquipment();
+    }
+
+    private void PopulateAvailableEquipment()
+    {
+        EnsureCorrectContainer();
+        if (equipmentListContainer == null) return;
+
+        // Clear old list
+        foreach (Transform child in equipmentListContainer)
+        {
+            child.gameObject.SetActive(false);
+            Destroy(child.gameObject);
+        }
+
+        if (playerInventory == null || equipmentItemPrefab == null) return;
+
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+        Equipment currentEquip = selectedChar.EquippedItems[selectedSlotIndex];
+
+        // If the slot has something equipped, show Remove as the first button
+        if (currentEquip != null)
+        {
+            GameObject removeBtn = Instantiate(equipmentItemPrefab, equipmentListContainer);
+            TextMeshProUGUI removeTxt = removeBtn.GetComponentInChildren<TextMeshProUGUI>();
+            if (removeTxt != null)
+            {
+                removeTxt.text = "Remove";
+                removeTxt.raycastTarget = false;
+            }
+
+            // Hide the icon image if it exists
+            Image removeIcon = removeBtn.transform.Find("Icon")?.GetComponent<Image>();
+            if (removeIcon != null) removeIcon.gameObject.SetActive(false);
+
+            Button removeButton = removeBtn.GetComponent<Button>();
+            if (removeButton != null)
+            {
+                removeButton.onClick.AddListener(RemoveEquippedItem);
+            }
+
+            // HOVER on Remove = preview stat reductions
+            EventTrigger removeTrigger = removeBtn.GetComponent<EventTrigger>() ?? removeBtn.AddComponent<EventTrigger>();
+
+            EventTrigger.Entry enterEntry = new EventTrigger.Entry();
+            enterEntry.eventID = EventTriggerType.PointerEnter;
+            enterEntry.callback.AddListener((_) => ShowRemovePreview(currentEquip));
+            removeTrigger.triggers.Add(enterEntry);
+
+            EventTrigger.Entry exitEntry = new EventTrigger.Entry();
+            exitEntry.eventID = EventTriggerType.PointerExit;
+            exitEntry.callback.AddListener((_) => ClearInfoPanel());
+            removeTrigger.triggers.Add(exitEntry);
+        }
+
+        // Group copies of the same equipment asset into one list entry.
+        List<Equipment> availableEquips = new List<Equipment>();
+        Dictionary<Equipment, int> quantities = new Dictionary<Equipment, int>();
+        foreach (var slot in playerInventory.Slots)
+        {
+            if (slot.Item is Equipment eq)
+            {
+                if (quantities.TryGetValue(eq, out int count))
+                    quantities[eq] = count + 1;
+                else
+                {
+                    quantities.Add(eq, 1);
+                    availableEquips.Add(eq);
+                }
+            }
+        }
+
+        // Create one button per equipment type, with its owned quantity.
+        foreach (var eq in availableEquips)
+        {
+            Equipment capturedEq = eq; // capture for closure
+            GameObject btnObj = Instantiate(equipmentItemPrefab, equipmentListContainer);
+            TextMeshProUGUI txt = btnObj.GetComponentInChildren<TextMeshProUGUI>();
+            if (txt != null)
+            {
+                txt.text = $"{eq.ItemName}  x{quantities[eq]}";
+                txt.raycastTarget = false;
+            }
+
+            // Set the icon if it exists on the prefab
+            Image iconImg = btnObj.transform.Find("Icon")?.GetComponent<Image>();
+            if (iconImg != null)
+            {
+                if (eq.Icon != null)
+                {
+                    iconImg.sprite = eq.Icon;
+                    iconImg.gameObject.SetActive(true);
+                }
+                iconImg.raycastTarget = false;
+            }
+
+            Button btn = btnObj.GetComponent<Button>();
+            if (btn != null)
+            {
+                // CLICK = equip the item
+                btn.onClick.AddListener(() => EquipItem(capturedEq));
+            }
+
+            // HOVER = preview stat diffs (no equip)
+            EventTrigger trigger = btnObj.GetComponent<EventTrigger>() ?? btnObj.AddComponent<EventTrigger>();
+
+            EventTrigger.Entry enterEntry = new EventTrigger.Entry();
+            enterEntry.eventID = EventTriggerType.PointerEnter;
+            enterEntry.callback.AddListener((_) => ShowEquipmentDetails(capturedEq));
+            trigger.triggers.Add(enterEntry);
+
+            EventTrigger.Entry exitEntry = new EventTrigger.Entry();
+            exitEntry.eventID = EventTriggerType.PointerExit;
+            exitEntry.callback.AddListener((_) => ClearInfoPanel());
+            trigger.triggers.Add(exitEntry);
+        }
+    }
+
+    public void ShowEquipmentDetails(Equipment newEquip)
+    {
+        if (newEquip == null) return;
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+        Equipment oldEquip = selectedChar.EquippedItems[selectedSlotIndex];
+
+        if (nameText != null) nameText.text = newEquip.ItemName;
+        if (descriptionText != null) descriptionText.text = newEquip.Description;
+
+        // Calculate differences
+        int oldHp = oldEquip != null ? oldEquip.HpBonus : 0;
+        int oldSp = oldEquip != null ? oldEquip.SpBonus : 0;
+        int oldAtk = oldEquip != null ? oldEquip.AtkBonus : 0;
+        int oldDef = oldEquip != null ? oldEquip.DefBonus : 0;
+        int oldCrit = oldEquip != null ? oldEquip.CritBonus : 0;
+
+        int hpDiff = newEquip.HpBonus - oldHp;
+        int spDiff = newEquip.SpBonus - oldSp;
+        int atkDiff = newEquip.AtkBonus - oldAtk;
+        int defDiff = newEquip.DefBonus - oldDef;
+        int critDiff = newEquip.CritBonus - oldCrit;
+
+        // Show current total stats
+        if (hpText != null) hpText.text = $"HP  {selectedChar.GetMaxHP()}";
+        if (spText != null) spText.text = $"SP  {selectedChar.GetMaxSP()}";
+        if (atkText != null) atkText.text = $"ATK {selectedChar.GetTotalAttack()}";
+        if (defText != null) defText.text = $"DEF {selectedChar.GetTotalDefense()}";
+        if (critText != null) critText.text = $"CRIT {selectedChar.GetTotalCrit()}%";
+
+        SetDiffText(hpDiffText, hpDiff);
+        SetDiffText(spDiffText, spDiff);
+        SetDiffText(atkDiffText, atkDiff);
+        SetDiffText(defDiffText, defDiff);
+        SetDiffText(critDiffText, critDiff);
+    }
+
+    public void ShowRemovePreview(Equipment currentEquip)
+    {
+        if (currentEquip == null) return;
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+
+        if (nameText != null) nameText.text = "Unequip " + currentEquip.ItemName;
+        if (descriptionText != null) descriptionText.text = "Click to remove this equipment.";
+
+        if (hpText != null) hpText.text = $"HP  {selectedChar.GetMaxHP()}";
+        if (spText != null) spText.text = $"SP  {selectedChar.GetMaxSP()}";
+        if (atkText != null) atkText.text = $"ATK {selectedChar.GetTotalAttack()}";
+        if (defText != null) defText.text = $"DEF {selectedChar.GetTotalDefense()}";
+        if (critText != null) critText.text = $"CRIT {selectedChar.GetTotalCrit()}%";
+
+        SetDiffText(hpDiffText, -currentEquip.HpBonus);
+        SetDiffText(spDiffText, -currentEquip.SpBonus);
+        SetDiffText(atkDiffText, -currentEquip.AtkBonus);
+        SetDiffText(defDiffText, -currentEquip.DefBonus);
+        SetDiffText(critDiffText, -currentEquip.CritBonus);
+    }
+
+    private void SetDiffText(TextMeshProUGUI txt, int diff)
+    {
+        if (txt == null) return;
+        if (diff > 0)
+        {
+            txt.text = $"+{diff}";
+            txt.color = Color.green;
+            txt.gameObject.SetActive(true);
+        }
+        else if (diff < 0)
+        {
+            txt.text = $"{diff}"; // negative sign included
+            txt.color = Color.red;
+            txt.gameObject.SetActive(true);
+        }
+        else
+        {
+            txt.gameObject.SetActive(false);
+        }
+    }
+
+    private void ClearInfoPanel()
+    {
+        if (characters != null && selectedCharacterIndex >= 0 && selectedCharacterIndex < characters.Length)
+        {
+            CharacterBase selectedChar = characters[selectedCharacterIndex];
+            Equipment currentEquip = (selectedChar != null && selectedChar.EquippedItems != null && selectedSlotIndex >= 0 && selectedSlotIndex < selectedChar.EquippedItems.Length)
+                ? selectedChar.EquippedItems[selectedSlotIndex] : null;
+
+            if (currentEquip != null)
+            {
+                if (nameText != null) nameText.text = currentEquip.ItemName;
+                if (descriptionText != null) descriptionText.text = currentEquip.Description;
+            }
+            else
+            {
+                if (nameText != null) nameText.text = "Empty Slot";
+                if (descriptionText != null) descriptionText.text = "Select an item below to equip.";
+            }
+        }
+        else
+        {
+            if (nameText != null) nameText.text = "";
+            if (descriptionText != null) descriptionText.text = "";
+        }
+
+        if (hpDiffText != null) hpDiffText.gameObject.SetActive(false);
+        if (spDiffText != null) spDiffText.gameObject.SetActive(false);
+        if (atkDiffText != null) atkDiffText.gameObject.SetActive(false);
+        if (defDiffText != null) defDiffText.gameObject.SetActive(false);
+        if (critDiffText != null) critDiffText.gameObject.SetActive(false);
+
+        UpdateBaseStatsDisplay();
+    }
+
+    private void UpdateBaseStatsDisplay()
+    {
+        if (characters == null || selectedCharacterIndex < 0 || selectedCharacterIndex >= characters.Length) return;
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+        if (selectedChar == null) return;
+
+        if (hpText != null) hpText.text = $"HP  {selectedChar.GetMaxHP()}";
+        if (spText != null) spText.text = $"SP  {selectedChar.GetMaxSP()}";
+        if (atkText != null) atkText.text = $"ATK {selectedChar.GetTotalAttack()}";
+        if (defText != null) defText.text = $"DEF {selectedChar.GetTotalDefense()}";
+        if (critText != null) critText.text = $"CRIT {selectedChar.GetTotalCrit()}%";
+    }
+
+    private void EquipItem(Equipment eq)
+    {
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+        Equipment oldEquip = selectedChar.EquippedItems[selectedSlotIndex];
+
+        // Return old equip to inventory
+        if (oldEquip != null)
+        {
+            playerInventory.AddItem(oldEquip);
+        }
+
+        // Equip new one and remove from inventory
+        selectedChar.Equip(eq, selectedSlotIndex);
+        playerInventory.RemoveItem(eq);
+
+        RefreshUI();
+        ClearInfoPanel();
+    }
+
+    public void RemoveEquippedItem()
+    {
+        CharacterBase selectedChar = characters[selectedCharacterIndex];
+        Equipment oldEquip = selectedChar.EquippedItems[selectedSlotIndex];
+
+        if (oldEquip != null)
+        {
+            playerInventory.AddItem(oldEquip);
+            selectedChar.Unequip(selectedSlotIndex);
+        }
+
+        RefreshUI();
+        ClearInfoPanel();
+    }
+}

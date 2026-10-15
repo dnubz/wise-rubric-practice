@@ -1,0 +1,19 @@
+using UnityEngine;
+
+// Animates saved effect prefabs. No interface is created by this script.
+public sealed class BattleEffectVisual : MonoBehaviour
+{
+    public float lifetime = 1, rotationSpeed = 35;
+    float elapsed;
+    Vector3 size;
+    void Awake() => size = transform.localScale;
+    public void SetSize(Vector3 value) { size = value; transform.localScale = value; }
+    void Update()
+    {
+        if (BattleSession.MenuOpen) return;
+        elapsed += Time.deltaTime;
+        transform.Rotate(Vector3.up, rotationSpeed * Time.deltaTime, Space.Self);
+        transform.localScale = size * (1 + Mathf.Sin(elapsed * 5) * .035f);
+        if (lifetime > 0 && elapsed >= lifetime) Destroy(gameObject);
+    }
+}

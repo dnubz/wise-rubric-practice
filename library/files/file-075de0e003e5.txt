@@ -1,0 +1,27 @@
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "New Equipment", menuName = "Inventory/Equipment")]
+public class Equipment : Item
+{
+    [Header("Stat Bonuses")]
+    [SerializeField] private int hpBonus;
+    [SerializeField] private int spBonus;
+    [SerializeField] private int atkBonus;
+    [SerializeField] private int defBonus;
+    [SerializeField] private int critBonus;
+
+    [Header("Shop")]
+    [SerializeField] private int cost;
+
+    public int HpBonus => hpBonus;
+    public int SpBonus => spBonus;
+    public int AtkBonus => atkBonus;
+    public int DefBonus => defBonus;
+    public int CritBonus => critBonus;
+    public override int Cost => cost;
+
+    public override void Use()
+    {
+        Debug.Log($"Equipment {ItemName} cannot be used directly. Equip it from the menu.");
+    }
+}

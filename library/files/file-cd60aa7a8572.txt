@@ -1,0 +1,44 @@
+using System;
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class ShopItemButtonUI : MonoBehaviour
+{
+    [SerializeField] private Button button;
+    [SerializeField] private Image icon;
+    [SerializeField] private TMP_Text itemNameText;
+    [SerializeField] private TMP_Text priceText;
+
+    private Action onSelected;
+
+    private void Awake()
+    {
+        if (button == null) button = GetComponent<Button>();
+        if (button != null) button.onClick.AddListener(HandleClick);
+    }
+
+    public void Bind(ShopEntry entry, Action selectedCallback)
+    {
+        onSelected = selectedCallback;
+        Item item = entry != null ? entry.item : null;
+
+        if (icon != null)
+        {
+            icon.sprite = item != null ? item.Icon : null;
+            icon.enabled = item != null && item.Icon != null;
+        }
+
+        if (itemNameText != null)
+            itemNameText.text = item != null ? item.ItemName : string.Empty;
+        if (priceText != null)
+            priceText.text = entry != null ? entry.GetPrice().ToString() : string.Empty;
+        if (button != null)
+            button.interactable = item != null;
+    }
+
+    private void HandleClick()
+    {
+        onSelected?.Invoke();
+    }
+}

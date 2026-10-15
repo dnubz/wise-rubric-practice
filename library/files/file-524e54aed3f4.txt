@@ -1,0 +1,660 @@
+using System;
+using System.Collections;
+using TMPro;
+using UnityEngine;
+using UnityEngine.Events;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.UI;
+using UnityEngine.UI;
+
+/// <summary>Runs Berdly's chemistry battle using the designer-built scene UI.</summary>
+public sealed class BerdlyBattleController : MonoBehaviour
+{
+    public enum BattleScreen { Closed, MoveSelection, Attack, Defend, Resolving, Result }
+
+    [Header("Screens")]
+    [SerializeField] GameObject battlePanel;
+    [SerializeField] GameObject movePanel;
+    [SerializeField] GameObject guessingPanel;
+    [SerializeField] GameObject moleculeContainer;
+
+    [Header("Move Buttons")]
+    [SerializeField] Button attackButton;
+    [SerializeField] Button defendButton;
+    [SerializeField] Button exitButton;
+    [SerializeField] Button[] answerButtons = new Button[4];
+
+    [Header("Labels")]
+    [SerializeField] TMP_Text playerHPText;
+    [SerializeField] TMP_Text berdlyHPText;
+    [SerializeField] TMP_Text turnText;
+    [SerializeField] TMP_Text boardInstructionText;
+    [SerializeField] TMP_Text questionText;
+    [SerializeField] TMP_Text timerText;
+    [SerializeField] Slider timerSlider;
+
+    [Header("Player Guard and Healing (created automatically when empty)")]
+    [SerializeField] TMP_Text guardText;
+    [SerializeField] TMP_Text healingText;
+    [SerializeField] BerdlySonicWave sonicWave;
+
+    [Header("Chemistry Tables (Resources/BerdlyNaming when empty)")]
+    [SerializeField] TextAsset alkaneNames;
+    [SerializeField] TextAsset alkylNames;
+    [SerializeField] TextAsset multiplierPrefixes;
+
+    [Header("Battle Balance")]
+    [Min(1), SerializeField] int damagePerAnswer = 10;
+    [Min(1), SerializeField] int healPerAnswer = 6;
+    [Min(1), SerializeField] float berdlyDamage = 33;
+    [Min(0), SerializeField] float turnFeedbackSeconds = .8f;
+
+    [Header("Turn Events")]
+    [SerializeField] UnityEvent onAttackSelected = new UnityEvent();
+    [SerializeField] UnityEvent onDefendSelected = new UnityEvent();
+    [SerializeField] UnityEvent onBattleOpened = new UnityEvent();
+    [SerializeField] UnityEvent onBattleClosed = new UnityEvent();
+    [SerializeField] UnityEvent onBattleWon = new UnityEvent();
+
+    static BerdlyBattleController activeBattle;
+    static int closedFrame = -1;
+    bool initialized;
+    MinigameNPC challenger;
+    BerdlyChemistry chemistry;
+    BerdlyQuestion currentQuestion;
+    BerdlyMoleculeView moleculeView;
+    readonly TMP_Text[] answerLabels = new TMP_Text[4];
+    readonly UnityAction[] answerActions = new UnityAction[4];
+    float remainingTime;
+    int correctAnswers, protectionTurns;
+    bool waitingForAnswer;
+    int questionFrame;
+    Coroutine resolution;
+    GameObject resultModal;
+    TMP_Text resultText;
+    const float HealingFeedbackDuration = 1.25f;
+    float healingFeedbackStartedAt = -1f;
+    Vector2 healingFeedbackOrigin;
+    RectTransform playerPortrait, berdlyPortrait;
+
+    public BattleScreen Screen { get; private set; } = BattleScreen.Closed;
+    public float PlayerHP { get; private set; }
+    public int BerdlyHP { get; private set; }
+    public float RemainingTime => remainingTime;
+    public int CorrectAnswers => correctAnswers;
+    public int ProtectionTurns => protectionTurns;
+    public static bool IsOpen => activeBattle != null && activeBattle.Screen != BattleScreen.Closed;
+    public static bool BlocksGameplayInput => IsOpen || closedFrame == Time.frameCount;
+
+    void Reset() => AssignMissingReferences();
+    void Awake() => Initialize();
+
+    void Initialize()
+    {
+        if (initialized) return;
+        initialized = true;
+        AssignMissingReferences();
+        if (attackButton != null) attackButton.onClick.AddListener(ChooseAttack);
+        if (defendButton != null) defendButton.onClick.AddListener(ChooseDefend);
+        if (exitButton != null) exitButton.onClick.AddListener(ExitBattle);
+        for (int i = 0; i < 4; i++)
+        {
+            if (answerButtons[i] == null) continue;
+            int index = i;
+            answerActions[i] = () => ChooseAnswer(index);
+            answerButtons[i].onClick.AddListener(answerActions[i]);
+            answerLabels[i] = answerButtons[i].GetComponentInChildren<TMP_Text>(true);
+            if (answerLabels[i] != null)
+            {
+                answerLabels[i].enableAutoSizing = true;
+                answerLabels[i].fontSizeMin = 12; answerLabels[i].fontSizeMax = 26;
+                answerLabels[i].textWrappingMode = TextWrappingModes.Normal;
+                answerLabels[i].overflowMode = TextOverflowModes.Overflow;
+                answerLabels[i].raycastTarget = false;
+            }
+        }
+        if (timerSlider != null)
+        {
+            timerSlider.minValue = 0f; timerSlider.maxValue = 20f;
+            timerSlider.wholeNumbers = false; timerSlider.interactable = false;
+            if (timerText != null && timerText.transform.parent != timerSlider.transform)
+            {
+                // Text must not inherit the shrinking fill area's width.
+                Vector3 position = timerText.transform.position;
+                timerText.transform.SetParent(timerSlider.transform, true);
+                timerText.rectTransform.anchorMin = timerText.rectTransform.anchorMax = new Vector2(.5f, .5f);
+                timerText.rectTransform.sizeDelta = new Vector2(100, 35);
+                timerText.transform.position = position;
+            }
+        }
+        if (battlePanel != null) battlePanel.SetActive(false);
+    }
+
+    public static bool TryOpenFromNPC(MinigameNPC npc)
+    {
+        if (IsOpen) return false;
+        var battle = FindAnyObjectByType<BerdlyBattleController>(FindObjectsInactive.Include);
+        if (battle == null)
+        {
+            Debug.LogWarning("Add BerdlyBattleController to an active manager under Canvas.", npc);
+            return false;
+        }
+        return battle.Open(npc);
+    }
+
+    [ContextMenu("Open Battle (Play Mode)")]
+    public void OpenBattle() { if (Application.isPlaying) Open(null); }
+
+    bool Open(MinigameNPC npc)
+    {
+        Initialize();
+        if (!isActiveAndEnabled || Screen != BattleScreen.Closed || IsOpen) return false;
+        if (battlePanel == null || movePanel == null || guessingPanel == null || attackButton == null || defendButton == null || exitButton == null)
+        { Debug.LogError("Assign the battle screens and Attack/Defend/Exit buttons on BerdlyBattleController.", this); return false; }
+        for (int i = 0; i < 4; i++)
+            if (answerButtons[i] == null || answerLabels[i] == null)
+            { Debug.LogError("GuessingPanel/AnswerButtons needs four Buttons with Text (TMP) children, named Answer1 to Answer4.", this); return false; }
+        if (battlePanel.transform.parent != null && !battlePanel.transform.parent.gameObject.activeInHierarchy)
+        { Debug.LogError("The Canvas containing BerdlyBattlePanel must stay active.", this); return false; }
+        try
+        {
+            if (alkaneNames == null) alkaneNames = Resources.Load<TextAsset>("BerdlyNaming/alkane");
+            if (alkylNames == null) alkylNames = Resources.Load<TextAsset>("BerdlyNaming/alkyl");
+            if (multiplierPrefixes == null) multiplierPrefixes = Resources.Load<TextAsset>("BerdlyNaming/prefix");
+            chemistry = new BerdlyChemistry(Environment.TickCount, alkaneNames != null ? alkaneNames.text : null,
+                alkylNames != null ? alkylNames.text : null, multiplierPrefixes != null ? multiplierPrefixes.text : null);
+        }
+        catch (Exception error) { Debug.LogError("Berdly naming setup failed: " + error.Message, this); return false; }
+        PrepareBattleUI();
+        challenger = npc; activeBattle = this;
+        OverworldMusicController.Instance?.BeginBerdlyBattle(this);
+        PlayerHP = BerdlyHP = 100; protectionTurns = correctAnswers = 0;
+        Screen = BattleScreen.MoveSelection;
+        ResetPortraitFeedback();
+        if (resultModal != null) resultModal.SetActive(false);
+        UpdateHP(); ShowMoveSelection(); battlePanel.SetActive(true);
+        // Apply sorting after enabling a newly added nested Canvas as well.
+        var overlay = battlePanel.GetComponent<Canvas>();
+        overlay.overrideSorting = true; overlay.sortingOrder = 200;
+        overlay.worldCamera = overlay.rootCanvas.worldCamera;
+        onBattleOpened.Invoke();
+        return true;
+    }
+
+    void PrepareBattleUI()
+    {
+        // Put this full-screen battle above the overworld HUD; preserve its background art.
+        Canvas overlay = battlePanel.GetComponent<Canvas>();
+        if (overlay == null) overlay = battlePanel.AddComponent<Canvas>();
+        overlay.overrideSorting = true; overlay.sortingOrder = 200;
+        if (battlePanel.GetComponent<GraphicRaycaster>() == null) battlePanel.AddComponent<GraphicRaycaster>();
+        var group = battlePanel.GetComponent<CanvasGroup>();
+        if (group == null) group = battlePanel.AddComponent<CanvasGroup>();
+        group.alpha = 1; group.interactable = group.blocksRaycasts = true; group.ignoreParentGroups = true;
+        var background = battlePanel.GetComponent<Image>();
+        if (background != null) { Color tint = background.color; tint.a = 1; background.color = tint; }
+        var guessingBackground = guessingPanel.GetComponent<Image>();
+        if (guessingBackground != null) guessingBackground.enabled = false;
+        if (EventSystem.current == null)
+            new GameObject("EventSystem", typeof(EventSystem), typeof(InputSystemUIInputModule));
+        CreatePortraitFeedback();
+        CreateSonicWave();
+
+        Transform board = battlePanel.transform.Find("Board/Image") ?? battlePanel.transform;
+        if (moleculeContainer == null) moleculeContainer = new GameObject("MoleculeContainer", typeof(RectTransform));
+        var container = moleculeContainer.GetComponent<RectTransform>();
+        container.SetParent(board, false); Stretch(container, new Vector2(24, 24));
+        // The user's empty UI Image was the opaque white rectangle in the screenshot.
+        var placeholder = moleculeContainer.GetComponent<Image>();
+        if (placeholder != null) placeholder.enabled = false;
+        if (moleculeView == null)
+        {
+            var drawing = new GameObject("MoleculeDrawing", typeof(RectTransform), typeof(CanvasRenderer));
+            drawing.transform.SetParent(container, false);
+            Stretch((RectTransform)drawing.transform, Vector2.zero);
+            moleculeView = drawing.AddComponent<BerdlyMoleculeView>();
+        }
+    }
+
+    static void Stretch(RectTransform rect, Vector2 margin)
+    {
+        rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one;
+        rect.pivot = new Vector2(.5f, .5f); rect.localScale = Vector3.one;
+        rect.offsetMin = margin; rect.offsetMax = -margin;
+    }
+
+    public void ShowMoveSelection()
+    {
+        if (Screen == BattleScreen.Closed || Screen == BattleScreen.Result) return;
+        CancelResolution(); waitingForAnswer = false;
+        Screen = BattleScreen.MoveSelection; guessingPanel.SetActive(false);
+        if (moleculeContainer != null) moleculeContainer.SetActive(false);
+        movePanel.SetActive(true);
+        if (turnText != null) turnText.text = "Your Turn";
+        ShowBoardMessage("Choose Your Move");
+        ClearSelection();
+    }
+
+    public void ChooseAttack() => SelectMove(BattleScreen.Attack);
+    public void ChooseDefend() => SelectMove(BattleScreen.Defend);
+
+    void SelectMove(BattleScreen move)
+    {
+        if (Screen != BattleScreen.MoveSelection) return;
+        Screen = move; correctAnswers = 0; remainingTime = 20f;
+        if (move == BattleScreen.Defend) protectionTurns = Mathf.Min(2, protectionTurns + 2);
+        UpdateGuardIndicator();
+        movePanel.SetActive(false);
+        if (boardInstructionText != null) boardInstructionText.gameObject.SetActive(false);
+        moleculeContainer.SetActive(true); guessingPanel.SetActive(true);
+        if (turnText != null) turnText.text = move == BattleScreen.Attack ? "Your Turn - Attack" : "Your Turn - Defend";
+        NextQuestion(); UpdateTimer(); ClearSelection();
+        KeepAnswersOnScreen();
+        if (move == BattleScreen.Attack) onAttackSelected.Invoke(); else onDefendSelected.Invoke();
+    }
+
+    void NextQuestion()
+    {
+        currentQuestion = chemistry.GenerateQuestion();
+        moleculeView.Show(currentQuestion.Molecule, TMP_Settings.defaultFontAsset);
+        for (int i = 0; i < 4; i++)
+        {
+            answerLabels[i].text = currentQuestion.Answers[i]; answerButtons[i].interactable = true;
+        }
+        if (questionText != null) questionText.text = "What is this molecule called?  Correct: " + correctAnswers;
+        waitingForAnswer = true; questionFrame = Time.frameCount;
+    }
+
+    void KeepAnswersOnScreen()
+    {
+        // Preserve the designer's arrangement, correcting only any off-screen edges.
+        Canvas.ForceUpdateCanvases();
+        var root = (RectTransform)battlePanel.transform;
+        var area = answerButtons[0].transform.parent as RectTransform;
+        if (area == null || area == guessingPanel.transform) return;
+        Bounds bounds = RectTransformUtility.CalculateRelativeRectTransformBounds(root, area);
+        Vector2 offset = Vector2.zero;
+        if (bounds.min.y < root.rect.yMin + 16) offset.y = root.rect.yMin + 16 - bounds.min.y;
+        if (bounds.max.y > root.rect.yMax - 16) offset.y = root.rect.yMax - 16 - bounds.max.y;
+        if (bounds.min.x < root.rect.xMin + 16) offset.x = root.rect.xMin + 16 - bounds.min.x;
+        if (bounds.max.x > root.rect.xMax - 16) offset.x = root.rect.xMax - 16 - bounds.max.x;
+        area.position += root.TransformVector(offset);
+        if (questionText != null)
+        {
+            questionText.ForceMeshUpdate();
+            float answersTop = float.MinValue;
+            foreach (var button in answerButtons)
+                answersTop = Mathf.Max(answersTop, RectTransformUtility.CalculateRelativeRectTransformBounds(root, button.transform).max.y);
+            float textBottom = root.InverseTransformPoint(questionText.transform.TransformPoint(questionText.textBounds.min)).y;
+            if (textBottom < answersTop + 12)
+                questionText.transform.position += root.TransformVector(new Vector3(0, answersTop + 12 - textBottom, 0));
+        }
+    }
+
+    public void ChooseAnswer(int index)
+    {
+        if (!waitingForAnswer || (Screen != BattleScreen.Attack && Screen != BattleScreen.Defend) || index < 0 || index >= 4) return;
+        waitingForAnswer = false;
+        if (remainingTime <= 0) { FinishGuessing("Time's up!"); return; }
+        if (index != currentQuestion.CorrectIndex)
+        { FinishGuessing("Incorrect!\n" + currentQuestion.CorrectName); return; }
+        correctAnswers++;
+        remainingTime = Mathf.Clamp(remainingTime + 7f - .5f * correctAnswers, 0f, 20f);
+        if (remainingTime <= 0f) { UpdateTimer(); FinishGuessing("Time's up!"); return; }
+        NextQuestion(); UpdateTimer(); ClearSelection();
+    }
+
+    void FinishGuessing(string reason)
+    {
+        BattleScreen move = Screen;
+        Screen = BattleScreen.Resolving; waitingForAnswer = false;
+        foreach (var button in answerButtons) button.interactable = false;
+        guessingPanel.SetActive(false); moleculeContainer.SetActive(false);
+        ShowBoardMessage(reason);
+        resolution = StartCoroutine(ResolveEnemyTurn(move, reason));
+    }
+
+    IEnumerator ResolveEnemyTurn(BattleScreen move, string reason)
+    {
+        if (move == BattleScreen.Attack)
+        {
+            int playerDamage = Mathf.Max(1, damagePerAnswer) * correctAnswers;
+            if (playerDamage > 0)
+            {
+                ShowBoardMessage(reason + "\nWiSe attacks!");
+                yield return PlaySonicAttack(true, () => { BerdlyHP = Mathf.Max(0, BerdlyHP - playerDamage); UpdateHP(); });
+            }
+            reason += "\nYou dealt " + playerDamage + " damage.";
+        }
+        else
+        {
+            float healed = Mathf.Min(100 - PlayerHP, Mathf.Max(1, healPerAnswer) * correctAnswers);
+            PlayerHP += healed; reason += "\nYou healed " + healed + " HP.";
+            ShowHealingFeedback(healed);
+            if (turnText != null) turnText.text = healed > 0 ? "GUARD UP! +" + healed.ToString("0.#") : "GUARD UP!";
+        }
+        UpdateHP(); ShowBoardMessage(reason);
+        yield return WaitForFeedback();
+        if (BerdlyHP <= 0) { resolution = null; FinishBattle(true); yield break; }
+        if (turnText != null) turnText.text = "Berdly's Turn";
+        bool protectedTurn = protectionTurns > 0;
+        float damage = Mathf.Max(1, berdlyDamage) * (protectedTurn ? .5f : 1f);
+        ShowBoardMessage("Berdly attacks!");
+        yield return PlaySonicAttack(false, () => {
+            if (protectedTurn) protectionTurns--;
+            PlayerHP = Mathf.Max(0, PlayerHP - damage); UpdateHP(); UpdateGuardIndicator();
+        });
+        ShowBoardMessage("Berdly dealt " + damage + " damage!" + (protectedTurn ? "\nGuard reduced damage by 50%." : ""));
+        yield return WaitForFeedback();
+        resolution = null;
+        if (PlayerHP <= 0) FinishBattle(false); else ShowMoveSelection();
+    }
+
+    IEnumerator WaitForFeedback()
+    {
+        float elapsed = 0;
+        while (elapsed < turnFeedbackSeconds)
+        {
+            elapsed += Time.unscaledDeltaTime;
+            yield return null;
+        }
+    }
+
+    public static bool CheatWin()
+    {
+        if (activeBattle == null || activeBattle.Screen == BattleScreen.Result) return false;
+        var battle = activeBattle;
+        battle.CancelResolution(); battle.waitingForAnswer = false;
+        battle.BerdlyHP = 0; battle.UpdateHP(); battle.FinishBattle(true); return true;
+    }
+
+    public static bool CheatDrainHP()
+    {
+        if (activeBattle == null || activeBattle.Screen == BattleScreen.Result) return false;
+        activeBattle.PlayerHP = 1; activeBattle.UpdateHP(); return true;
+    }
+
+    void CreateSonicWave()
+    {
+        if (sonicWave == null)
+        {
+            var effect = new GameObject("SonicWaveEffect", typeof(RectTransform), typeof(CanvasRenderer));
+            effect.transform.SetParent(battlePanel.transform, false);
+            Stretch((RectTransform)effect.transform, Vector2.zero);
+            sonicWave = effect.AddComponent<BerdlySonicWave>();
+        }
+        sonicWave.raycastTarget = false;
+        sonicWave.transform.SetAsLastSibling();
+    }
+
+    IEnumerator PlaySonicAttack(bool fromPlayer, Action onImpact)
+    {
+        RectTransform source = fromPlayer ? playerPortrait : berdlyPortrait;
+        RectTransform target = fromPlayer ? berdlyPortrait : playerPortrait;
+        var space = sonicWave.rectTransform;
+        Vector2 from = source != null ? (Vector2)space.InverseTransformPoint(source.TransformPoint(source.rect.center)) :
+            new Vector2(fromPlayer ? space.rect.xMin + 140 : space.rect.xMax - 140, space.rect.yMax - 140);
+        Vector2 to = target != null ? (Vector2)space.InverseTransformPoint(target.TransformPoint(target.rect.center)) :
+            new Vector2(fromPlayer ? space.rect.xMax - 140 : space.rect.xMin + 140, space.rect.yMax - 140);
+        Vector2 direction = (to - from).normalized;
+        from += direction * 110f; to -= direction * 100f;
+        sonicWave.Play(from, to, fromPlayer, target, onImpact);
+        while (sonicWave.IsPlaying) yield return null;
+    }
+
+    void FinishBattle(bool won)
+    {
+        Screen = BattleScreen.Result;
+        ResetPortraitFeedback();
+        if (turnText != null) turnText.text = won ? "Victory!" : "Defeat";
+        bool unlocked = false;
+        if (won)
+        {
+            foreach (WiSe wise in FindObjectsByType<WiSe>(FindObjectsInactive.Include))
+            { wise.UnlockUltimate(); unlocked = true; }
+            onBattleWon.Invoke();
+        }
+        CreateResultModal();
+        resultText.text = won ? (unlocked ? "You defeated Berdly!\nWiSe's ultimate is unlocked." : "You defeated Berdly!")
+            : "Berdly won this time.\nYou can challenge him again.";
+        resultModal.SetActive(true); ClearSelection();
+    }
+
+    void CreateResultModal()
+    {
+        if (resultModal != null) return;
+        resultModal = new GameObject("BattleResult", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+        resultModal.transform.SetParent(battlePanel.transform, false);
+        Stretch((RectTransform)resultModal.transform, Vector2.zero);
+        resultModal.GetComponent<Image>().color = new Color(.05f, .04f, .10f, .96f);
+        resultText = CreateText("ResultText", resultModal.transform, new Vector2(0, 35), new Vector2(700, 170));
+        var buttonObject = new GameObject("ContinueButton", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image), typeof(Button));
+        buttonObject.transform.SetParent(resultModal.transform, false);
+        var rect = (RectTransform)buttonObject.transform;
+        rect.sizeDelta = new Vector2(240, 55); rect.anchoredPosition = new Vector2(0, -90);
+        buttonObject.GetComponent<Image>().color = new Color(.27f, .46f, .55f);
+        buttonObject.GetComponent<Button>().onClick.AddListener(ExitBattle);
+        var label = CreateText("Text (TMP)", buttonObject.transform, Vector2.zero, new Vector2(220, 50));
+        label.text = "Continue"; resultModal.SetActive(false);
+    }
+
+    TMP_Text CreateText(string name, Transform parent, Vector2 position, Vector2 size)
+    {
+        var obj = new GameObject(name, typeof(RectTransform), typeof(CanvasRenderer), typeof(TextMeshProUGUI));
+        obj.transform.SetParent(parent, false);
+        var text = obj.GetComponent<TextMeshProUGUI>();
+        text.rectTransform.sizeDelta = size; text.rectTransform.anchoredPosition = position;
+        text.alignment = TextAlignmentOptions.Center; text.fontSize = 30;
+        if (questionText != null) text.font = questionText.font;
+        text.color = Color.white; text.raycastTarget = false; return text;
+    }
+
+    void CreatePortraitFeedback()
+    {
+        Transform player = battlePanel.transform.Find("Player") ?? battlePanel.transform;
+        playerPortrait = player.Find("Portrait") as RectTransform;
+        berdlyPortrait = battlePanel.transform.Find("Berdly/Portrait") as RectTransform;
+        if (guardText == null)
+        {
+            guardText = CreateText("GuardText", player, Vector2.zero, new Vector2(230, 42));
+            guardText.fontSize = 28;
+            guardText.color = new Color(.30f, .85f, 1f);
+            if (playerHPText != null)
+            {
+                RectTransform hp = playerHPText.rectTransform;
+                guardText.rectTransform.position = hp.TransformPoint(hp.rect.center +
+                    Vector2.down * (hp.rect.height * .5f + 31f));
+            }
+        }
+        if (healingText == null)
+        {
+            healingText = CreateText("HealingText", player, Vector2.zero, new Vector2(200, 60));
+        }
+        // The board is a later sibling of Player; the popup must draw above its frame.
+        healingText.transform.SetParent(battlePanel.transform, false);
+        healingText.rectTransform.anchorMin = healingText.rectTransform.anchorMax = new Vector2(.5f, .5f);
+        healingText.rectTransform.sizeDelta = new Vector2(180, 64);
+        healingText.fontSize = 42; healingText.enableAutoSizing = true;
+        healingText.fontSizeMin = 26; healingText.fontSizeMax = 42; healingText.fontStyle = FontStyles.Bold;
+        healingText.color = new Color(.30f, 1f, .45f);
+        healingText.outlineColor = new Color(.02f, .14f, .05f, 1); healingText.outlineWidth = .18f;
+        if (playerPortrait != null)
+            healingText.rectTransform.position = playerPortrait.TransformPoint(playerPortrait.rect.center +
+                new Vector2(playerPortrait.rect.width * .5f + 128f, playerPortrait.rect.height * .15f));
+        healingText.transform.SetAsLastSibling();
+        guardText.raycastTarget = healingText.raycastTarget = false;
+        healingFeedbackOrigin = healingText.rectTransform.anchoredPosition;
+    }
+
+    void UpdateGuardIndicator()
+    {
+        if (guardText == null) return;
+        bool visible = protectionTurns > 0 && Screen != BattleScreen.Closed && Screen != BattleScreen.Result;
+        guardText.text = visible ? "GUARD " + protectionTurns : "";
+        guardText.gameObject.SetActive(visible);
+    }
+
+    void ShowHealingFeedback(float amount)
+    {
+        if (healingText == null) return;
+        healingText.gameObject.SetActive(amount > 0);
+        if (amount <= 0) { healingFeedbackStartedAt = -1f; return; }
+        healingText.text = "+" + amount.ToString("0.#") + " HP";
+        healingText.alpha = 1f;
+        healingText.rectTransform.localScale = Vector3.one;
+        healingText.rectTransform.anchoredPosition = healingFeedbackOrigin;
+        healingFeedbackStartedAt = Time.unscaledTime;
+    }
+
+    void UpdateHealingFeedback()
+    {
+        if (healingText == null || healingFeedbackStartedAt < 0) return;
+        float progress = (Time.unscaledTime - healingFeedbackStartedAt) / HealingFeedbackDuration;
+        AnimateHealingFeedback(progress);
+    }
+
+    void AnimateHealingFeedback(float progress)
+    {
+        if (progress >= 1f)
+        {
+            healingText.gameObject.SetActive(false);
+            healingText.rectTransform.anchoredPosition = healingFeedbackOrigin;
+            healingText.rectTransform.localScale = Vector3.one;
+            healingFeedbackStartedAt = -1f;
+            return;
+        }
+        progress = Mathf.Clamp01(progress);
+        healingText.alpha = 1f - Mathf.SmoothStep(0, 1, Mathf.Clamp01((progress - .45f) / .55f));
+        healingText.rectTransform.anchoredPosition = healingFeedbackOrigin + Vector2.up * (48f * progress);
+        healingText.rectTransform.localScale = Vector3.one * (1f + .18f * Mathf.Sin(Mathf.Clamp01(progress / .25f) * Mathf.PI));
+    }
+
+    void ResetPortraitFeedback()
+    {
+        healingFeedbackStartedAt = -1f;
+        if (sonicWave != null) sonicWave.Cancel();
+        if (healingText != null)
+        {
+            healingText.gameObject.SetActive(false);
+            healingText.rectTransform.anchoredPosition = healingFeedbackOrigin;
+            healingText.rectTransform.localScale = Vector3.one;
+        }
+        UpdateGuardIndicator();
+    }
+
+    void ShowBoardMessage(string message)
+    {
+        if (boardInstructionText == null) return;
+        boardInstructionText.gameObject.SetActive(true); boardInstructionText.text = message;
+        boardInstructionText.enableAutoSizing = true;
+        boardInstructionText.fontSizeMin = 16; boardInstructionText.fontSizeMax = 50;
+        boardInstructionText.raycastTarget = false;
+    }
+
+    void UpdateHP()
+    {
+        if (playerHPText != null) playerHPText.text = PlayerHP + "/100";
+        if (berdlyHPText != null) berdlyHPText.text = BerdlyHP + "/100";
+    }
+
+    void UpdateTimer()
+    {
+        if (timerSlider != null) timerSlider.value = remainingTime;
+        if (timerText != null) timerText.text = Mathf.CeilToInt(remainingTime).ToString();
+    }
+
+    void CancelResolution()
+    {
+        if (resolution != null) StopCoroutine(resolution);
+        resolution = null;
+        if (sonicWave != null) sonicWave.Cancel();
+    }
+
+    public void ExitBattle()
+    {
+        if (Screen == BattleScreen.Closed) return;
+        OverworldMusicController.Instance?.EndBerdlyBattle(this);
+        CancelResolution(); waitingForAnswer = false; Screen = BattleScreen.Closed;
+        ResetPortraitFeedback();
+        challenger = null; currentQuestion = null;
+        if (activeBattle == this) activeBattle = null;
+        closedFrame = Time.frameCount; ClearSelection();
+        if (battlePanel != null) battlePanel.SetActive(false);
+        onBattleClosed.Invoke();
+    }
+
+    public static void CloseForNPC(MinigameNPC npc)
+    { if (activeBattle != null && activeBattle.challenger == npc) activeBattle.ExitBattle(); }
+
+    void Update()
+    {
+        if (Screen == BattleScreen.Closed) return;
+        bool typingCode = CheatConsole.BlocksGameplayInput;
+        if ((!typingCode && Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame) || battlePanel == null || !battlePanel.activeInHierarchy)
+        { ExitBattle(); return; }
+        UpdateHealingFeedback();
+        if (!waitingForAnswer) return;
+        remainingTime = Mathf.Max(0, remainingTime - Time.unscaledDeltaTime); UpdateTimer();
+        if (remainingTime <= 0) { FinishGuessing("Time's up!\n" + currentQuestion.CorrectName); return; }
+        var keys = Keyboard.current;
+        if (typingCode || keys == null || Time.frameCount <= questionFrame) return;
+        if (keys.digit1Key.wasPressedThisFrame) ChooseAnswer(0);
+        else if (keys.digit2Key.wasPressedThisFrame) ChooseAnswer(1);
+        else if (keys.digit3Key.wasPressedThisFrame) ChooseAnswer(2);
+        else if (keys.digit4Key.wasPressedThisFrame) ChooseAnswer(3);
+    }
+
+    void OnDisable() => ExitBattle();
+    void OnDestroy()
+    {
+        ExitBattle();
+        if (attackButton != null) attackButton.onClick.RemoveListener(ChooseAttack);
+        if (defendButton != null) defendButton.onClick.RemoveListener(ChooseDefend);
+        if (exitButton != null) exitButton.onClick.RemoveListener(ExitBattle);
+        for (int i = 0; i < 4; i++)
+            if (answerButtons[i] != null && answerActions[i] != null) answerButtons[i].onClick.RemoveListener(answerActions[i]);
+    }
+
+    void ClearSelection()
+    {
+        if (EventSystem.current == null || battlePanel == null) return;
+        var selected = EventSystem.current.currentSelectedGameObject;
+        if (selected != null && selected.transform.IsChildOf(battlePanel.transform)) EventSystem.current.SetSelectedGameObject(null);
+    }
+
+    [ContextMenu("Assign Missing UI References")]
+    public void AssignMissingReferences()
+    {
+        if (battlePanel == null)
+            foreach (RectTransform candidate in FindObjectsByType<RectTransform>(FindObjectsInactive.Include))
+                if (candidate.name == "BerdlyBattlePanel" && candidate.gameObject.scene == gameObject.scene)
+                { battlePanel = candidate.gameObject; break; }
+        if (battlePanel == null) return;
+        Transform root = battlePanel.transform;
+        if (movePanel == null) movePanel = root.Find("Move")?.gameObject;
+        if (guessingPanel == null) guessingPanel = root.Find("GuessingPanel")?.gameObject;
+        if (moleculeContainer == null) moleculeContainer = (FindNamed<RectTransform>(root, "MoleculeContainer") ?? FindNamed<RectTransform>(root, "MolecularContainer"))?.gameObject;
+        if (attackButton == null) attackButton = FindNamed<Button>(root, "AttackButton");
+        if (defendButton == null) defendButton = FindNamed<Button>(root, "DefendButton");
+        if (exitButton == null) exitButton = FindNamed<Button>(root, "ExitButton");
+        if (answerButtons == null || answerButtons.Length != 4) Array.Resize(ref answerButtons, 4);
+        for (int i = 0; i < 4; i++)
+            if (answerButtons[i] == null) answerButtons[i] = FindNamed<Button>(root, "Answer" + (i + 1)) ?? FindNamed<Button>(root, "Answer" + (i + 1) + "Button");
+        if (playerHPText == null) playerHPText = FindNamed<TMP_Text>(root, "PlayerHPText");
+        if (berdlyHPText == null) berdlyHPText = FindNamed<TMP_Text>(root, "BerdlyHPText");
+        if (turnText == null) turnText = FindNamed<TMP_Text>(root, "TurnText");
+        if (boardInstructionText == null) boardInstructionText = root.Find("Board/Image/Text (TMP)")?.GetComponent<TMP_Text>();
+        if (questionText == null) questionText = FindNamed<TMP_Text>(root, "QuestionText");
+        if (timerText == null) timerText = FindNamed<TMP_Text>(root, "TimerText");
+        if (timerSlider == null) timerSlider = FindNamed<Slider>(root, "TimerSlider");
+        if (guardText == null) guardText = FindNamed<TMP_Text>(root, "GuardText");
+        if (healingText == null) healingText = FindNamed<TMP_Text>(root, "HealingText");
+    }
+
+    static T FindNamed<T>(Transform root, string name) where T : Component
+    {
+        foreach (T child in root.GetComponentsInChildren<T>(true)) if (child.name == name) return child;
+        return null;
+    }
+}

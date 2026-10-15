@@ -1,0 +1,85 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattleCoverPolishChecks
+{
+    const string Folder = "Temp/BattleCoverPolish";
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static BattleCoverPolishChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: skeleton renders at 5.2m with matching capsule/NavMesh height and HP bar above its head; all three layouts have split walls; upper half stays at 51 HP and breaks at exactly 50 HP, lower mesh keeps its size/base, high shots clear the half-wall, debris occurs once, and zero HP removes the remaining wall."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result) { File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static bool BlocksHighRay(BattleCover cover)
+    {
+        Vector3 origin = cover.transform.position + Vector3.up * 2 + cover.transform.forward * 3;
+        return Physics.RaycastAll(origin, -cover.transform.forward, 6).Any(h => h.collider == cover.box);
+    }
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance; Require(session != null, "Battle session missing.");
+        if (session.menu != null) session.menu.SetActive(false); Time.timeScale = 1;
+        var data = session.settings.enemies.First(e => e.kind == BattleEnemyKind.Skeleton);
+        if (!BattleSession.IsActive)
+        {
+            var source = Object.Instantiate(data.prefab).GetComponent<EncounterEnemy>();
+            source.Configure(data, "test:cover-polish"); source.enabled = false;
+            Require(session.Begin(source), "Battle did not start.");
+        }
+        float deadline = Time.realtimeSinceStartup + 30;
+        while ((BattleController.Instance == null || !BattleController.Instance.Ready) && Time.realtimeSinceStartup < deadline) yield return null;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Battle did not load.");
+        Require(battle.layouts.All(l => l.cover.All(c => c.topHalf != null && c.breakEffect != null)), "One or more layouts still use whole-wall scaling.");
+        var skeleton = battle.SpawnEnemy(data, battle.Layout.enemySpawns[0].position + Vector3.right * 8, false);
+        yield return null;
+        var renderers = skeleton.GetComponentsInChildren<MeshRenderer>(); var body = renderers[0].bounds;
+        foreach (var renderer in renderers) body.Encapsulate(renderer.bounds);
+        Require(Mathf.Abs(body.size.y - 5.2f) < .2f, "Skeleton render is still small: " + body.size.y);
+        Require(Mathf.Abs(skeleton.GetComponent<CapsuleCollider>().height - 5.2f) < .01f && Mathf.Abs(skeleton.Agent.height - 5.2f) < .01f, "Skeleton hitbox/navigation height did not follow its model.");
+        Require(skeleton.HealthUI.transform.position.y > body.max.y + .3f, "Skeleton's HP bar is inside its model.");
+
+        var cover = battle.Layout.cover[0]; var bottom = cover.shape.GetComponent<MeshRenderer>();
+        Vector3 lowerScale = cover.shape.localScale; float baseY = bottom.bounds.min.y, height = cover.box.bounds.size.y;
+        int debris = Object.FindObjectsByType<ParticleSystem>().Length;
+        Require(cover.HP == 100 && cover.topHalf.activeSelf && BlocksHighRay(cover), "Full wall starts broken or lacks collision.");
+        cover.Damage(49); Physics.SyncTransforms();
+        Require(cover.HP == 51 && cover.topHalf.activeSelf && !cover.HalfCovered && BlocksHighRay(cover), "Top breaks before 50 percent HP.");
+        cover.Damage(1); Physics.SyncTransforms();
+        Require(cover.HP == 50 && cover.HalfCovered && !cover.topHalf.activeSelf && cover.gameObject.activeSelf, "Top was not removed at exactly 50 HP.");
+        Require(Vector3.Distance(cover.shape.localScale, lowerScale) < .001f && Mathf.Abs(bottom.bounds.min.y - baseY) < .001f, "Bottom stones shrink or shift instead of staying in place.");
+        Require(Mathf.Abs(cover.box.bounds.size.y - height * .5f) < .001f && Mathf.Abs(cover.box.bounds.min.y - baseY) < .001f && !BlocksHighRay(cover), "Half-wall collision does not match its remaining lower stones.");
+        Require(Object.FindObjectsByType<ParticleSystem>().Length == debris + 1, "Top-half break has no stone debris.");
+        cover.Damage(1); Physics.SyncTransforms();
+        Require(Object.FindObjectsByType<ParticleSystem>().Length == debris + 1 && Vector3.Distance(cover.shape.localScale, lowerScale) < .001f, "Repeated damage repeats the break or shrinks the lower half again.");
+        cover.Damage(49); Physics.SyncTransforms();
+        Require(cover.HP == 0 && !cover.gameObject.activeInHierarchy && !BlocksHighRay(cover), "Zero-HP wall still blocks shots.");
+    }
+}

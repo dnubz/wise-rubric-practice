@@ -1,0 +1,152 @@
+using System;
+using System.IO;
+using System.Linq;
+using TMPro;
+using UnityEditor;
+using UnityEditor.Events;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class SaveFileSetup
+{
+    const string Folder = "Temp/SaveFiles";
+    static SaveFileSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode || !File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: three slots, delete confirmation, Continue Last Played, Save & Quit and fitted menu navigation wired in saved scenes."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/setup-result.txt", e.ToString()); }
+    }
+    [MenuItem("WiSe/Save Files/Set Up Save Menus")]
+    public static void Build()
+    {
+        SetUpScene("TitleScene", SetUpTitle); SetUpScene("GameScene", SetUpGame);
+        AssetDatabase.SaveAssets();
+    }
+    static void SetUpScene(string name, Action<Scene> setup)
+    {
+        var scene = SceneManager.GetSceneByName(name); bool opened = !scene.IsValid() || !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/" + name + ".unity", OpenSceneMode.Additive);
+        try { setup(scene); EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene); }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+    static T Find<T>(Scene scene) where T : Component => scene.GetRootGameObjects().SelectMany(g => g.GetComponentsInChildren<T>(true)).Single();
+    static void SetUpTitle(Scene scene)
+    {
+        var ui = Find<SaveSlotUI>(scene); var root = ui.saveSlots.transform;
+        var continuation = root.GetComponentInChildren<ContinueSaveUI>(true); var template = continuation.GetComponent<Button>();
+        template.name = "ContinueLastPlayed"; template.GetComponentInChildren<TMP_Text>(true).text = "Continue Last Played";
+        var fields = new SerializedObject(ui); var array = fields.FindProperty("slots"); array.arraySize = GameSave.SlotCount;
+        var audio = scene.GetRootGameObjects().SelectMany(g => g.GetComponentsInChildren<TitleAudio>(true)).FirstOrDefault();
+        var rows = root.GetComponentsInChildren<Button>(true).Where(b => b.name.StartsWith("SaveF", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(b => ((RectTransform)b.transform).anchoredPosition.y).ToArray();
+        if (rows.Length != 3) throw new InvalidOperationException("Expected the three original title slot cards.");
+        for (int i = 0; i < rows.Length; i++)
+        {
+            var row = rows[i]; row.name = "SaveFile" + (i + 1); row.onClick = new Button.ButtonClickedEvent();
+            if (audio != null) UnityEventTools.AddPersistentListener(row.onClick, audio.PlayNormalButtonSFX);
+            var entry = array.GetArrayElementAtIndex(i); Assign(entry, "select", row);
+            string[] names = { "Name", "Level", "Playtime", "Location" }, properties = { "name", "level", "playtime", "location" };
+            string[] values = { "Slot " + (i + 1), "", "Empty - start a new game", "" };
+            float[] xs = { -230, 190, -220, 180 }, ys = { 15, 15, -47, -47 }, widths = { 400, 280, 470, 280 };
+            for (int n = 0; n < names.Length; n++)
+            {
+                var label = row.transform.Find(names[n]).GetComponent<TMP_Text>(); Assign(entry, properties[n], label);
+                label.text = values[n]; label.raycastTarget = false; label.enableAutoSizing = true;
+                label.fontSize = label.fontSizeMax = n < 2 ? 38 : 27; label.fontSizeMin = 18;
+                label.rectTransform.anchoredPosition = new Vector2(xs[n], ys[n]); label.rectTransform.sizeDelta = new Vector2(widths[n], 60);
+            }
+            var delete = Button(template, row.transform, "DeleteSave", new Vector2(440, 0), new Vector2(150, 75), "Delete");
+            Assign(entry, "delete", delete); delete.gameObject.SetActive(false);
+        }
+        var status = Label(template, root, "SaveStatus", new Vector2(0, -355), new Vector2(1000, 45), "", 22);
+        Assign(fields, "status", status);
+        var overlay = root.Find("DeleteConfirmation");
+        if (overlay == null)
+        {
+            var go = new GameObject("DeleteConfirmation", typeof(RectTransform), typeof(Image)); go.transform.SetParent(root, false);
+            overlay = go.transform; ((RectTransform)overlay).sizeDelta = new Vector2(1500, 1100);
+            go.GetComponent<Image>().color = new Color(0, 0, 0, .85f);
+        }
+        var prompt = Label(template, overlay, "Prompt", new Vector2(0, 75), new Vector2(1100, 150), "Delete this save?", 42);
+        var confirm = Button(template, overlay, "ConfirmDelete", new Vector2(-240, -100), new Vector2(430, 100), "Delete Save");
+        var cancel = Button(template, overlay, "CancelDelete", new Vector2(240, -100), new Vector2(430, 100), "Cancel");
+        Assign(fields, "confirmation", overlay.gameObject); Assign(fields, "confirmationText", prompt);
+        Assign(fields, "confirmDelete", confirm); Assign(fields, "cancelDelete", cancel);
+        overlay.SetAsLastSibling(); overlay.gameObject.SetActive(false); fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+    static void SetUpGame(Scene scene)
+    {
+        var quit = Find<QuitMenuUI>(scene);
+        var standaloneSave = quit.transform.Find("SaveGame");
+        if (standaloneSave != null) Object.DestroyImmediate(standaloneSave.gameObject);
+        var heading = quit.transform.Find("Title").GetComponent<TMP_Text>(); heading.text = "Save and quit to the title?";
+        FitNavigation(Find<MenuTabManager>(scene));
+    }
+    public static void FitNavigation(MenuTabManager tabs)
+    {
+        var fields = new SerializedObject(tabs); var entries = fields.FindProperty("tabs");
+        var first = (Button)entries.GetArrayElementAtIndex(0).FindPropertyRelative("tabButton").objectReferenceValue;
+        var sidebar = (RectTransform)first.transform.parent;
+        Centre(sidebar, new Vector2(-670, -4.92f), new Vector2(420, 840.3f));
+        for (int i = 0; i < entries.arraySize; i++)
+        {
+            var button = (Button)entries.GetArrayElementAtIndex(i).FindPropertyRelative("tabButton").objectReferenceValue;
+            Centre((RectTransform)button.transform, new Vector2(0, 238 - i * 120), new Vector2(420, 100));
+            var label = button.GetComponentInChildren<TMP_Text>(true);
+            label.rectTransform.offsetMin = new Vector2(32, 10); label.rectTransform.offsetMax = new Vector2(-32, -10);
+            label.fontSize = label.fontSizeMax = 38; label.fontSizeMin = 26; label.enableAutoSizing = true;
+        }
+        var gold = sidebar.parent.Find("GoldBox") as RectTransform;
+        if (gold != null)
+        {
+            Centre(gold, new Vector2(-670, 359.08f), new Vector2(420, 112));
+            Centre((RectTransform)gold.Find("Image"), new Vector2(-125, 0), new Vector2(84, 84));
+            // The frame follows the box instead of keeping independent screen coordinates.
+            var outline = gold.Find("GoldOutline") as RectTransform;
+            if (outline == null) outline = sidebar.parent.Find("GoldBox (1)") as RectTransform;
+            if (outline != null)
+            {
+                outline.name = "GoldOutline"; outline.SetParent(gold, false); outline.SetAsFirstSibling();
+                outline.anchorMin = Vector2.zero; outline.anchorMax = Vector2.one;
+                outline.localScale = Vector3.one; outline.offsetMin = outline.offsetMax = Vector2.zero;
+                outline.GetComponent<Image>().color = new Color(1, 1, 1, .65f);
+                var unusedWallet = outline.GetComponent<CoinUI>();
+                if (unusedWallet != null) Object.DestroyImmediate(unusedWallet);
+            }
+            var value = gold.Find("Coins").GetComponent<TMP_Text>();
+            value.fontSize = value.fontSizeMax = 54; value.fontSizeMin = 24; value.enableAutoSizing = true;
+            Centre(value.rectTransform, new Vector2(54, 0), new Vector2(230, 88));
+        }
+        fields.FindProperty("inactiveColor").colorValue = new Color(.87f, .81f, .70f, 1);
+        fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+    static void Centre(RectTransform rect, Vector2 position, Vector2 size)
+    {
+        rect.anchorMin = rect.anchorMax = rect.pivot = Vector2.one * .5f;
+        rect.localScale = Vector3.one; rect.anchoredPosition = position; rect.sizeDelta = size;
+    }
+    static Button Button(Button template, Transform parent, string name, Vector2 position, Vector2 size, string value)
+    {
+        var old = parent.Find(name); var b = old != null ? old.GetComponent<Button>() : Object.Instantiate(template, parent);
+        var continuation = b.GetComponent<ContinueSaveUI>(); if (continuation != null) Object.DestroyImmediate(continuation);
+        b.name = name; b.gameObject.SetActive(true); b.interactable = true; b.onClick = new Button.ButtonClickedEvent();
+        var rect = (RectTransform)b.transform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = position; rect.sizeDelta = size;
+        var label = b.GetComponentInChildren<TMP_Text>(true); label.text = value; label.enableAutoSizing = true;
+        label.fontSize = label.fontSizeMax = 38; label.fontSizeMin = 18; return b;
+    }
+    static TMP_Text Label(Button template, Transform parent, string name, Vector2 position, Vector2 size, string value, float fontSize)
+    {
+        var old = parent.Find(name); var t = old != null ? old.GetComponent<TMP_Text>() : Object.Instantiate(template.GetComponentInChildren<TMP_Text>(true), parent);
+        t.name = name; t.gameObject.SetActive(true); t.text = value; t.color = Color.white; t.raycastTarget = false;
+        t.rectTransform.anchorMin = t.rectTransform.anchorMax = Vector2.one * .5f; t.rectTransform.anchoredPosition = position; t.rectTransform.sizeDelta = size;
+        t.fontSize = t.fontSizeMax = fontSize; t.fontSizeMin = 18; t.enableAutoSizing = true; t.alignment = TextAlignmentOptions.Center; return t;
+    }
+    static void Assign(SerializedObject fields, string name, Object value) => fields.FindProperty(name).objectReferenceValue = value;
+    static void Assign(SerializedProperty fields, string name, Object value) => fields.FindPropertyRelative(name).objectReferenceValue = value;
+}

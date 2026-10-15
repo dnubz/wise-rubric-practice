@@ -1,0 +1,82 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattleCoverPolishSetup
+{
+    const string Folder = "Temp/BattleCoverPolish";
+    static double next;
+    static BattleCoverPolishSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: skeleton enlarged to 5.2m with matching capsule/agent; all battle walls have separate removable upper halves and stone debris."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    public static void Build()
+    {
+        var skeleton = PrefabUtility.LoadPrefabContents("Assets/Resources/Battle/Skeleton.prefab");
+        try
+        {
+            var visual = skeleton.GetComponent<BattleEnemyMotion>().visual;
+            foreach (Transform child in visual) Object.DestroyImmediate(child.gameObject);
+            DungeonPolishSetup.AttachSkeleton(visual); DungeonPolishSetup.FitSkeletonCollider(skeleton);
+            PrefabUtility.SaveAsPrefabAsset(skeleton, "Assets/Resources/Battle/Skeleton.prefab");
+        }
+        finally { PrefabUtility.UnloadPrefabContents(skeleton); }
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/BattleScene.unity"); bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/BattleScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            GameObject effect = null;
+            int count = 0;
+            foreach (var root in scene.GetRootGameObjects()) foreach (var cover in root.GetComponentsInChildren<BattleCover>(true))
+            {
+                if (effect == null) effect = Debris(cover.shape.GetComponent<MeshRenderer>().sharedMaterial);
+                if (cover.topHalf == null)
+                {
+                    var bottom = cover.shape; var size = bottom.localScale; var position = bottom.localPosition;
+                    var top = GameObject.CreatePrimitive(PrimitiveType.Cube); top.name = "StoneTop";
+                    top.transform.SetParent(bottom.parent, false); top.transform.localRotation = bottom.localRotation;
+                    top.transform.localScale = new Vector3(size.x, size.y * .5f, size.z);
+                    top.transform.localPosition = position + Vector3.up * size.y * .25f;
+                    top.GetComponent<MeshRenderer>().sharedMaterial = bottom.GetComponent<MeshRenderer>().sharedMaterial;
+                    Object.DestroyImmediate(top.GetComponent<Collider>());
+                    bottom.name = "StoneBottom"; bottom.localScale = top.transform.localScale;
+                    bottom.localPosition = position - Vector3.up * size.y * .25f;
+                    cover.topHalf = top;
+                }
+                cover.breakEffect = effect; EditorUtility.SetDirty(cover); count++;
+            }
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+            File.WriteAllText(Folder + "/walls.txt", "Split walls: " + count);
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+    static GameObject Debris(Material stone)
+    {
+        var root = new GameObject("BattleCoverBreak");
+        var cube = GameObject.CreatePrimitive(PrimitiveType.Cube); var mesh = cube.GetComponent<MeshFilter>().sharedMesh; Object.DestroyImmediate(cube);
+        try
+        {
+            var particles = root.AddComponent<ParticleSystem>(); particles.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            var main = particles.main; main.loop = false; main.duration = .6f; main.startLifetime = new ParticleSystem.MinMaxCurve(.5f, .9f);
+            main.startSize = new ParticleSystem.MinMaxCurve(.15f, .3f); main.startSpeed = new ParticleSystem.MinMaxCurve(.6f, 1.5f);
+            main.gravityModifier = 1.8f; main.simulationSpace = ParticleSystemSimulationSpace.World; main.maxParticles = 20;
+            main.startRotation3D = true; main.startRotationX = new ParticleSystem.MinMaxCurve(0, 6.28f); main.startRotationZ = new ParticleSystem.MinMaxCurve(0, 6.28f);
+            var emission = particles.emission; emission.rateOverTime = 0; emission.SetBursts(new[] { new ParticleSystem.Burst(0, 16) });
+            var shape = particles.shape; shape.shapeType = ParticleSystemShapeType.Box;
+            var renderer = particles.GetComponent<ParticleSystemRenderer>(); renderer.renderMode = ParticleSystemRenderMode.Mesh; renderer.mesh = mesh; renderer.sharedMaterial = stone;
+            return PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Battle/CoverBreak.prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+}

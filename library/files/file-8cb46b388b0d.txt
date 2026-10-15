@@ -1,0 +1,269 @@
+using System.Collections;
+using UnityEngine;
+using UnityEngine.Events;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
+
+/// <summary>
+/// Interactive Chest that rewards items and/or gold from a LootTable when opened.
+/// Displays an [F] billboard prompt when the player is nearby.
+/// Supports Animator triggers or smooth procedural lid rotation.
+/// </summary>
+public class Chest : MonoBehaviour
+{
+    [Header("Loot Configuration")]
+    [Tooltip("Loot table used to roll rewarded items and gold.")]
+    [SerializeField] private LootTable lootTable;
+
+    [Header("Interaction Settings")]
+    [Tooltip("Maximum distance from the chest surface to the player's feet, in world units.")]
+    [SerializeField] private float interactDistance = 8f;
+
+    [Tooltip("World offset for the floating prompt billboard.")]
+    [SerializeField] private Vector3 promptOffset = new Vector3(0, 1.4f, 0);
+
+    [Tooltip("Default prompt text shown before opening.")]
+    [SerializeField] private string promptText = "[F] Open Chest";
+
+    [Header("Animation & Visuals")]
+    [Tooltip("Optional transform of the chest lid to rotate open procedurally.")]
+    [SerializeField] private Transform lidTransform;
+
+    [Tooltip("Target local euler rotation angles for the open lid.")]
+    [SerializeField] private Vector3 lidOpenRotation = new Vector3(-85f, 0f, 0f);
+
+    [Tooltip("Speed multiplier for lid opening rotation.")]
+    [SerializeField] private float lidOpenSpeed = 4f;
+
+    [Tooltip("Optional Animator component (if using skeletal / imported animation).")]
+    [SerializeField] private Animator chestAnimator;
+
+    [Tooltip("Trigger parameter name for the open animation in Animator.")]
+    [SerializeField] private string animatorTrigger = "Open";
+
+    [Tooltip("Optional particle system played when the chest opens.")]
+    [SerializeField] private ParticleSystem openParticles;
+
+    [Header("Audio")]
+    [SerializeField] private AudioClip openSound;
+
+    [Header("Events")]
+    [SerializeField] private UnityEvent onChestOpened;
+
+    // Runtime state
+    private bool isOpened = false;
+    private bool isPlayerInRange = false;
+
+    // UI references
+    private GameObject promptUI;
+    private Coroutine feedbackCoroutine;
+    private WorldInteractionPrompt spritePrompt;
+    private PoolGlideCliff requiredCliff;
+    private BoxCollider requiredPlatform;
+    private bool requiresDruid;
+    private Collider interactionCollider;
+    public void RequireDruidLanding(PoolGlideCliff cliff) => requiredCliff = cliff;
+    public void RequirePlatformLanding(BoxCollider platform, bool druidOnly = false)
+    { requiredPlatform = platform; requiresDruid = druidOnly; }
+    public bool CanInteract(Transform player) => !isOpened && player != null &&
+        !NPCChallengePrompt.BlocksGameplayInput &&
+        InteractionDistance(player) <= interactDistance &&
+        (requiredCliff == null || requiredCliff.Supports(player)) && OnRequiredPlatform(player);
+
+    // Account for both character height and the chest's size/pivot.
+    float InteractionDistance(Transform player)
+    {
+        var body = player.GetComponent<CharacterController>();
+        Vector3 feet = body != null && body.enabled ? body.bounds.center - Vector3.up * body.bounds.extents.y : player.position;
+        Vector3 chestPoint = interactionCollider != null && interactionCollider.enabled
+            ? interactionCollider.ClosestPoint(feet) : transform.position;
+        return Vector3.Distance(chestPoint, feet);
+    }
+
+    bool OnRequiredPlatform(Transform player)
+    {
+        if (requiredPlatform == null) return true;
+        if (requiresDruid && player.GetComponentInChildren<Druid>() == null) return false;
+        var movement = player.GetComponent<CharacterMovement>();
+        var body = player.GetComponent<CharacterController>();
+        if (movement == null || body == null || !movement.IsGrounded) return false;
+        Bounds pad = requiredPlatform.bounds;
+        Vector3 feet = body.bounds.center - Vector3.up * body.bounds.extents.y;
+        return feet.x >= pad.min.x && feet.x <= pad.max.x && feet.z >= pad.min.z && feet.z <= pad.max.z && feet.y >= pad.max.y - .3f;
+    }
+
+    public bool IsOpened => isOpened;
+    public event System.Action Opened;
+    System.Random lootRandom;
+
+    public void ConfigureLootSeed(int seed) => lootRandom = new System.Random(seed);
+    public void ConfigureWorldLoot()
+    {
+        if (lootRandom == null) lootRandom = WorldRandom.AtPosition(transform.position, 0x4C4F4F54);
+    }
+
+    /// <summary>Restores a generated chest after chunk reload without granting loot again.</summary>
+    public void RestoreOpenedState()
+    {
+        isOpened = true;
+        if (lidTransform != null) lidTransform.localRotation = Quaternion.Euler(lidOpenRotation);
+        SetPromptVisible(false);
+    }
+
+    private void Awake()
+    {
+        interactionCollider = GetComponent<Collider>();
+        SetupPromptUI();
+    }
+
+    private void Start()
+    {
+        SetPromptVisible(false);
+    }
+
+    private void Update()
+    {
+        if (isOpened) return;
+
+        CheckPlayerDistance();
+
+        if (isPlayerInRange && !NPCChallengePrompt.BlocksGameplayInput && IsFKeyPressed())
+        {
+            OpenChest();
+        }
+    }
+
+    private void CheckPlayerDistance()
+    {
+        isPlayerInRange = CanInteract(GetPlayerTransform());
+        SetPromptVisible(isPlayerInRange);
+    }
+
+    private Transform GetPlayerTransform()
+    {
+        if (CharacterSwitchManager.CurrentCharacterTransform != null)
+            return CharacterSwitchManager.CurrentCharacterTransform;
+
+        GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+        if (playerObj != null) return playerObj.transform;
+
+        return null;
+    }
+
+    private bool IsFKeyPressed()
+    {
+#if ENABLE_INPUT_SYSTEM
+        if (Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame)
+            return true;
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+        if (Input.GetKeyDown(KeyCode.F))
+            return true;
+#endif
+        return false;
+    }
+
+    /// <summary>
+    /// Opens the chest, awards loot to PlayerInventory, and plays visual/sound effects.
+    /// </summary>
+    public void OpenChest()
+    {
+        if (isOpened || ((requiredCliff != null || requiredPlatform != null) && !CanInteract(GetPlayerTransform()))) return;
+        isOpened = true;
+
+        // 1. Audio
+        if (openSound != null)
+        {
+            GameAudio.PlaySFXAtPoint(openSound, transform.position);
+        }
+
+        // 2. Particles
+        if (openParticles != null)
+        {
+            openParticles.Play();
+        }
+
+        // 3. Animation
+        if (chestAnimator != null && !string.IsNullOrEmpty(animatorTrigger))
+        {
+            chestAnimator.SetTrigger(animatorTrigger);
+        }
+        else if (lidTransform != null)
+        {
+            StartCoroutine(AnimateLidOpen());
+        }
+
+        // 4. Distribute Loot
+        string lootMessage = "";
+        if (lootTable != null)
+        {
+            ConfigureWorldLoot();
+            LootEntry entry = lootTable.RollEntry(lootRandom);
+            if (entry != null && entry.Item != null)
+            {
+                PlayerInventory.Instance.AddItem(entry.Item);
+                lootMessage = entry.Item.ItemName;
+                Debug.Log($"[Chest] Opened: received {lootMessage}!");
+            }
+        }
+        else
+        {
+            Debug.LogWarning($"[Chest] '{gameObject.name}' has no LootTable assigned!");
+        }
+
+        // 5. Show Reward Notification above chest
+        if (feedbackCoroutine != null) StopCoroutine(feedbackCoroutine);
+        feedbackCoroutine = StartCoroutine(ShowRewardFeedback(lootMessage));
+
+        // 6. Invoke UnityEvent
+        Opened?.Invoke();
+        onChestOpened?.Invoke();
+    }
+
+    private IEnumerator AnimateLidOpen()
+    {
+        if (lidTransform == null) yield break;
+
+        Quaternion startRot = lidTransform.localRotation;
+        Quaternion targetRot = Quaternion.Euler(lidOpenRotation);
+        float elapsed = 0f;
+
+        while (elapsed < 1f)
+        {
+            elapsed += Time.deltaTime * lidOpenSpeed;
+            lidTransform.localRotation = Quaternion.Slerp(startRot, targetRot, elapsed);
+            yield return null;
+        }
+
+        lidTransform.localRotation = targetRot;
+    }
+
+    private IEnumerator ShowRewardFeedback(string message)
+    {
+        if (spritePrompt == null) yield break;
+        spritePrompt.Reward(string.IsNullOrEmpty(message) ? "Chest Opened" : $"Obtained\n{message}!");
+        yield return new WaitForSeconds(2.5f);
+        spritePrompt.gameObject.SetActive(false);
+    }
+
+    private void SetPromptVisible(bool visible)
+    {
+        if (spritePrompt != null && (!isOpened || !visible)) spritePrompt.Show(visible, promptText);
+    }
+
+    private void SetupPromptUI()
+    {
+        spritePrompt = WorldInteractionPrompt.Create(transform);
+        if (spritePrompt == null) return;
+        spritePrompt.SetTarget(transform, gameObject, promptOffset);
+        promptUI = spritePrompt.gameObject;
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawWireSphere(transform.position, interactDistance);
+        Gizmos.DrawIcon(transform.position + promptOffset, "chest_icon", true);
+    }
+}

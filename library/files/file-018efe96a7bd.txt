@@ -1,0 +1,38 @@
+using UnityEngine;
+using UnityEngine.UI;
+
+public class AudioSettings : MonoBehaviour
+{
+    public Slider musicSlider;
+    public Slider sfxSlider;
+
+    public AudioSource musicSource;
+    public AudioSource sfxSource;
+
+    private void Start()
+    {
+        float musicVolume = PlayerPrefs.GetFloat("MusicVolume", 1f);
+        float sfxVolume = PlayerPrefs.GetFloat("SFXVolume", 1f);
+
+        musicSlider.value = musicVolume;
+        sfxSlider.value = sfxVolume;
+
+        SetMusicVolume(musicVolume);
+        SetSFXVolume(sfxVolume);
+
+        musicSlider.onValueChanged.AddListener(SetMusicVolume);
+        sfxSlider.onValueChanged.AddListener(SetSFXVolume);
+    }
+
+    public void SetMusicVolume(float volume)
+    {
+        GameAudio.RouteMusic(musicSource);
+        GameAudio.SetMusic(volume);
+    }
+
+    public void SetSFXVolume(float volume)
+    {
+        GameAudio.RouteSFX(sfxSource);
+        GameAudio.SetSFX(volume);
+    }
+}

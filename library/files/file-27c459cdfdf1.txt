@@ -1,0 +1,98 @@
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+public static class WiSeAssetGenerator
+{
+    private const string ItemFolder = "Assets/GameData/Items";
+    private const string LootFolder = "Assets/GameData/LootTables";
+
+    [MenuItem("WiSe/Generate Potions & Loot Table", false, 1)]
+    public static void GenerateAll()
+    {
+        EnsureFolder(ItemFolder);
+        EnsureFolder(LootFolder);
+
+        // 1. Create the 5 Consumables
+        Consumable heal = CreateConsumable("Potion of Heal", "Restores 10 HP.", 10, 0, false, 10);
+        Consumable healDX = CreateConsumable("Potion of Heal DX", "Restores 100 HP.", 100, 0, false, 50);
+        Consumable sp = CreateConsumable("Sapphire Essence", "Restores 10 SP.", 0, 10, false, 25);
+        Consumable spDX = CreateConsumable("Sapphire Essence DX", "Restores 100 SP.", 0, 100, false, 70);
+        Consumable diamond = CreateConsumable("Diamond", "Revives a fallen ally and fully restores HP and SP.", 0, 0, true, 0);
+
+        // 2. Create the Loot Table
+        string lootPath = $"{LootFolder}/OverworldChestLootTable.asset";
+        LootTable table = AssetDatabase.LoadAssetAtPath<LootTable>(lootPath);
+        if (table == null)
+        {
+            table = ScriptableObject.CreateInstance<LootTable>();
+            AssetDatabase.CreateAsset(table, lootPath);
+        }
+
+        SerializedObject so = new SerializedObject(table);
+        SerializedProperty entriesProp = so.FindProperty("entries");
+        entriesProp.ClearArray();
+
+        AddLootEntry(entriesProp, heal, 40);
+        AddLootEntry(entriesProp, sp, 30);
+        AddLootEntry(entriesProp, healDX, 15);
+        AddLootEntry(entriesProp, spDX, 10);
+        AddLootEntry(entriesProp, diamond, 5);
+
+        so.ApplyModifiedProperties();
+        EditorUtility.SetDirty(table);
+
+        AssetDatabase.SaveAssets();
+        AssetDatabase.Refresh();
+
+        Selection.activeObject = table;
+        Debug.Log("[WiSe] Successfully generated all Potions and OverworldChestLootTable!");
+        EditorUtility.DisplayDialog("WiSe Setup", "Successfully generated 5 Potions and the OverworldChestLootTable in Assets/GameData/!", "OK");
+    }
+
+    private static Consumable CreateConsumable(string name, string desc, int heal, int sp, bool revive, int cost)
+    {
+        string path = $"{ItemFolder}/{name}.asset";
+        Consumable item = AssetDatabase.LoadAssetAtPath<Consumable>(path);
+        if (item == null)
+        {
+            item = ScriptableObject.CreateInstance<Consumable>();
+            AssetDatabase.CreateAsset(item, path);
+        }
+
+        SerializedObject so = new SerializedObject(item);
+        so.FindProperty("itemName").stringValue = name;
+        so.FindProperty("description").stringValue = desc;
+        so.FindProperty("healAmount").intValue = heal;
+        so.FindProperty("spAmount").intValue = sp;
+        so.FindProperty("revivesAndFullRestore").boolValue = revive;
+        so.FindProperty("cost").intValue = cost;
+        so.ApplyModifiedProperties();
+
+        EditorUtility.SetDirty(item);
+        return item;
+    }
+
+    private static void AddLootEntry(SerializedProperty listProp, Item item, int weight)
+    {
+        int index = listProp.arraySize;
+        listProp.InsertArrayElementAtIndex(index);
+        SerializedProperty elem = listProp.GetArrayElementAtIndex(index);
+        elem.FindPropertyRelative("item").objectReferenceValue = item;
+        elem.FindPropertyRelative("weight").intValue = weight;
+    }
+
+    private static void EnsureFolder(string path)
+    {
+        if (!AssetDatabase.IsValidFolder(path))
+        {
+            string parent = Path.GetDirectoryName(path).Replace("\\", "/");
+            string leaf = Path.GetFileName(path);
+            if (!AssetDatabase.IsValidFolder(parent))
+            {
+                EnsureFolder(parent);
+            }
+            AssetDatabase.CreateFolder(parent, leaf);
+        }
+    }
+}

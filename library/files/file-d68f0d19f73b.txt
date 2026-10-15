@@ -1,0 +1,95 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class NPCDialogueChecks
+{
+    const string Folder = "Temp/NPCDialogue";
+    static double nextCheck;
+    static NPCDialogueChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: saved speech-bubble Images/TMP, grey centred text, rich-text typewriter, generated IUPAC name, camera-facing placement at 65 degrees, hidden on exit, saved guide/friendly NPCs; native renders saved."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Validate NPC Dialogue Bubbles")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var owned = new GameObject("DialoguePreview"); SceneManager.MoveGameObjectToScene(owned, scene);
+        var originalCameras = Object.FindObjectsByType<Camera>(FindObjectsInactive.Include).Where(c => c.CompareTag("MainCamera")).ToArray();
+        foreach (Camera item in originalCameras) item.tag = "Untagged";
+        RenderTexture target = null;
+        try
+        {
+            var cameraObject = new GameObject("DialogueCamera"); cameraObject.transform.SetParent(owned.transform);
+            var camera = cameraObject.AddComponent<Camera>(); camera.tag = "MainCamera";
+            camera.orthographic = true; camera.orthographicSize = 7.5f; camera.backgroundColor = new Color(.08f,.06f,.04f);
+            camera.clearFlags = CameraClearFlags.SolidColor; camera.transform.rotation = Quaternion.Euler(65,45,0);
+            camera.transform.position = new Vector3(0,2,0) - camera.transform.forward * 30;
+            var lamp = cameraObject.AddComponent<Light>(); lamp.type = LightType.Directional; lamp.intensity = 1.4f;
+            var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+            var layout = DungeonLayout.Generate(24681,12,36,42,new BerdlyChemistry(0,Table("alkane"),Table("alkyl"),Table("prefix")));
+            for (int i = 0; i < 2; i++)
+            {
+                var npcObject = Object.Instantiate(i == 0 ? settings.dungeonGuideNPC : settings.dungeonFriendlyNPC, owned.transform);
+                var npc = npcObject.GetComponent<NormalNPC>();
+                var fields = new SerializedObject(npc);
+                var bubble = (NPCSpeechBubble)fields.FindProperty("speechBubble").objectReferenceValue;
+                bubble.Initialize(npcObject.transform); bubble.Show();
+                string line = i == 0 ? "Rooms as carbons, doors as bonds.\n(<color=#5C8EAF>" + layout.Name + "</color>)." : "I'm taking a break here. You won't have to fight me!";
+                int count = bubble.PrepareTyping(line); bubble.ShowCharacters(6);
+                var text = bubble.GetComponentInChildren<TextMeshProUGUI>(true);
+                Require(text.text == line && text.maxVisibleCharacters == 6 && (i == 0 ? count < line.Length : count == line.Length),
+                    "Typewriter destroys rich-text markup.");
+                bubble.SetText(line); text.ForceMeshUpdate(true);
+                Require(text.alignment == TextAlignmentOptions.Center && text.color.r < .5f && !text.isTextOverflowing,
+                    "Text is clipped or missing the reference style.");
+                Require(text.font.name.StartsWith("MedievalSharp") && text.enableAutoSizing && text.margin.x >= 8,
+                    "Dialogue text is missing MedievalSharp or its fitting settings.");
+                Require((text.fontStyle & FontStyles.Bold) != 0 && text.color.r <= .16f && text.fontSharedMaterial.GetFloat("_FaceDilate") >= .14f,
+                    "Dialogue is missing the heavier, darker style.");
+                Require(bubble.GetComponentInChildren<Image>().sprite != null && bubble.GetComponent<Canvas>().renderMode == RenderMode.WorldSpace,
+                    "Speech UI has no saved bubble sprite or world-space Canvas.");
+                Require(Quaternion.Angle(bubble.transform.rotation, camera.transform.rotation) < .01f,
+                    "Bubble does not face the current camera.");
+                foreach (Transform child in owned.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+                camera.cullingMask = 1 << 30; lamp.cullingMask = 1 << 30;
+                if (target == null) target = new RenderTexture(1000,700,24);
+                camera.targetTexture = target; camera.ResetWorldToCameraMatrix(); camera.ResetProjectionMatrix();
+                Canvas.ForceUpdateCanvases(); camera.Render();
+                RenderTexture previous = RenderTexture.active; RenderTexture.active = target;
+                var image = new Texture2D(1000,700,TextureFormat.RGB24,false);
+                image.ReadPixels(new Rect(0,0,1000,700),0,0); image.Apply();
+                File.WriteAllBytes(Folder + (i == 0 ? "/berdly.png" : "/friendly.png"),image.EncodeToPNG());
+                Object.DestroyImmediate(image); RenderTexture.active = previous;
+                bubble.Hide(); Require(!bubble.IsVisible(), "Bubble remains visible on exit.");
+                Object.DestroyImmediate(npcObject);
+            }
+        }
+        finally
+        {
+            foreach (Camera camera in originalCameras) if (camera != null) camera.tag = "MainCamera";
+            foreach (Camera camera in owned.GetComponentsInChildren<Camera>()) camera.targetTexture = null;
+            if (target != null) { target.Release(); Object.DestroyImmediate(target); }
+            Object.DestroyImmediate(owned); SceneManager.SetActiveScene(original); EditorSceneManager.CloseScene(scene,true);
+        }
+    }
+    static string Table(string name) => Resources.Load<TextAsset>("BerdlyNaming/" + name).text;
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

@@ -1,0 +1,92 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Positions a saved sprite prefab; never draws or generates artwork at runtime.</summary>
+[DefaultExecutionOrder(200)]
+public sealed class WorldInteractionPrompt : MonoBehaviour
+{
+    [SerializeField] Image bubble;
+    [SerializeField] TextMeshProUGUI caption;
+    [SerializeField] float screenHeight = 54f;
+    [SerializeField] RectTransform overlayAnchor;
+    Transform target;
+    Vector3 anchor;
+    GameObject visual;
+    bool useBounds;
+
+    public Image Bubble => bubble;
+    public static WorldInteractionPrompt Create(Transform owner, bool screenOverlay = false)
+    {
+        var prefab = Resources.Load<WorldInteractionPrompt>(screenOverlay
+            ? "Interaction/WorldInteractionPromptOverlay" : "Interaction/WorldInteractionPrompt");
+        if (prefab == null) { Debug.LogError("Missing saved F interaction prompt prefab."); return null; }
+        // Overlay canvases must be scene roots, independent of the building's scale.
+        var instance = Instantiate(prefab, screenOverlay ? null : owner);
+        instance.gameObject.SetActive(false);
+        return instance;
+    }
+    public void SetTarget(Transform speaker, GameObject model, Vector3 fallback, bool aboveVisual = true)
+    { target = speaker; visual = model; anchor = fallback; useBounds = aboveVisual; }
+    public void Show(bool visible, string action = null)
+    {
+        bubble.gameObject.SetActive(true);
+        caption.text = (action ?? "").Replace("[F]", "").Trim();
+        caption.color = Color.white;
+        gameObject.SetActive(visible);
+        if (visible) RefreshPosition();
+    }
+    public void Reward(string message)
+    {
+        bubble.gameObject.SetActive(false);
+        caption.text = message; caption.color = new Color(.3f, 1f, .4f);
+        gameObject.SetActive(true); RefreshPosition();
+    }
+    void LateUpdate() => RefreshPosition();
+    public void RefreshPosition()
+    {
+        var camera = Camera.main;
+        if (camera == null) return;
+        Vector3 point = target != null ? target.position + anchor : anchor;
+        Bounds bounds = default;
+        bool found = false;
+        if (useBounds && visual != null)
+            foreach (var renderer in visual.GetComponentsInChildren<Renderer>())
+            {
+                if (!renderer.enabled || !(renderer is MeshRenderer || renderer is SkinnedMeshRenderer)) continue;
+                if (!found) { bounds = renderer.bounds; found = true; } else bounds.Encapsulate(renderer.bounds);
+            }
+        if (found) point = bounds.center;
+        float depth = Vector3.Dot(point - camera.transform.position, camera.transform.forward);
+        if (depth <= camera.nearClipPlane) { bubble.enabled = false; caption.enabled = false; return; }
+        bubble.enabled = caption.enabled = true;
+        if (overlayAnchor != null && TryGetComponent<Canvas>(out var overlayCanvas))
+        {
+            Vector3 screen = camera.WorldToScreenPoint(point);
+            float iconScale = screenHeight / 78f;
+            overlayAnchor.localScale = Vector3.one * iconScale;
+            // Keep the icon and its caption on screen even beside a viewport edge.
+            screen.x = Mathf.Clamp(screen.x, 124f * iconScale, Screen.width - 124f * iconScale);
+            screen.y = Mathf.Clamp(screen.y, 78f * iconScale, Screen.height - 54f * iconScale);
+            RectTransformUtility.ScreenPointToLocalPointInRectangle((RectTransform)overlayCanvas.transform,
+                screen, null, out Vector2 position);
+            overlayAnchor.anchoredPosition = position;
+            return;
+        }
+        float unitsPerPixel = (camera.orthographic ? camera.orthographicSize * 2f :
+            2f * depth * Mathf.Tan(camera.fieldOfView * Mathf.Deg2Rad * .5f)) / Mathf.Max(1, camera.pixelHeight);
+        // Reference artwork has transparent margins. Keep its visible bubble ~54 screen pixels.
+        float scale = unitsPerPixel * screenHeight / 78f;
+        var parentScale = transform.parent != null ? transform.parent.lossyScale : Vector3.one;
+        transform.localScale = new Vector3(scale / parentScale.x, scale / parentScale.y, scale / parentScale.z);
+        transform.rotation = camera.transform.rotation;
+        if (found)
+        {
+            Vector3 up = camera.transform.up;
+            float silhouetteTop = Vector3.Dot(new Vector3(Mathf.Abs(up.x), Mathf.Abs(up.y), Mathf.Abs(up.z)), bounds.extents);
+            point += up * (silhouetteTop + unitsPerPixel * (screenHeight * .65f + 14));
+        }
+        transform.position = point;
+        if (TryGetComponent<Canvas>(out var canvas)) canvas.worldCamera = camera;
+    }
+}

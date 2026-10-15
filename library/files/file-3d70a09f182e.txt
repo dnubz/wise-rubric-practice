@@ -1,0 +1,212 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+public class InventoryUI : MonoBehaviour
+{
+    [SerializeField] private TextMeshProUGUI titleText;
+    [SerializeField] private TextMeshProUGUI descriptionText;
+    [SerializeField] private TextMeshProUGUI coinText;
+    [SerializeField] private Inventory playerInventory;
+    [SerializeField] private ItemSlotUI[] itemSlots;
+
+    [SerializeField] private CharacterBase[] characters;
+    [SerializeField] private Button[] avatarButtons;
+
+    [SerializeField] private Image[] hpBars;
+    [SerializeField] private TextMeshProUGUI[] hpTexts;
+    [SerializeField] private Image[] spBars;
+    [SerializeField] private TextMeshProUGUI[] spTexts;
+
+    private Consumable selectedConsumable;
+
+
+    private void Start()
+    {
+        SetupAvatarButtons();
+        RefreshUI();
+    }
+
+    private void OnEnable()
+    {
+        if (playerInventory == null) playerInventory = FindFirstObjectByType<Inventory>();
+        if (playerInventory != null)
+        {
+            playerInventory.OnChanged -= RefreshUI;
+            playerInventory.OnChanged += RefreshUI;
+        }
+        RefreshUI();
+        UpdateBars();
+        UpdateCoinDisplay(PlayerInventory.Instance != null ? PlayerInventory.Instance.Gold : 0);
+
+        if (PlayerInventory.Instance != null)
+        {
+            PlayerInventory.Instance.OnGoldChanged -= UpdateCoinDisplay;
+            PlayerInventory.Instance.OnGoldChanged += UpdateCoinDisplay;
+        }
+    }
+
+    private void OnDisable()
+    {
+        if (playerInventory != null) playerInventory.OnChanged -= RefreshUI;
+        if (PlayerInventory.HasInstance)
+        {
+            PlayerInventory.Instance.OnGoldChanged -= UpdateCoinDisplay;
+        }
+    }
+
+    private void UpdateCoinDisplay(int currentGold)
+    {
+        if (coinText != null)
+        {
+            coinText.text = currentGold.ToString();
+        }
+    }
+
+    private void Update()
+    {
+        UpdateBars();
+    }
+
+    private void SetupAvatarButtons()
+    {
+        if (avatarButtons == null) return;
+
+        for (int i = 0; i < avatarButtons.Length; i++)
+        {
+            if (avatarButtons[i] == null) continue;
+            int index = i;
+            avatarButtons[i].onClick.RemoveAllListeners();
+            avatarButtons[i].onClick.AddListener(() => UseOnCharacter(index));
+        }
+    }
+
+    public void RefreshUI()
+    {
+        if (playerInventory == null)
+        {
+            playerInventory = FindFirstObjectByType<Inventory>();
+        }
+
+        if (itemSlots == null) return;
+
+        int visibleTypes = 0;
+        for (int i = 0; i < itemSlots.Length; i++)
+        {
+            if (itemSlots[i] == null) continue;
+            itemSlots[i].Setup(this);
+            itemSlots[i].UpdateQuantity(playerInventory);
+            bool owned = itemSlots[i].Item is Consumable && playerInventory != null &&
+                playerInventory.GetItemCount(itemSlots[i].Item) > 0 && visibleTypes < 5;
+            itemSlots[i].gameObject.SetActive(owned);
+            if (owned) visibleTypes++;
+        }
+
+        // Clear the selection when its last copy is used or the bag is empty.
+        if (selectedConsumable == null || playerInventory == null || playerInventory.GetItemCount(selectedConsumable) == 0)
+        {
+            selectedConsumable = null;
+            if (titleText != null) titleText.text = "-";
+            if (descriptionText != null) descriptionText.text = "-";
+        }
+    }
+
+    public void ShowItemDetails(Item item)
+    {
+        if (item == null) return;
+        selectedConsumable = item as Consumable;
+        if (titleText != null) titleText.text = item.ItemName;
+        if (descriptionText != null) descriptionText.text = item.Description;
+    }
+
+    public void UseOnCharacter(int index)
+    {
+        if (selectedConsumable == null) return;
+        if (playerInventory == null) return;
+        if (characters == null || index < 0 || index >= characters.Length || characters[index] == null) return;
+        if (playerInventory.GetItemCount(selectedConsumable) <= 0) return;
+
+        CharacterBase target = characters[index];
+
+        // Cannot use regular potions on a knocked out character
+        if (target.IsDead() && !selectedConsumable.RevivesAndFullRestore)
+        {
+            Debug.Log(target.gameObject.name + " is knocked out! Needs a revive.");
+            return;
+        }
+
+        bool restoresHp = selectedConsumable.HealAmount > 0;
+        bool restoresSp = selectedConsumable.SpAmount > 0;
+
+        // Block if health potion used on full HP
+        if (restoresHp && !restoresSp && target.GetCurrHP() >= target.GetMaxHP())
+        {
+            Debug.Log(target.gameObject.name + " is already at full HP!");
+            return;
+        }
+
+        // Block if mana/SP potion used on full SP
+        if (restoresSp && !restoresHp && target.GetCurrSP() >= target.GetMaxSP())
+        {
+            Debug.Log(target.gameObject.name + " is already at full SP!");
+            return;
+        }
+
+        // Block if hybrid potion used on full HP and SP
+        if (restoresHp && restoresSp && target.GetCurrHP() >= target.GetMaxHP() && target.GetCurrSP() >= target.GetMaxSP())
+        {
+            Debug.Log(target.gameObject.name + " is already at full HP and SP!");
+            return;
+        }
+
+        // Don't waste a revive/diamond on a character that doesn't need it
+        if (selectedConsumable.RevivesAndFullRestore && !target.IsDead() && target.GetCurrHP() >= target.GetMaxHP() && target.GetCurrSP() >= target.GetMaxSP())
+        {
+            Debug.Log(target.gameObject.name + " is already fully healed and alive!");
+            return;
+        }
+
+        int beforeHP = target.GetCurrHP(), beforeSP = target.GetCurrSP();
+        selectedConsumable.Use(target);
+        if (BattleSession.IsActive && BattleController.Instance != null)
+        {
+            if (target.GetCurrHP() > beforeHP) BattleController.Instance.Popup(target.transform.position, "+" + (target.GetCurrHP() - beforeHP), Color.green);
+            if (target.GetCurrSP() > beforeSP) BattleController.Instance.Popup(target.transform.position, "+" + (target.GetCurrSP() - beforeSP) + " SP", Color.cyan);
+            target.GetComponent<BattleUnit>()?.Refresh(); BattleController.Instance.RefreshHUD();
+        }
+        playerInventory.RemoveItem(selectedConsumable);
+        RefreshUI();
+        UpdateBars();
+    }
+
+    public void UpdateBars()
+    {
+        if (characters == null || characters.Length == 0) return;
+
+        for (int i = 0; i < characters.Length; i++)
+        {
+            if (characters[i] == null) continue;
+
+            int currHP = characters[i].GetCurrHP();
+            int maxHP = characters[i].GetMaxHP();
+            int currSP = characters[i].GetCurrSP();
+            int maxSP = characters[i].GetMaxSP();
+
+            if (hpBars != null && i < hpBars.Length)
+                MenuStatBar.Set(hpBars[i], currHP, maxHP);
+
+            if (hpTexts != null && i < hpTexts.Length && hpTexts[i] != null)
+            {
+                hpTexts[i].text = currHP + "/" + maxHP;
+            }
+
+            if (spBars != null && i < spBars.Length)
+                MenuStatBar.Set(spBars[i], currSP, maxSP);
+
+            if (spTexts != null && i < spTexts.Length && spTexts[i] != null)
+            {
+                spTexts[i].text = currSP + "/" + maxSP;
+            }
+        }
+    }
+}

@@ -1,0 +1,76 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>One looping world track and one fading NPC/challenge track.</summary>
+public sealed class OverworldMusicController : MonoBehaviour
+{
+    public static OverworldMusicController Instance { get; private set; }
+    [SerializeField] AudioSource overworldSource;
+    [SerializeField] AudioSource themeSource;
+    [SerializeField] AudioClip overworldMusic;
+    [SerializeField] AudioClip berdlyBattleMusic;
+    [Min(.05f), SerializeField] float fadeSeconds = .8f;
+    [Range(0, 1), SerializeField] float musicVolume = .7f;
+    readonly List<MinigameNPC> npcs = new List<MinigameNPC>();
+    Object battleOwner, silenceOwner;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics() { Instance = null; }
+    void Awake()
+    {
+        Instance = this;
+        GameAudio.RouteMusic(overworldSource); GameAudio.RouteMusic(themeSource);
+        overworldSource.clip = overworldMusic;
+        overworldSource.loop = themeSource.loop = true;
+        overworldSource.playOnAwake = themeSource.playOnAwake = false;
+        overworldSource.spatialBlend = themeSource.spatialBlend = 0;
+        overworldSource.volume = musicVolume; themeSource.volume = 0;
+        overworldSource.Play();
+    }
+    public void Register(MinigameNPC npc) { if (!npcs.Contains(npc)) npcs.Add(npc); }
+    public void Unregister(MinigameNPC npc) { npcs.Remove(npc); }
+    public bool Owns(AudioSource source) => source == overworldSource || source == themeSource;
+    public void BeginBerdlyBattle(Object owner) { battleOwner = owner; }
+    public void EndBerdlyBattle(Object owner) { if (battleOwner == owner) battleOwner = null; }
+    public void SilenceForRhythm(Object owner) { silenceOwner = owner; }
+    public void ResumeAfterRhythm(Object owner) { if (silenceOwner == owner) silenceOwner = null; }
+
+    void LateUpdate() { Tick(Time.unscaledDeltaTime); }
+    void Tick(float seconds)
+    {
+        // Dungeon travel already pauses the surface sources and restores their playback positions.
+        if (DungeonSession.IsInside || BattleSession.IsActive) return;
+        AudioClip desired = null;
+        if (silenceOwner == null)
+        {
+            if (battleOwner != null) desired = berdlyBattleMusic;
+            else
+            {
+                var player = CharacterSwitchManager.CurrentCharacterTransform;
+                float nearest = float.PositiveInfinity;
+                if (player != null) for (int i = npcs.Count - 1; i >= 0; i--)
+                {
+                    var npc = npcs[i];
+                    if (npc == null) { npcs.RemoveAt(i); continue; }
+                    if (!npc.isActiveAndEnabled || npc.ApproachMusic == null) continue;
+                    float distance = npc.DistanceToPlayerSquared(player);
+                    if (distance <= npc.MusicRadius * npc.MusicRadius && distance < nearest)
+                    { nearest = distance; desired = npc.ApproachMusic; }
+                }
+            }
+        }
+        float step = musicVolume * seconds / Mathf.Max(.05f, fadeSeconds);
+        float worldTarget = silenceOwner == null && desired == null ? musicVolume : 0;
+        overworldSource.volume = Mathf.MoveTowards(overworldSource.volume, worldTarget, step);
+        // Switch clips at silence, so entering another NPC's range never cuts a loud track.
+        float themeTarget = desired != null && themeSource.clip == desired ? musicVolume : 0;
+        themeSource.volume = Mathf.MoveTowards(themeSource.volume, themeTarget, step);
+        if (themeSource.volume == 0 && themeSource.clip != desired)
+        {
+            themeSource.Stop(); themeSource.clip = desired;
+            if (desired != null) themeSource.Play();
+        }
+        else if (desired == null && themeSource.volume == 0 && themeSource.isPlaying) themeSource.Stop();
+    }
+    void OnDestroy() { if (Instance == this) Instance = null; }
+}

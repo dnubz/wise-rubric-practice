@@ -1,0 +1,183 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class OverworldObstacleChecks
+{
+    const string Folder = "Temp/OverworldObstacles";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double next;
+    static int frame = -1;
+    static OverworldObstacleChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || frame == Time.frameCount) return;
+            frame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: seeded platforms and opened chest state persist; chest sits on the final deck; Wise, Randal and Druid can interact when landed; Druid glides across the gaps; chest grants one diamond and cannot be opened from below."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result) { Time.captureDeltaTime = 0; File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static object Get(object obj, string field) => obj.GetType().GetField(field, Private).GetValue(obj);
+    static void Set(object obj, string field, object value) => obj.GetType().GetField(field, Private).SetValue(obj, value);
+    static object Invoke(object obj, string name, params object[] args) => obj.GetType().GetMethod(name, Private).Invoke(obj, args);
+
+    static IEnumerator Run()
+    {
+        Time.timeScale = 1; Time.captureDeltaTime = 1f / 60;
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var world = WFCWorldManager.Instance; world.enabled = false;
+        var nav = world.GetComponent<ExplorationNavigation>(); nav.BeforeTerrainChanges(); nav.enabled = false;
+        var spawner = world.GetComponent<OverworldObstacleSpawner>();
+        var generated = world.GetComponentsInChildren<OverworldPlatformObstacle>();
+        Require(spawner != null && generated.Length > 0, "No platform challenges in the actual generated world.");
+        foreach (var challenge in generated)
+        {
+            Require(challenge.platforms.Length == 3 && challenge.platforms[0].bounds.max.y < challenge.platforms[1].bounds.max.y &&
+                challenge.platforms[1].bounds.max.y < challenge.platforms[2].bounds.max.y, "Platforms are not ascending.");
+            Bounds area = challenge.WorldFootprint;
+            for (float x = area.min.x; x <= area.max.x; x += 2) for (float z = area.min.z; z <= area.max.z; z += 2)
+                Require(world.GetTerrainAt(new Vector3(x, 0, z)) != 1, "Challenge overlaps WFC water.");
+            foreach (var tree in challenge.transform.parent.GetComponentsInChildren<TreeCuttable>())
+                Require(!challenge.Reserves(tree.transform.position), "A resource blocks the reserved jumps.");
+        }
+        var first = generated[0]; Vector3 before = first.transform.position; Quaternion rotation = first.transform.rotation;
+        var chunks = (Dictionary<Vector2Int, GameObject>)Get(world, "chunks");
+        var chunk = chunks.First(pair => pair.Value.transform == first.transform.parent).Key;
+        first.chest.RestoreOpenedState();
+        // Persist an opened generated chest without granting test loot at the remote location.
+        spawner.RestoreOpenedChests(world.WorldSeed, new[] { chunk });
+        var saved = Object.FindAnyObjectByType<GameSave>().Capture();
+        Require(saved.openedPlatformChests.Contains(chunk), "Save omits the opened platform chest.");
+        var oldRoot = chunks[chunk]; oldRoot.SetActive(false); chunks.Remove(chunk);
+        var terrainData = (Dictionary<Vector2Int, List<TerrainData>>)Get(world, "generatedTerrainData");
+        if (terrainData.TryGetValue(chunk, out var oldData)) { terrainData.Remove(chunk); foreach (var data in oldData) Object.Destroy(data); }
+        Object.Destroy(oldRoot); yield return null;
+        Invoke(world, "GenerateChunk", chunk);
+        var reloaded = chunks[chunk].GetComponentInChildren<OverworldPlatformObstacle>();
+        Require(reloaded != null && Vector3.Distance(before, reloaded.transform.position) < .001f && Quaternion.Angle(rotation, reloaded.transform.rotation) < .01f,
+            "The same seed produces a different obstacle after chunk reload.");
+        Require(reloaded.chest.IsOpened, "Chunk reload resets the opened chest.");
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+
+        var stage = Object.Instantiate(spawner.platformPrefab, new Vector3(0, 300, 0), Quaternion.identity);
+        stage.Configure(12345, false, () => { });
+        Require(ChunkSpawnUtility.TryGetVisualBounds(stage.chest.gameObject, out Bounds chestVisual), "Chest visual missing.");
+        Bounds deck = stage.platforms[2].bounds;
+        Require(Mathf.Abs(chestVisual.center.x - deck.center.x) < .01f &&
+            Mathf.Abs(chestVisual.center.z - deck.center.z) < .01f &&
+            Mathf.Abs(chestVisual.min.y - deck.max.y - .02f) < .01f, "Chest did not follow the moved final deck.");
+        var floor = GameObject.CreatePrimitive(PrimitiveType.Cube); floor.transform.SetParent(stage.transform, false);
+        floor.transform.localPosition = new Vector3(0, -.5f, 16); floor.transform.localScale = new Vector3(35, 1, 65);
+        var switching = Object.FindAnyObjectByType<CharacterSwitchManager>();
+        CharacterMovement move;
+        for (int character = 0; character < 2; character++)
+        {
+            switching.SwitchToCharacter(character);
+            move = CharacterSwitchManager.CurrentCharacterTransform.GetComponent<CharacterMovement>(); move.enabled = false;
+            Stand(move, new Vector3(0, stage.platforms[2].bounds.max.y, stage.platforms[2].bounds.center.z - 1.6f));
+            Require(stage.chest.CanInteract(move.transform), move.name + " cannot interact with the chest after landing.");
+        }
+        switching.SwitchToCharacter(2);
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        move = player.GetComponent<CharacterMovement>(); move.enabled = false;
+        var druid = player.GetComponent<Druid>(); druid.enabled = false;
+        Stand(move, new Vector3(0, 300, -4));
+        Require(stage.platforms[0].bounds.max.y - 300 < (float)Get(move, "jumpHeight"), "Lower first platform is unreachable.");
+        var jump = JumpTo(move, stage.platforms[0]); while (jump.MoveNext()) yield return null;
+        for (int i = 1; i < 3; i++)
+        {
+            BoxCollider previous = stage.platforms[i - 1];
+            Stand(move, new Vector3(0, previous.bounds.max.y, previous.bounds.max.z - .5f));
+            jump = CrossGap(move, stage.platforms[i], true); while (jump.MoveNext()) yield return null;
+        }
+        Bounds finalDeck = stage.platforms[2].bounds;
+        Stand(move, new Vector3(finalDeck.max.x - .05f, finalDeck.max.y, finalDeck.min.z + .05f));
+        Require(Vector3.Distance(player.position, stage.chest.transform.position) > 4f,
+            "Chest range check must exercise the newly added interaction distance.");
+        Require(stage.chest.CanInteract(player), "The final deck corner does not show the chest interaction within its larger range.");
+        var diamond = AssetDatabase.LoadAssetAtPath<Consumable>("Assets/Scripts/Inventory/Items/Consumable/Diamond.asset");
+        int owned = PlayerInventory.Instance.Consumables.Count(i => i == diamond);
+        stage.chest.OpenChest(); stage.chest.OpenChest();
+        Require(stage.chest.IsOpened && PlayerInventory.Instance.Consumables.Count(i => i == diamond) == owned + 1, "Chest does not grant exactly one diamond.");
+        var unopened = Object.Instantiate(spawner.platformPrefab, new Vector3(50, 300, 0), Quaternion.identity); unopened.Configure(123, false, () => { });
+        Stand(move, new Vector3(50, 300, unopened.platforms[2].bounds.center.z)); unopened.chest.OpenChest();
+        Require(!unopened.chest.CanInteract(player) && !unopened.chest.IsOpened, "The chest can be looted from below.");
+        Object.Destroy(unopened.gameObject); Object.Destroy(stage.gameObject);
+    }
+    static void Stand(CharacterMovement move, Vector3 feet)
+    {
+        var body = move.GetComponent<CharacterController>(); float offset = body.bounds.min.y - move.transform.position.y;
+        move.Teleport(feet + Vector3.up * (.03f - offset), Quaternion.identity); Physics.SyncTransforms(); body.Move(Vector3.down * .12f);
+        Set(move, "groundContactFresh", true); Set(move, "lastGroundedAt", Time.time); Set(move, "velocity", Vector3.down * 2);
+    }
+    static IEnumerator JumpTo(CharacterMovement move, BoxCollider target)
+    {
+        var body = move.GetComponent<CharacterController>(); Set(move, "jumpRequested", true); Set(move, "jumpExpiresAt", Time.time + .3f);
+        float highest = body.bounds.min.y;
+        var samples = new System.Text.StringBuilder();
+        for (int i = 0; i < 150; i++)
+        {
+            float speed = (float)Get(move, "moveSpeed");
+            bool approaching = move.transform.position.z < target.bounds.center.z;
+            Vector3 horizontal = approaching && body.bounds.min.y > target.bounds.max.y + .04f ? Vector3.forward * speed : Vector3.zero;
+            if (approaching && move.IsGrounded && body.bounds.min.y >= target.bounds.max.y - .1f) horizontal = Vector3.forward * speed;
+            Invoke(move, "ApplyJumpAndGravity", horizontal); highest = Mathf.Max(highest, body.bounds.min.y);
+            if (i % 5 == 0) samples.AppendLine("i=" + i + "; feet=" + body.bounds.min.y + "; position=" + move.transform.position + "; velocity=" + Get(move, "velocity") + "; delta=" + Time.deltaTime + "; animatorRoot=" + move.GetComponentInChildren<Animator>().applyRootMotion);
+            if ((body.collisionFlags & CollisionFlags.Above) != 0)
+            {
+                var touching = Physics.OverlapSphere(body.bounds.center + Vector3.up * (body.bounds.extents.y - .1f), body.bounds.extents.x + .3f, ~0, QueryTriggerInteraction.Ignore);
+                File.WriteAllText(Folder + "/jump-ceiling.txt", "target=" + target.name + "; body=" + body.bounds + "; scale=" + move.transform.lossyScale +
+                    "; velocity=" + Get(move, "velocity") + "; delta=" + Time.deltaTime + "\n" + string.Join("\n", touching.Select(c => c.name + " " + c.bounds)));
+            }
+            if (i > 3 && move.IsGrounded && body.bounds.min.y >= target.bounds.max.y - .2f &&
+                move.transform.position.z > target.bounds.min.z + .05f && move.transform.position.z < target.bounds.max.z) yield break;
+            yield return null;
+        }
+        File.WriteAllText(Folder + "/jump-" + target.name.Replace(" ", "_") + ".txt", samples.ToString());
+        throw new Exception("Cannot jump to " + target.name + "; highest feet=" + highest + "; platform=" + target.bounds.max.y + "; player=" + move.transform.position);
+    }
+    static IEnumerator CrossGap(CharacterMovement move, BoxCollider target, bool glide)
+    {
+        var body = move.GetComponent<CharacterController>();
+        Set(move, "jumpRequested", true); Set(move, "jumpExpiresAt", Time.time + .3f);
+        move.SetFloating(glide, .35f);
+        for (int i = 0; i < 600; i++)
+        {
+            // Release the glide once over the deck, just as releasing Space lets Druid land.
+            if (glide && move.transform.position.z >= target.bounds.min.z + .6f) move.SetFloating(false);
+            Vector3 horizontal = move.transform.position.z < target.bounds.center.z ? Vector3.forward * (float)Get(move, "moveSpeed") : Vector3.zero;
+            Invoke(move, "ApplyJumpAndGravity", horizontal);
+            if (i > 5 && move.IsGrounded)
+            {
+                bool landed = body.bounds.min.y >= target.bounds.max.y - .2f && move.transform.position.z >= target.bounds.min.z;
+                Require(landed == glide, glide ? "Druid cannot glide to " + target.name : "A normal jump crosses the glide-only gap.");
+                move.SetFloating(false); yield break;
+            }
+            yield return null;
+        }
+        throw new Exception("Glide landing timed out: " + target.name);
+    }
+}

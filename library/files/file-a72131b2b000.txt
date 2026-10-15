@@ -1,0 +1,170 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+// An isolated copy of the authored boss UI; never changes party stats or real saves.
+[InitializeOnLoad]
+public static class JevilPatternChecks
+{
+    const string Folder = "Temp/JevilPattern";
+    const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
+    static BattleBossGame game;
+    static GameObject fixture;
+    static BattleEnemyData data;
+    static IEnumerator attack;
+    static object[] identities;
+    static Image[] pooledImages;
+    static Vector2 firstPosition;
+    static int frames, pass, lastFrame;
+    static float duration;
+    static bool oldBackground;
+    static bool capturedBackground;
+    static bool struck;
+    static double deadline;
+    static JevilPatternChecks() => EditorApplication.update += Check;
+    [MenuItem("Tools/WiSe/Check Jevil Pattern 3")]
+    static void Request() { Directory.CreateDirectory(Folder); File.WriteAllText(Folder + "/check.request", ""); }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (fixture != null)
+        {
+            if (EditorApplication.timeSinceStartup > deadline) Finish("FAIL: Pattern 3 check timed out; sampled frames=" + frames + ", duration=" + duration);
+            else if (EditorApplication.isPlaying && !EditorApplication.isPaused && lastFrame != Time.frameCount)
+            {
+                lastFrame = Time.frameCount; Frame();
+            }
+            return;
+        }
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        if (!capturedBackground) { oldBackground = Application.runInBackground; capturedBackground = true; }
+        Application.runInBackground = true;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request");
+        try { Begin(); }
+        catch (Exception e) { Finish("FAIL: " + e); }
+    }
+    static void Begin()
+    {
+        var preview = EditorSceneManager.OpenPreviewScene("Assets/Scenes/BattleScene.unity");
+        try
+        {
+            var source = preview.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<BattleBossGame>(true)).Single();
+            fixture = new GameObject("Jevil Pattern Validation", typeof(Canvas));
+            var canvas = fixture.GetComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = 32000;
+            var scale = fixture.AddComponent<CanvasScaler>(); scale.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize; scale.referenceResolution = new Vector2(1920, 1080);
+            game = Object.Instantiate(source, fixture.transform);
+            foreach (var child in fixture.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 31;
+            data = ScriptableObject.CreateInstance<BattleEnemyData>(); data.displayName = "Pattern 3"; data.hp = 100000; data.attack = 20; data.defense = 0;
+            var boss = new GameObject("Test Jevil").AddComponent<BattleUnit>(); boss.transform.SetParent(fixture.transform); boss.enemy = data; boss.HP = data.hp;
+            var victim = new GameObject("Test Heart").AddComponent<BattleUnit>(); victim.transform.SetParent(fixture.transform); victim.enemy = data; victim.HP = data.hp;
+            Time.timeScale = 1;
+            pass = frames = 0; lastFrame = -1; duration = 0; identities = null; pooledImages = null; struck = false; deadline = EditorApplication.timeSinceStartup + 90;
+            attack = game.Play(boss, victim, 2, 4);
+        }
+        finally { EditorSceneManager.ClosePreviewScene(preview); }
+    }
+    public static void Frame()
+    {
+        if (attack == null) return;
+        try
+        {
+            bool running = attack.MoveNext();
+            var bullets = (IList)typeof(BattleBossGame).GetField("bullets", Private).GetValue(game);
+            if (!running)
+            {
+                Require(bullets.Count == 0 && !game.panel.activeSelf, "Pattern end left scythes active.");
+                Require(duration >= 9.9f && frames > 30, "The full ten-second pattern was not sampled.");
+                Require((firstPosition - ((Image)Field(identities[0], "image")).rectTransform.anchoredPosition).sqrMagnitude > 100, "Scythes never moved.");
+                Require(struck, "The enlarged scythe did not damage an overlapping heart.");
+                if (++pass == 2) { Finish("PASS: two complete Pattern 3 turns; exactly four identical, visible 120-unit scythes throughout, including after five seconds; compound inner/outer orbits and local spin; blade/handle collision and transparent corners; damage; end cleanup and pooled reuse. Native UI captures: start, inner orbit and late pattern."); return; }
+                var units = fixture.GetComponentsInChildren<BattleUnit>(); duration = 0; frames = 0; identities = null;
+                attack = game.Play(units[0], units[1], 2, 4); return;
+            }
+            duration += Time.deltaTime; frames++;
+            Require(bullets.Count == 4, "Pattern spawned/recycled scythes: " + bullets.Count + " at " + duration);
+            if (identities == null)
+            {
+                identities = bullets.Cast<object>().ToArray(); firstPosition = ((Image)Field(identities[0], "image")).rectTransform.anchoredPosition;
+                var images = identities.Select(b => (Image)Field(b, "image")).ToArray();
+                if (pass == 0) pooledImages = images;
+                else Require(images.All(pooledImages.Contains), "The next turn did not reuse the original four scythes.");
+                CheckMotion(identities[0]); CheckCollision(((Image)Field(identities[0], "image")).rectTransform);
+                if (pass == 0) Capture("start");
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                Require(ReferenceEquals(bullets[i], identities[i]), "One of the four scythes was replaced.");
+                var image = (Image)Field(bullets[i], "image");
+                Require(image.gameObject.activeInHierarchy && image.enabled && image.color.a > .99f, "A scythe disappeared.");
+                Require(image.rectTransform.rect.width == 120, "A scythe was not enlarged.");
+            }
+            if (pass == 0 && duration - Time.deltaTime < 1 && duration >= 1) Capture("inner-orbit");
+            if (pass == 0 && duration - Time.deltaTime < 7 && duration >= 7) Capture("late-pattern");
+            var victim = fixture.GetComponentsInChildren<BattleUnit>()[1];
+            if (victim.HP < data.hp) struck = true;
+            // Force one actual collision after the formation enters the movement box.
+            if (!struck && duration > 1)
+                game.heart.anchoredPosition = ((Image)Field(bullets[0], "image")).rectTransform.anchoredPosition;
+        }
+        catch (Exception e) { Finish("FAIL: " + e); }
+    }
+    static object Field(object bullet, string name) => bullet.GetType().GetField(name).GetValue(bullet);
+    static void CheckMotion(object bullet)
+    {
+        var type = bullet.GetType(); var age = type.GetField("age"); float saved = (float)age.GetValue(bullet);
+        var rect = ((Image)Field(bullet, "image")).rectTransform;
+        var move = typeof(BattleBossGame).GetMethod("MoveScythe", BindingFlags.NonPublic | BindingFlags.Static);
+        age.SetValue(bullet, 0f); move.Invoke(null, new[] { bullet }); Vector2 initial = rect.anchoredPosition;
+        float innerPeriod = Mathf.PI * 2 / (1.9f * BattleBossGame.ProjectileSpeedMultiplier);
+        age.SetValue(bullet, innerPeriod * .5f); move.Invoke(null, new[] { bullet });
+        Require(rect.anchoredPosition.magnitude < initial.magnitude * .2f, "No inward inner orbit.");
+        age.SetValue(bullet, innerPeriod); move.Invoke(null, new[] { bullet });
+        Require(Mathf.Abs(rect.anchoredPosition.magnitude - initial.magnitude) < .1f && Vector2.Distance(initial, rect.anchoredPosition) > 100, "Outer orbit did not carry the inner circle.");
+        Require(Quaternion.Angle(rect.localRotation, Quaternion.Euler(0, 0, (float)Field(bullet, "angle") * Mathf.Rad2Deg)) > 5, "Blade did not spin locally.");
+        age.SetValue(bullet, saved); move.Invoke(null, new[] { bullet });
+    }
+    static void CheckCollision(RectTransform rect)
+    {
+        var hit = typeof(BattleBossGame).GetMethod("ScytheHits", BindingFlags.NonPublic | BindingFlags.Static);
+        foreach (float angle in new[] { 0f, 73f, 190f })
+        {
+            Quaternion saved = rect.localRotation; rect.localRotation = Quaternion.Euler(0, 0, angle);
+            Vector2 blade = rect.anchoredPosition + (Vector2)(rect.localRotation * new Vector3(-.18f, .4f, 0)) * 120;
+            Vector2 corner = rect.anchoredPosition + (Vector2)(rect.localRotation * new Vector3(.42f, -.42f, 0)) * 120;
+            Require((bool)hit.Invoke(null, new object[] { rect, blade }), "Rotated blade missed the heart.");
+            Require(!(bool)hit.Invoke(null, new object[] { rect, corner }), "Transparent corner damaged the heart.");
+            rect.localRotation = saved;
+        }
+    }
+    static void Capture(string name)
+    {
+        var cameraObject = new GameObject("Validation Camera", typeof(Camera)); var camera = cameraObject.GetComponent<Camera>(); camera.cullingMask = 1 << 31; camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = Color.black;
+        var canvas = fixture.GetComponent<Canvas>(); var target = new RenderTexture(1280, 720, 24); var texture = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = 1; camera.targetTexture = target;
+            Canvas.ForceUpdateCanvases(); RenderPipeline.SubmitRenderRequest(camera, new RenderPipeline.StandardRequest { destination = target });
+            RenderTexture.active = target; texture.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); texture.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", texture.EncodeToPNG());
+        }
+        finally { canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.worldCamera = null; RenderTexture.active = previous; Object.DestroyImmediate(cameraObject); Object.DestroyImmediate(target); Object.DestroyImmediate(texture); }
+    }
+    static void Finish(string result)
+    {
+        attack = null; File.WriteAllText(Folder + "/check-result.txt", result);
+        if (fixture != null) Object.DestroyImmediate(fixture); fixture = null;
+        if (data != null) Object.DestroyImmediate(data); data = null;
+        Application.runInBackground = oldBackground; capturedBackground = false; EditorApplication.isPlaying = false;
+    }
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

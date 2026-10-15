@@ -1,0 +1,26 @@
+using UnityEngine;
+
+/// <summary>F unlocks a locked doorway, or enters an already open doorway.</summary>
+public sealed class DungeonRoomExit : MonoBehaviour
+{
+    DungeonGenerator generator;
+    int sourceRoom, destinationRoom;
+    DungeonGateLift gate;
+    public bool IsReady => gate != null && gate.IsFullyRaised;
+
+    public void Initialize(DungeonGenerator owner, int source, int destination, DungeonGateLift steelGate = null)
+    {
+        generator = owner;
+        sourceRoom = source;
+        destinationRoom = destination;
+        gate = steelGate;
+    }
+
+    public bool Interact()
+    {
+        if (generator == null) return false;
+        if (!generator.CanOpenExit(sourceRoom, destinationRoom))
+            return generator.TryUnlockExit(sourceRoom, destinationRoom);
+        return IsReady && generator.TryUseExit(sourceRoom, destinationRoom);
+    }
+}

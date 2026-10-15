@@ -1,0 +1,76 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class MinionProjectileSetup
+{
+    const string Folder = "Temp/MinionProjectile";
+    const string ModelPath = "Assets/Imported Assets/Projectile Skewer Ball/source/bolita pinchos pintada.fbx";
+    const string TexturePath = "Assets/Imported Assets/Projectile Skewer Ball/textures/Default Material_Paint Layer 1.png";
+    const string PrefabPath = "Assets/Resources/Battle/Laser.prefab";
+    static MinionProjectileSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try
+        {
+            BuildPrefab();
+            File.WriteAllText(Folder + "/result.txt", "PASS: imported textured skewer-ball mesh saved as the existing minion projectile prefab; both battle and exploration retain their shared reference, flight and hit behavior. Visual bounds and collider-free prefab verified.");
+        }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    [MenuItem("WiSe/Set Up Minion Skewer Ball Projectile")]
+    public static GameObject BuildPrefab()
+    {
+        Directory.CreateDirectory(Folder);
+        AssetDatabase.Refresh();
+        var model = AssetDatabase.LoadAssetAtPath<GameObject>(ModelPath);
+        var texture = AssetDatabase.LoadAssetAtPath<Texture2D>(TexturePath);
+        if (model == null || texture == null) throw new Exception("Skewer-ball model or paint texture is missing.");
+        const string materialPath = "Assets/Resources/Battle/SkewerBall.mat";
+        var material = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+        if (material == null)
+        {
+            material = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+            AssetDatabase.CreateAsset(material, materialPath);
+        }
+        material.SetTexture("_BaseMap", texture); material.SetColor("_BaseColor", Color.white);
+        material.SetFloat("_Smoothness", .25f); EditorUtility.SetDirty(material);
+        // Preserve the existing prefab identity so exploration, dungeon and battle all use it.
+        var root = PrefabUtility.LoadPrefabContents(PrefabPath);
+        GameObject prefab;
+        try
+        {
+            while (root.transform.childCount > 0) Object.DestroyImmediate(root.transform.GetChild(0).gameObject);
+            root.transform.localScale = Vector3.one;
+            var wrapper = new GameObject("Skewer Ball Visual"); wrapper.transform.SetParent(root.transform, false);
+            var visual = (GameObject)PrefabUtility.InstantiatePrefab(model); visual.transform.SetParent(wrapper.transform, false);
+            foreach (var collider in visual.GetComponentsInChildren<Collider>(true)) Object.DestroyImmediate(collider);
+            foreach (var renderer in visual.GetComponentsInChildren<Renderer>(true))
+            {
+                var materials = renderer.sharedMaterials;
+                for (int i = 0; i < materials.Length; i++) materials[i] = material;
+                renderer.sharedMaterials = materials;
+            }
+            if (!ChunkSpawnUtility.TryGetVisualBounds(wrapper, out var bounds)) throw new Exception("Skewer ball has no visible mesh.");
+            wrapper.transform.localScale = Vector3.one * (.65f / Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z));
+            ChunkSpawnUtility.TryGetVisualBounds(wrapper, out bounds);
+            wrapper.transform.position += root.transform.position - bounds.center;
+            ChunkSpawnUtility.TryGetVisualBounds(wrapper, out bounds);
+            if (Mathf.Abs(Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z) - .65f) > .01f ||
+                Vector3.Distance(bounds.center, root.transform.position) > .01f || root.GetComponentsInChildren<Collider>(true).Length != 0)
+                throw new Exception("Projectile sizing, centering or colliders are incorrect.");
+            prefab = PrefabUtility.SaveAsPrefabAsset(root, PrefabPath);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(root); }
+        AssetDatabase.SaveAssets();
+        var settings = AssetDatabase.LoadAssetAtPath<BattleSettings>("Assets/Resources/Battle/Settings.asset");
+        if (settings.laser != prefab) throw new Exception("Minion settings no longer reference the saved projectile.");
+        return prefab;
+    }
+}

@@ -1,0 +1,172 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+
+/// <summary>Topology checks exercise many layouts without modifying scenes or party progress.</summary>
+public static class DungeonGenerationChecks
+{
+    [MenuItem("WiSe/Validate Dungeon Generation")]
+    public static void Run()
+    {
+        var naming = new BerdlyChemistry(0, Resources.Load<TextAsset>("BerdlyNaming/alkane").text,
+            Resources.Load<TextAsset>("BerdlyNaming/alkyl").text, Resources.Load<TextAsset>("BerdlyNaming/prefix").text);
+        var layouts = new HashSet<string>(); var names = new HashSet<string>(); var counts = new HashSet<int>();
+        for (int seed = 0; seed < 256; seed++)
+        {
+            int count = DungeonLayout.ChooseRoomCount(seed, 14, 24);
+            counts.Add(count);
+            var layout = DungeonLayout.Generate(seed, count, 36, 42, naming);
+            Check(layout, naming);
+            Require(layout.Rooms.All(room => room.Size.x >= 36 && room.Size.x <= 42 && room.Size.y >= 36 && room.Size.y <= 42), "Room size outside the larger bounds.");
+            Require(count == DungeonLayout.ChooseRoomCount(seed, 14, 24), "Same-seed room count differs.");
+            var again = DungeonLayout.Generate(seed, count, 36, 42, naming);
+            Require(Signature(layout) == Signature(again), "Same-seed layout differs.");
+            layouts.Add(Signature(layout)); names.Add(layout.Name);
+            CheckFloor(seed);
+        }
+        Require(layouts.Count == 256 && names.Count >= 220, "Dungeon layouts/names lack variety.");
+        Require(counts.SetEquals(Enumerable.Range(14, 11)), "Dungeon counts do not span the full randomized range.");
+        for (int seed = 0; seed < 4; seed++) Check(DungeonLayout.Generate(seed, DungeonLayout.MaximumRooms, 7, 15, naming), naming);
+        for (int seed = 0; seed < 16; seed++) Check(DungeonLayout.Generate(seed, 8, 7, 9, naming), naming);
+        Debug.Log("PASS: 256 distinct repeatable layouts spanning 14-24 rooms, four 24-room layouts and sixteen 8-room layouts; nested branches in larger dungeons, 11-carbon chain limit, MST/BFS ties, numbering, keys, solvability and floor WFC adjacency.");
+    }
+
+    static void CheckFloor(int seed)
+    {
+        const int size = 12;
+        int[] floor = DungeonFloorWFC.Generate(size, size, seed);
+        Require(floor.SequenceEqual(DungeonFloorWFC.Generate(size, size, seed)), "Same-seed floor differs.");
+        for (int z = 0; z < size; z++)
+            for (int x = 0; x < size; x++)
+            {
+                int tile = floor[z * size + x];
+                Require(tile >= 0 && tile < 4, "Unknown floor tile.");
+                if (x == 0 || z == 0 || x == size - 1 || z == size - 1)
+                    Require(tile < 2, "Cracked/moss tile on a doorway edge.");
+                if (tile != 3) continue;
+                Require((x == 0 || floor[z * size + x - 1] < 2) && (x == size - 1 || floor[z * size + x + 1] < 2) &&
+                    (z == 0 || floor[(z - 1) * size + x] < 2) && (z == size - 1 || floor[(z + 1) * size + x] < 2), "Moss floor adjacency violated.");
+            }
+    }
+
+    static void Check(DungeonLayout layout, BerdlyChemistry naming)
+    {
+        int count = layout.Rooms.Count;
+        Require(layout.Graph.Positions.Distinct().Count() == count && layout.Doors.Count == count - 1, "Duplicate cells or non-tree graph.");
+        var seen = new HashSet<int> { layout.SpawnRoom }; var queue = new Queue<int>(); queue.Enqueue(layout.SpawnRoom);
+        while (queue.Count > 0)
+            foreach (int next in layout.Graph.Bonds[queue.Dequeue()]) if (seen.Add(next)) queue.Enqueue(next);
+        Require(seen.Count == count, "Disconnected dungeon.");
+        // Independent all-pairs traversal verifies diameter and the PDF's two numeric tie breakers.
+        var main = layout.Chains[0]; var bestLocants = Locants(layout, main);
+        Require(naming.LongestChainLength(layout.Graph) <= BerdlyChemistry.MaximumChain &&
+            layout.Chains.All(chain => chain.Count <= BerdlyChemistry.MaximumChain), "A dungeon chain exceeds 11 carbons.");
+        for (int start = 0; start < count; start++)
+        {
+            var parent = new Dictionary<int, int> { [start] = -1 }; queue.Enqueue(start);
+            while (queue.Count > 0)
+            {
+                int node = queue.Dequeue();
+                foreach (int next in layout.Graph.Bonds[node]) if (!parent.ContainsKey(next)) { parent[next] = node; queue.Enqueue(next); }
+            }
+            for (int end = 0; end < count; end++)
+            {
+                var path = new List<int>(); for (int node = end; node >= 0; node = parent[node]) path.Add(node); path.Reverse();
+                Require(path.Count <= main.Count, "Main chain is not a BFS diameter.");
+                if (path.Count != main.Count) continue;
+                var locants = Locants(layout, path);
+                Require(locants.Count <= bestLocants.Count, "Diameter tie missed a chain with more branches.");
+                if (locants.Count == bestLocants.Count)
+                    for (int i = 0; i < locants.Count; i++)
+                    { if (locants[i] > bestLocants[i]) break; Require(locants[i] >= bestLocants[i], "Main chain numbering missed the lowest locants."); }
+            }
+        }
+        var assigned = new HashSet<int>();
+        foreach (var chain in layout.Chains)
+            for (int i = 0; i < chain.Count; i++)
+            {
+                var room = layout.Rooms[chain[i]];
+                Require(assigned.Add(chain[i]) && room.Number == i + 1 && room.Degree >= 1, "Missing or repeated room numbering.");
+                if (i > 0) Require(layout.Graph.Bonds[chain[i - 1]].Contains(chain[i]), "Non-adjacent rooms in a chain.");
+                Require(room.Size.x >= 7 && room.Size.y >= 7, "Unplayable room dimensions.");
+            }
+        if (count >= 18)
+        {
+            Require(layout.MaximumDegree >= 3 && layout.Chains.Skip(1).Count(c => layout.Rooms[c[0]].Degree == 2) >= (count >= 21 ? 4 : 3) &&
+                layout.Chains.Skip(1).Count(c => layout.Rooms[c[0]].Degree >= 3) >= (count >= 21 ? 2 : 1), "Dungeon lacks nested branch complexity.");
+            Require(layout.Name.Contains("("), "Nested branch name is missing.");
+        }
+        Require(assigned.Count == count && layout.Rooms[layout.SpawnRoom].Kind == DungeonRoomKind.Spawn &&
+            layout.Rooms[layout.BossRoom].Kind == DungeonRoomKind.Boss && layout.BerdlyRoom == main[1] &&
+            layout.Rooms[layout.BerdlyRoom].Kind == DungeonRoomKind.Guide, "Fixed room types are incorrect.");
+        Require(layout.Rooms.All(r => r.Kind != DungeonRoomKind.Normal || r.Key == DungeonKeyKind.None), "Normal rooms must not contain key loot.");
+        foreach (var room in layout.Rooms)
+            if (room.Index != layout.SpawnRoom && room.Index != layout.BerdlyRoom && room.Index != layout.BossRoom)
+                Require(room.Kind == DungeonRoomKind.Normal || room.Kind == DungeonRoomKind.Treasure || room.Kind == DungeonRoomKind.Enemy,
+                    "Ordinary rooms must use one of the three random types.");
+        foreach (var door in layout.Doors)
+        {
+            DungeonKeyKind expected = door.A == layout.BossRoom || door.B == layout.BossRoom ? DungeonKeyKind.Boss :
+                layout.Rooms[door.A].Chain != layout.Rooms[door.B].Chain ? DungeonKeyKind.Original : DungeonKeyKind.None;
+            Require(door.Lock == expected, "Incorrect boss/branch door lock.");
+        }
+        Require(main.Count(i => layout.Rooms[i].Key == DungeonKeyKind.Original) == 2 && layout.Rooms[layout.SpawnRoom].Key == DungeonKeyKind.None && layout.Rooms[layout.BossRoom].Key == DungeonKeyKind.None, "Main-chain key placement is incorrect.");
+        Require(layout.Rooms.Count(r => r.Key == DungeonKeyKind.Boss) == 1, "Expected one Boss Key.");
+        foreach (var chain in layout.Chains.Skip(1))
+        {
+            var end = layout.Rooms[chain.Last()];
+            Require(end.Degree == layout.MaximumDegree || end.Key == DungeonKeyKind.Original, "Non-final branch endpoint lacks a key.");
+            if (end.Key == DungeonKeyKind.Boss) Require(end.Degree == layout.MaximumDegree, "Boss Key is not in the deepest degree.");
+        }
+        Require(CanExploreAll(layout), "Unsolvable layout with consumable yellow keys; seed=" + layout.Seed);
+        Require(layout.Name == naming.Name(layout.Graph), "Berdly dialogue name differs from the generated graph.");
+    }
+    static bool CanExploreAll(DungeonLayout layout)
+    {
+        int complete = (1 << layout.Rooms.Count) - 1;
+        var frontier = new Queue<(int rooms, int keys, bool boss)>();
+        var tried = new HashSet<int>();
+        frontier.Enqueue((1 << layout.SpawnRoom, 0, false));
+        while (frontier.Count > 0)
+        {
+            var state = frontier.Dequeue(); int rooms = state.rooms, keys = state.keys; bool boss = state.boss;
+            bool changed;
+            do
+            {
+                changed = false;
+                foreach (var door in layout.Doors)
+                {
+                    if (door.Lock == DungeonKeyKind.Original || door.Lock == DungeonKeyKind.Boss && !boss) continue;
+                    int a = 1 << door.A, b = 1 << door.B;
+                    int next = (rooms & a) != 0 ? b : (rooms & b) != 0 ? a : 0;
+                    if (next == 0 || (rooms & next) != 0) continue;
+                    int index = next == a ? door.A : door.B; rooms |= next; changed = true;
+                    if (layout.Rooms[index].Key == DungeonKeyKind.Original) keys++;
+                    if (layout.Rooms[index].Key == DungeonKeyKind.Boss) boss = true;
+                }
+            } while (changed);
+            if (rooms == complete) return true;
+            if (keys == 0 || !tried.Add(rooms)) continue;
+            foreach (var door in layout.Doors.Where(d => d.Lock == DungeonKeyKind.Original))
+            {
+                int a = 1 << door.A, b = 1 << door.B;
+                int next = (rooms & a) != 0 ? b : (rooms & b) != 0 ? a : 0;
+                if (next == 0 || (rooms & next) != 0) continue;
+                int index = next == a ? door.A : door.B;
+                frontier.Enqueue((rooms | next, keys - 1 + (layout.Rooms[index].Key == DungeonKeyKind.Original ? 1 : 0),
+                    boss || layout.Rooms[index].Key == DungeonKeyKind.Boss));
+            }
+        }
+        return false;
+    }
+    static List<int> Locants(DungeonLayout layout, List<int> path)
+    {
+        var chain = new HashSet<int>(path); var result = new List<int>();
+        for (int i = 0; i < path.Count; i++) foreach (int next in layout.Graph.Bonds[path[i]]) if (!chain.Contains(next)) result.Add(i + 1);
+        return result;
+    }
+    static string Signature(DungeonLayout layout) => layout.Name + "|" + string.Join("|", layout.Rooms.Select(r => $"{r.Grid}:{r.Size}:{r.Degree}:{r.Number}:{r.Kind}:{r.Key}")) + "|" + string.Join("|", layout.Doors.Select(d => $"{d.A}:{d.B}:{d.Lock}"));
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

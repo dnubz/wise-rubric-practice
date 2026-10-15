@@ -1,0 +1,180 @@
+using System;
+using System.IO;
+using System.Linq;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattlePresentationSetup
+{
+    const string Folder = "Temp/BattlePresentation";
+    static TMP_FontAsset font;
+    static Sprite rounded, outline;
+    public static bool IsApplying { get; private set; }
+    static BattlePresentationSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        bool squareBoss = File.Exists(Folder + "/boss-square.request");
+        if (!squareBoss && !File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + (squareBoss ? "/boss-square.request" : "/setup.request"));
+        IsApplying = true;
+        try
+        {
+            if (squareBoss) ApplySquareBoss(); else Apply();
+            File.WriteAllText(Folder + (squareBoss ? "/boss-square-result.txt" : "/setup-result.txt"), squareBoss ? "Saved: Jevil dodge arena is 600x600 with a 1:1 aspect constraint and a matching border." : "PASS: saved battle camera, icon bar, tooltip, AP slots, AoE previews and flying dragon.");
+        }
+        catch (Exception error) { File.WriteAllText(Folder + (squareBoss ? "/boss-square-result.txt" : "/setup-result.txt"), error.ToString()); Debug.LogException(error); }
+        finally { IsApplying = false; }
+    }
+    [MenuItem("WiSe/Battle/Make Jevil Arena Square")]
+    public static void ApplySquareBoss()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) throw new InvalidOperationException("Stop Play mode before editing the saved boss UI.");
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/BattleScene.unity");
+        bool close = !scene.IsValid() || !scene.isLoaded;
+        if (close) scene = EditorSceneManager.OpenScene("Assets/Scenes/BattleScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var boss = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<BattleBossGame>(true)).Single();
+            Place(boss.box, new Vector2(.5f, .5f), Vector2.zero, new Vector2(600, 600));
+            var square = boss.box.GetComponent<AspectRatioFitter>() ?? boss.box.gameObject.AddComponent<AspectRatioFitter>();
+            square.aspectMode = AspectRatioFitter.AspectMode.WidthControlsHeight; square.aspectRatio = 1;
+            var border = boss.box.Find("Border") as RectTransform; if (border != null) Stretch(border);
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+        }
+        finally { if (close) EditorSceneManager.CloseScene(scene, true); }
+    }
+    [MenuItem("WiSe/Battle/Update Camera and Skill Presentation")]
+    public static void Apply()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) throw new InvalidOperationException("Stop Play mode before editing the saved battle UI.");
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/BattleScene.unity");
+        bool close = !scene.IsValid() || !scene.isLoaded;
+        if (close) scene = EditorSceneManager.OpenScene("Assets/Scenes/BattleScene.unity", OpenSceneMode.Additive);
+        var battle = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<BattleController>(true)).Single();
+        font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>("Assets/Fonts/MedievalSharp/MedievalSharp-Regular SDF.asset");
+        rounded = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Rounded.png");
+        outline = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Outline.png");
+        var camera = battle.cameraRig;
+        camera.distance = 16; camera.tilt = 36; camera.focusWeight = 1;
+        camera.minimumDistance = 8; camera.maximumDistance = 24; camera.minimumTilt = 24; camera.maximumTilt = 48;
+        camera.view.fieldOfView = 55;
+        camera.transform.SetPositionAndRotation(camera.centre + Vector3.up * 1.5f - Quaternion.Euler(36, camera.yaw, 0) * Vector3.forward * 16, Quaternion.Euler(36, camera.yaw, 0));
+        var hud = battle.hud;
+        for (int i = 0; i < hud.skillButtons.Length; i++)
+        {
+            var button = hud.skillButtons[i]; var rect = (RectTransform)button.transform;
+            Place(rect, new Vector2(.5f, 0), new Vector2((i - 1.5f) * 166, 154), new Vector2(144, 144));
+            button.transition = Selectable.Transition.None;
+            button.image.sprite = outline; button.image.type = UnityEngine.UI.Image.Type.Sliced; button.image.color = Color.white;
+            button.image.pixelsPerUnitMultiplier = 4;
+            var oldBorder = button.transform.Find("Border"); if (oldBorder != null) oldBorder.gameObject.SetActive(false);
+            Place(hud.skillIcons[i].rectTransform, new Vector2(.5f, .5f), Vector2.zero, new Vector2(134, 134));
+            hud.skillIcons[i].raycastTarget = false;
+            hud.skillNames[i].gameObject.SetActive(false);
+            Place(hud.cooldowns[i].rectTransform, new Vector2(.5f, .5f), Vector2.zero, new Vector2(134, 134));
+            hud.cooldowns[i].fontSize = hud.cooldowns[i].fontSizeMax = 44; hud.cooldowns[i].text = ""; hud.cooldowns[i].raycastTarget = false;
+            var hover = button.GetComponent<BattleSkillHover>() ?? button.gameObject.AddComponent<BattleSkillHover>();
+            hover.hud = hud; hover.slot = i;
+        }
+        for (int i = 0; i < hud.portraits.Length; i++)
+        {
+            var row = hud.portraits[i]; row.transition = Selectable.Transition.None; row.image.color = Color.clear;
+            var oldBorder = row.transform.Find("Border"); if (oldBorder != null) oldBorder.gameObject.SetActive(false);
+            Place((RectTransform)row.transform, new Vector2(0, 0), new Vector2(210, 350 - i * 135), new Vector2(360, 120));
+            Place(row.transform.Find("Portrait") as RectTransform, new Vector2(.5f, .5f), new Vector2(-130, 0), new Vector2(106, 112));
+            Place(hud.characterValues[i].rectTransform, new Vector2(.5f, .5f), new Vector2(105, 34), new Vector2(130, 48));
+            hud.characterValues[i].fontSize = hud.characterValues[i].fontSizeMax = 38; hud.characterValues[i].alignment = TextAlignmentOptions.Right;
+            Place(hud.hpBars[i].rectTransform.parent as RectTransform, new Vector2(.5f, .5f), new Vector2(36, -7), new Vector2(205, 40));
+            hud.hpBars[i].color = new Color(0, .49f, .68f);
+            Place(hud.spBars[i].rectTransform.parent as RectTransform, new Vector2(.5f, .5f), new Vector2(-10, 31), new Vector2(116, 13));
+            hud.spBars[i].color = new Color(1, .68f, .1f);
+            Stretch(hud.hpBars[i].rectTransform); hud.hpBars[i].rectTransform.offsetMin = Vector2.one * 3; hud.hpBars[i].rectTransform.offsetMax = Vector2.one * -3;
+            Stretch(hud.spBars[i].rectTransform); hud.spBars[i].rectTransform.offsetMin = Vector2.one * 2; hud.spBars[i].rectTransform.offsetMax = Vector2.one * -2;
+            FitBar(hud.hpBars[i], 4); FitBar(hud.spBars[i], 8);
+        }
+        hud.movement.gameObject.SetActive(false); hud.actionPoints.gameObject.SetActive(false);
+        Place(hud.message.rectTransform, new Vector2(.5f, 0), new Vector2(0, 285), new Vector2(960, 64));
+        hud.message.fontSize = 24; hud.message.text = "";
+        var hint = hud.transform.Find("CameraControls");
+        if (hint != null) hint.GetComponent<TMP_Text>().text = "Q/E Rotate · Scroll Zoom\n5 Fast forward · Esc Menu";
+        if (hud.actionPointSlots == null || hud.actionPointSlots.Length == 0)
+            hud.actionPointSlots = new[] { Image("ActionPoint1", hud.transform, Color.white), Image("ActionPoint2", hud.transform, Color.white) };
+        for (int i = 0; i < hud.actionPointSlots.Length; i++)
+        {
+            var slot = hud.actionPointSlots[i]; slot.sprite = rounded; slot.type = UnityEngine.UI.Image.Type.Sliced;
+            slot.pixelsPerUnitMultiplier = 8;
+            Place(slot.rectTransform, new Vector2(.5f, 0), new Vector2((i - .5f) * 72, 52), new Vector2(62, 22));
+            var edge = slot.transform.Find("Border")?.GetComponent<Image>() ?? Image("Border", slot.transform, Color.white);
+            edge.sprite = outline; edge.type = UnityEngine.UI.Image.Type.Sliced; Stretch(edge.rectTransform);
+            edge.pixelsPerUnitMultiplier = 8;
+        }
+        if (hud.skillTooltip == null)
+        {
+            var panel = Image("SkillTooltip", hud.transform, new Color(.035f, .075f, .1f, .95f));
+            panel.sprite = rounded; panel.type = UnityEngine.UI.Image.Type.Sliced;
+            Place(panel.rectTransform, new Vector2(.5f, 0), new Vector2(0, 365), new Vector2(760, 270));
+            hud.skillTooltip = panel.gameObject;
+            var edge = Image("Border", panel.transform, new Color(.015f, .035f, .05f)); edge.sprite = outline; edge.type = UnityEngine.UI.Image.Type.Sliced; Stretch(edge.rectTransform);
+            hud.tooltipIcon = Image("Icon", panel.transform, Color.white); hud.tooltipIcon.preserveAspect = true;
+            Place(hud.tooltipIcon.rectTransform, new Vector2(.5f, .5f), new Vector2(-282, 25), new Vector2(116, 116));
+            hud.tooltipTitle = Text("Title", panel.transform, new Vector2(85, 80), new Vector2(520, 46), 31);
+            hud.tooltipDescription = Text("Description", panel.transform, new Vector2(85, -2), new Vector2(520, 104), 22);
+            hud.tooltipDescription.enableAutoSizing = true; hud.tooltipDescription.fontSizeMin = 18; hud.tooltipDescription.fontSizeMax = 22;
+            hud.tooltipCost = Text("SPCost", panel.transform, new Vector2(-193, -100), new Vector2(310, 35), 21);
+            hud.tooltipCooldown = Text("Cooldown", panel.transform, new Vector2(181, -100), new Vector2(330, 35), 21);
+        }
+        Place((RectTransform)hud.skillTooltip.transform, new Vector2(.5f, 0), new Vector2(0, 425), new Vector2(760, 270));
+        hud.skillTooltip.SetActive(false);
+        battle.movementArea = Area("MovementAreaFill", scene, new Color(.07f, .35f, .8f, .16f));
+        battle.skillArea = Area("SkillAreaFill", scene, new Color(1, .05f, .1f, .22f));
+        battle.movementCircle.startWidth = battle.movementCircle.endWidth = .045f;
+        battle.aimCircle.startWidth = battle.aimCircle.endWidth = .065f;
+        string linePath = "Assets/Resources/Battle/SkillAimLine.mat";
+        var lineMaterial = AssetDatabase.LoadAssetAtPath<Material>(linePath);
+        if (lineMaterial == null) { lineMaterial = new Material(Shader.Find("Universal Render Pipeline/Unlit")); AssetDatabase.CreateAsset(lineMaterial, linePath); }
+        lineMaterial.color = new Color(1, .12f, .16f); battle.aimCircle.sharedMaterial = lineMaterial; EditorUtility.SetDirty(lineMaterial);
+        battle.settings.dragon = BattleDragonBuilder.Build(); EditorUtility.SetDirty(battle.settings);
+        AssetDatabase.SaveAssets(); EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+        if (close) EditorSceneManager.CloseScene(scene, true);
+    }
+    static void Place(RectTransform rect, Vector2 anchor, Vector2 position, Vector2 size)
+    { rect.anchorMin = rect.anchorMax = anchor; rect.pivot = new Vector2(.5f, .5f); rect.anchoredPosition = position; rect.sizeDelta = size; rect.localScale = Vector3.one; }
+    static void Stretch(RectTransform rect)
+    { rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one; rect.offsetMin = rect.offsetMax = Vector2.zero; }
+    static void FitBar(Image fill, float multiplier)
+    {
+        var background = fill.transform.parent.GetComponent<Image>(); background.pixelsPerUnitMultiplier = multiplier;
+        var border = background.transform.Find("Border").GetComponent<Image>(); Stretch(border.rectTransform); border.pixelsPerUnitMultiplier = multiplier;
+    }
+    static Image Image(string name, Transform parent, Color color)
+    { var obj = new GameObject(name, typeof(RectTransform), typeof(Image)); obj.transform.SetParent(parent, false); var image = obj.GetComponent<Image>(); image.color = color; image.raycastTarget = false; return image; }
+    static TMP_Text Text(string name, Transform parent, Vector2 position, Vector2 size, int fontSize)
+    {
+        var obj = new GameObject(name, typeof(RectTransform), typeof(TextMeshProUGUI)); obj.transform.SetParent(parent, false);
+        var text = obj.GetComponent<TextMeshProUGUI>(); text.font = font; text.fontSize = fontSize; text.color = Color.white;
+        text.alignment = TextAlignmentOptions.MidlineLeft; text.raycastTarget = false;
+        Place(text.rectTransform, new Vector2(.5f, .5f), position, size); return text;
+    }
+    static BattleAreaIndicator Area(string name, Scene scene, Color color)
+    {
+        var area = scene.GetRootGameObjects().FirstOrDefault(x => x.name == name);
+        if (area == null) { area = new GameObject(name, typeof(BattleAreaIndicator)); SceneManager.MoveGameObjectToScene(area, scene); }
+        string path = "Assets/Resources/Battle/" + name + ".mat";
+        var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+        if (material == null) { material = new Material(Shader.Find("Universal Render Pipeline/Unlit")); AssetDatabase.CreateAsset(material, path); }
+        material.SetColor("_BaseColor", color); material.SetFloat("_Surface", 1); material.SetFloat("_Blend", 0); material.SetFloat("_ZWrite", 0);
+        material.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha); material.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+        material.SetFloat("_Cull", (float)CullMode.Off); material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT"); material.renderQueue = 3000;
+        var renderer = area.GetComponent<MeshRenderer>(); renderer.sharedMaterial = material; renderer.enabled = false;
+        renderer.shadowCastingMode = ShadowCastingMode.Off; renderer.receiveShadows = false;
+        EditorUtility.SetDirty(material); return area.GetComponent<BattleAreaIndicator>();
+    }
+}

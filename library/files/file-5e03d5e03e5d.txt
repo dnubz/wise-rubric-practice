@@ -1,0 +1,128 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+public static class ChunkSpawnUtility
+{
+    // Players, neighbouring chunks and pending destruction must not change a layout.
+    public static bool IsOwnedObstacle(Collider collider, Transform chunkParent)
+    {
+        return collider != null && !(collider is TerrainCollider) && collider.enabled &&
+            collider.gameObject.activeInHierarchy && chunkParent != null &&
+            collider.transform.IsChildOf(chunkParent);
+    }
+
+    public static TerrainCollider[] GetOwnedTerrain(Transform chunkParent)
+    {
+        if (chunkParent == null) return Array.Empty<TerrainCollider>();
+
+        List<TerrainCollider> owned = new List<TerrainCollider>();
+        foreach (TerrainCollider collider in chunkParent.GetComponentsInChildren<TerrainCollider>())
+        {
+            if (collider.transform.parent == chunkParent)
+                owned.Add(collider);
+        }
+        return owned.ToArray();
+    }
+
+    public static float ChunkWidth
+    {
+        get
+        {
+            WFCWorldManager world = WFCWorldManager.Instance;
+            return world != null ? world.ChunkSize * world.TileSize : 0f;
+        }
+    }
+
+    public static bool Contains(Vector2Int chunk, float minX, float maxX, float minZ, float maxZ, float margin = 0f)
+    {
+        float width = ChunkWidth;
+        if (width <= 0f) return false;
+
+        float left = chunk.x * width + margin;
+        float bottom = chunk.y * width + margin;
+        return minX >= left && maxX <= left + width - 2f * margin &&
+               minZ >= bottom && maxZ <= bottom + width - 2f * margin;
+    }
+
+    public static bool TryGetGround(TerrainCollider[] terrain, float x, float z, bool avoidWater, out Vector3 point)
+    {
+        point = default;
+        bool found = false;
+        Ray ray = new Ray(new Vector3(x, 1000f, z), Vector3.down);
+
+        WFCWorldManager world = WFCWorldManager.Instance;
+        if (avoidWater && world != null && world.GetTerrainAt(new Vector3(x, 0f, z)) == 1)
+            return false;
+        if (avoidWater && world != null && world.TryGetComponent<OverworldObstacleSpawner>(out var obstacles) &&
+            obstacles.IsReserved(new Vector3(x, 0, z))) return false;
+
+        foreach (TerrainCollider collider in terrain)
+        {
+            if (collider == null || !collider.enabled || !collider.gameObject.activeInHierarchy)
+                continue;
+
+            Bounds bounds = collider.bounds;
+            if (x < bounds.min.x || x > bounds.max.x || z < bounds.min.z || z > bounds.max.z)
+                continue;
+
+            if (avoidWater && world == null && collider.name.IndexOf("water", StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
+
+            if (!collider.Raycast(ray, out RaycastHit hit, 2000f))
+                continue;
+
+            if (!found || hit.point.y > point.y)
+            {
+                point = hit.point;
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    public static bool HasGroundAcross(TerrainCollider[] terrain, Bounds footprint, bool avoidWater)
+    {
+        WFCWorldManager world = WFCWorldManager.Instance;
+        float step = world != null ? Mathf.Max(1f, world.TileSize * 0.5f) : 5f;
+        int stepsX = Mathf.Max(1, Mathf.CeilToInt(footprint.size.x / step));
+        int stepsZ = Mathf.Max(1, Mathf.CeilToInt(footprint.size.z / step));
+
+        for (int x = 0; x <= stepsX; x++)
+        {
+            for (int z = 0; z <= stepsZ; z++)
+            {
+                float sampleX = Mathf.Lerp(footprint.min.x + 0.05f, footprint.max.x - 0.05f, (float)x / stepsX);
+                float sampleZ = Mathf.Lerp(footprint.min.z + 0.05f, footprint.max.z - 0.05f, (float)z / stepsZ);
+                if (!TryGetGround(terrain, sampleX, sampleZ, avoidWater, out _))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    public static bool TryGetVisualBounds(GameObject instance, out Bounds bounds)
+    {
+        bounds = default;
+        bool found = false;
+        foreach (Renderer renderer in instance.GetComponentsInChildren<Renderer>(true))
+        {
+            if (!(renderer is MeshRenderer) && !(renderer is SkinnedMeshRenderer))
+                continue;
+
+            if (!found)
+            {
+                bounds = renderer.bounds;
+                found = true;
+            }
+            else
+            {
+                bounds.Encapsulate(renderer.bounds);
+            }
+        }
+
+        return found;
+    }
+}

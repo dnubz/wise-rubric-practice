@@ -1,0 +1,99 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+public sealed class BattleHUD : MonoBehaviour
+{
+    public Button[] portraits, skillButtons;
+    public Image[] hpBars, spBars, skillIcons;
+    public TMP_Text[] characterValues, cooldowns, skillNames;
+    public TMP_Text turn, message, movement, actionPoints;
+    public GameObject results, crosshair, dodgePrompt;
+    public TMP_Text resultTitle;
+    public TMP_Text[] resultValues, levelUp;
+    public Button returnButton;
+    public Image[] actionPointSlots;
+    public GameObject skillTooltip;
+    public Image tooltipIcon;
+    public TMP_Text tooltipTitle, tooltipDescription, tooltipCost, tooltipCooldown;
+    int hoveredSkill = -1;
+    BattleController controller;
+    void Start()
+    {
+        controller = GetComponentInParent<BattleController>();
+        if (controller == null) controller = FindAnyObjectByType<BattleController>();
+        for (int i = 0; i < portraits.Length; i++) { int at = i; portraits[i].onClick.AddListener(() => controller.SelectCharacter(at)); }
+        for (int i = 0; i < skillButtons.Length; i++) { int at = i; skillButtons[i].onClick.AddListener(() => controller.SelectSkill(at)); }
+        returnButton.onClick.AddListener(Return); crosshair.SetActive(false); dodgePrompt.SetActive(false);
+    }
+    public void Refresh(BattleController battle, int round = 1)
+    {
+        controller = battle; if (battle.Party == null) return;
+        turn.text = battle.Phase == BattlePhase.Enemy ? "Enemy's Turn" : battle.Phase == BattlePhase.Acting ? "Casting" : "Your Turn · " + round;
+        if (battle.SequenceSpeed > 1) turn.text += "  ×4";
+        turn.color = battle.Phase == BattlePhase.Enemy ? new Color(1, .35f, .35f) : Color.white;
+        for (int i = 0; i < battle.Party.Length; i++)
+        {
+            var unit = battle.Party[i]; hpBars[i].fillAmount = (float)unit.CurrentHP / unit.MaxHP;
+            spBars[i].fillAmount = (float)unit.character.GetCurrSP() / unit.character.GetMaxSP();
+            characterValues[i].text = unit.CurrentHP.ToString();
+            portraits[i].interactable = unit.Alive && battle.Phase == BattlePhase.Player;
+            var portrait = portraits[i].transform.Find("Portrait").GetComponent<Image>();
+            portrait.color = new Color(1, 1, 1, i == battle.Selected ? 1 : .4f);
+        }
+        if (battle.Current == null) return;
+        var actor = battle.Current;
+        movement.text = actor.movementLocked ? "Movement locked" : "Move " + Mathf.Max(0, actor.moveRange - BattleController.FlatDistance(actor.transform.position, actor.moveOrigin)).ToString("0.0") + "m";
+        actionPoints.text = "AP " + actor.AP + "/2" + (actor.shields > 0 ? "  Shield " + actor.shields : "");
+        for (int i = 0; actionPointSlots != null && i < actionPointSlots.Length; i++)
+            actionPointSlots[i].color = i < actor.AP ? new Color(1, .68f, .1f) : new Color(.15f, .18f, .23f);
+        for (int i = 0; i < skillButtons.Length; i++)
+        {
+            var skill = battle.Skill(battle.Selected, i); skillIcons[i].sprite = skill.icon; skillNames[i].text = (i + 1) + " · " + skill.displayName;
+            int cd = actor.character.BattleCooldowns[i];
+            cooldowns[i].text = cd > 0 ? cd.ToString() : i == 3 && battle.Selected != 1 && !actor.character.HasUltimate ? "×" : "";
+            skillButtons[i].interactable = battle.CanUse(i); skillIcons[i].color = skillButtons[i].interactable ? Color.white : new Color(.4f, .4f, .4f);
+            skillButtons[i].image.color = battle.SelectedSkill == i ? new Color(.3f, .8f, 1) : Color.white;
+            skillButtons[i].transform.localScale = Vector3.one * (battle.SelectedSkill == i ? 1.15f : 1);
+        }
+        if (battle.Phase == BattlePhase.Player) message.text = "";
+        if (hoveredSkill >= 0) ShowSkillInfo(hoveredSkill);
+    }
+    public void ShowSkillInfo(int slot)
+    {
+        if (controller == null || controller.Current == null || skillTooltip == null) return;
+        hoveredSkill = slot;
+        var skill = controller.Skill(controller.Selected, slot);
+        tooltipIcon.sprite = skill.icon; tooltipTitle.text = skill.displayName;
+        tooltipDescription.text = skill.description;
+        tooltipCost.text = "<color=#FFB128>SP COST</color>  " + skill.sp;
+        tooltipCooldown.text = "<color=#5AC9ED>COOLDOWN</color>  " + skill.cooldown + (skill.cooldown == 1 ? " TURN" : " TURNS");
+        skillTooltip.SetActive(true); skillTooltip.transform.SetAsLastSibling();
+    }
+    public void HideSkillInfo() { hoveredSkill = -1; if (skillTooltip != null) skillTooltip.SetActive(false); }
+    void OnDisable() => HideSkillInfo();
+    public void Message(string value) { message.text = value; }
+    public void ShowVictory(BattleController battle, int experience, int[] previousLevels, int[] previousExperience)
+    {
+        resultTitle.text = "Victory!";
+        for (int i = 0; i < battle.Party.Length; i++)
+        {
+            var character = battle.Party[i].character;
+            resultValues[i].text = character.characterData.displayName + "\nLV " + character.CurrentLevel + "\nEXP " + previousExperience[i] + " + " + experience + " → " + character.CurrentExp + "/100";
+            levelUp[i].gameObject.SetActive(character.CurrentLevel > previousLevels[i]);
+        }
+        returnButton.GetComponentInChildren<TMP_Text>().text = DungeonSession.IsInside ? "Return to Dungeon" : "Return to Overworld";
+        results.SetActive(true); results.transform.SetAsLastSibling();
+    }
+    public void ShowGameOver()
+    {
+        resultTitle.text = "Game Over"; for (int i = 0; i < resultValues.Length; i++) { resultValues[i].text = ""; levelUp[i].gameObject.SetActive(false); }
+        returnButton.GetComponentInChildren<TMP_Text>().text = "Return to Title"; results.SetActive(true); results.transform.SetAsLastSibling();
+    }
+    void Return()
+    {
+        if (controller.Phase == BattlePhase.GameOver) { Time.timeScale = 1; SceneManager.LoadScene("TitleScene"); }
+        else controller.ReturnFromBattle();
+    }
+}

@@ -1,0 +1,354 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.SceneManagement;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
+using UnityEngine.Rendering;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattleChecks
+{
+    const string Folder = "Temp/Battle";
+    static IEnumerator routine;
+    static double resume;
+    static string errorLog;
+    static BattleChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < resume) return;
+        if (routine == null)
+        {
+            if (!File.Exists(Folder + "/check.request")) return;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (!EditorApplication.isPlaying) return;
+            Application.runInBackground = true;
+            if (Time.timeSinceLevelLoad < 4) return;
+            File.Delete(Folder + "/check.request"); errorLog = null; Application.logMessageReceived += Log;
+            var pipeline = GraphicsSettings.currentRenderPipeline as UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset;
+            File.WriteAllText(Folder + "/renderer-state.txt", "Mesh deformation: " + PlayerSettings.meshDeformation + "; GPU Resident Drawer: " + pipeline?.gpuResidentDrawerMode);
+            routine = Run();
+        }
+        try
+        {
+            Require(!EditorApplication.isPaused, "Unity paused Play mode while running the check. " + errorLog);
+            if (routine.MoveNext()) { resume = EditorApplication.timeSinceStartup + (routine.Current is float seconds ? seconds : .1f); return; }
+            ((IDisposable)routine).Dispose(); routine = null; Require(errorLog == null, errorLog);
+            File.WriteAllText(Folder + "/check-result.txt", File.Exists(Folder + "/travel-only") ? "PASS: focused encounter, save and dungeon/overworld travel checks." : "PASS: melee and laser encounters; three layouts/NavMeshes; all 12 skill paths, charged crosshair projectile, healer rhythm entry/exit; five Jevil patterns and summon/kidnap turn; movement/AP/cooldown/cover/shield/kill reset; item healing and Diamond revival; saved UI raycasts; enemy turn and fast-forward; victory EXP/return and Game Over; dungeon battle/room return and surface return; JSON cooldown and defeated identity round trip. UI screenshots saved at 1280x720.");
+        }
+        catch (Exception error) { ((IDisposable)routine)?.Dispose(); routine = null; File.WriteAllText(Folder + "/check-result.txt", error.ToString() + "\nCaptured: " + errorLog); }
+        if (routine == null) { Application.logMessageReceived -= Log; EditorApplication.isPlaying = false; }
+    }
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance; Require(session != null, "BattleSession missing.");
+        var save = Object.FindAnyObjectByType<GameSave>(); var original = save.Capture();
+        Vector3 position = CharacterSwitchManager.CurrentCharacterTransform.position;
+        var root = Object.Instantiate(session.settings.enemies[0].prefab, position + CharacterSwitchManager.CurrentCharacterTransform.forward * 2, Quaternion.identity);
+        root.transform.rotation = Quaternion.LookRotation(position - root.transform.position);
+        var encounter = root.GetComponent<EncounterEnemy>(); encounter.Configure(session.settings.enemies[0], "test:encounter");
+        try
+        {
+            yield return 2f;
+            Require(BattleSession.IsActive, "Enemy's actual melee hit did not start battle.");
+            for (int wait = 0; wait < 30 && (BattleController.Instance == null || !BattleController.Instance.Ready); wait++) yield return .3f;
+            var battle = Object.FindAnyObjectByType<BattleController>();
+            Require(battle != null && battle.Ready, "Battle scene failed to prepare.");
+            Require(battle.layouts.Length >= 3 && battle.layouts.All(l => l.partySpawns.Length == 3 && l.cover.Length >= 3), "Three usable layouts required.");
+            Require(battle.skills.Length == 12 && battle.skills.All(s => s.icon != null), "One or more skill icons are missing.");
+            Require(battle.Party.All(p => p.Agent.isOnNavMesh) && battle.Enemies.All(e => e.Agent.isOnNavMesh), "Units are not on the NavMesh.");
+            Physics.SyncTransforms();
+            foreach (var member in battle.Party)
+            {
+                var bounds = member.GetComponent<CapsuleCollider>().bounds;
+                Require(Mathf.Abs(bounds.size.y - 3) < .05f && Mathf.Abs(bounds.size.x - 1.2f) < .05f && Mathf.Abs(bounds.size.z - 1.2f) < .05f, member.DisplayName + " battle hitbox does not fit world units.");
+                var effects = member.GetComponentInChildren<BattleStatusVisual>(true);
+                Require(effects != null && Vector3.Distance(effects.transform.lossyScale, Vector3.one) < .01f, member.DisplayName + " effects inherited the imported model scale.");
+            }
+            yield return .4f; Capture(battle, "battle-initial");
+            var wise = battle.Party[0]; var randal = battle.Party[1];
+            Vector3 origin = wise.moveOrigin; wise.Move(Vector3.forward * 100, 2); Require(BattleController.FlatDistance(wise.transform.position, origin) <= wise.moveRange + .05f, "Character exceeded movement range: " + BattleController.FlatDistance(wise.transform.position, origin));
+            wise.ResetMovement(); Require(BattleController.FlatDistance(wise.moveOrigin, wise.transform.position) < .01f, "Movement reset failed.");
+            int hp = wise.CurrentHP; wise.shields = 1; Require(wise.Damage(999) == 0 && wise.CurrentHP == hp && wise.shields == 0, "Shield did not absorb exactly one hit.");
+            Require(wise.Damage(0) == 1 && wise.CurrentHP == hp - 1, "Damage minimum should be 1."); wise.character.SetCurrentHP(hp);
+            var cover = battle.Layout.cover[0]; cover.transform.position = battle.Layout.transform.position;
+            foreach (var other in battle.Layout.cover.Skip(1)) other.gameObject.SetActive(false);
+            foreach (var enemy in battle.Enemies) Warp(enemy, battle.Layout.transform.position + new Vector3(14, 0, 14));
+            var target = battle.Enemies[0]; Warp(target, battle.Layout.transform.position + Vector3.right * 6);
+            Warp(randal, battle.Layout.transform.position + Vector3.left * 6); Physics.SyncTransforms();
+            int enemyHP = target.CurrentHP; bool done = false; battle.StartCoroutine(Complete(battle.Shoot(randal, target, 50), () => done = true));
+            yield return 1.2f; Require(done && target.CurrentHP == enemyHP && cover.HalfCovered && cover.box.size.y == 1.5f, "Cover did not absorb the projectile and become half-cover.");
+            Require(Mathf.Abs(cover.box.bounds.min.y - battle.Layout.transform.position.y) < .01f, "Half-cover is floating above ground.");
+            done = false; battle.StartCoroutine(Complete(battle.Shoot(randal, target, 50), () => done = true)); yield return 1.2f;
+            Require(done && target.CurrentHP < enemyHP, "Projectile should pass over half cover at 2m height."); cover.Damage(50); Require(!cover.gameObject.activeSelf, "Broken cover remains visible/collidable.");
+            // A real laser must hit each differently scaled party model, not a nearby ally.
+            var laserEnemy = battle.SpawnEnemy(battle.settings.enemies.First(e => e.kind == BattleEnemyKind.Minion), battle.Layout.transform.position + Vector3.back * 10, false);
+            foreach (var member in battle.Party)
+            {
+                foreach (var other in battle.Party) Warp(other, battle.Layout.transform.position + new Vector3(12 + other.characterIndex * 2, 0, 12));
+                Warp(member, battle.Layout.transform.position + Vector3.back * 4); member.shields = 0;
+                int before = member.CurrentHP; done = false;
+                battle.StartCoroutine(Complete(battle.Shoot(laserEnemy, member, laserEnemy.Attack), () => done = true)); yield return .8f;
+                Require(done && member.CurrentHP == before - Mathf.Max(1, laserEnemy.Attack - member.Defense), "Minion laser missed " + member.DisplayName + " or hit the wrong collider.");
+                member.character.SetCurrentHP(before); member.Refresh();
+            }
+            laserEnemy.HP = 0; laserEnemy.Refresh();
+            battle.SelectCharacter(0); Warp(wise, battle.Layout.transform.position); Warp(target, wise.transform.position + Vector3.forward * 2); target.HP = 1; wise.transform.rotation = Quaternion.identity;
+            foreach (var e in battle.Enemies.Skip(1).Where(e => e.Alive)) Warp(e, battle.Layout.transform.position + new Vector3(14, 0, 14));
+            wise.character.SetCurrentHP(wise.MaxHP - 30); wise.character.BattleCooldowns[0] = 0;
+            battle.SelectSkill(0); battle.ConfirmSkill(); yield return 1f;
+            Require(!target.Alive && wise.AP == 2 && !wise.movementLocked && wise.character.BattleCooldowns[0] == 0 && wise.CurrentHP > wise.MaxHP - 30, "WiSe killing blow did not refund move/basic cooldown/heal.");
+            wise.character.BattleCooldowns[1] = 0; int sp = wise.character.GetCurrSP(); battle.SelectSkill(1); battle.ConfirmSkill(); yield return .8f;
+            Require(wise.AP == 1 && wise.character.GetCurrSP() == sp - 10 && wise.shields == 1, "Guardian Ring SP/AP/shield behavior is wrong.");
+            battle.SelectCharacter(1); randal.character.BattleCooldowns[0] = 3; randal.character.BattleCooldowns[1] = 3; randal.character.BattleCooldowns[2] = 0;
+            battle.SelectSkill(2); battle.ConfirmSkill(); yield return .8f;
+            Require(randal.portal && randal.character.BattleCooldowns[0] == 2 && randal.character.BattleCooldowns[2] == 2, "Portal must reduce other cooldowns only.");
+            randal.character.BattleCooldowns[1] = 0; foreach (var p in battle.Party) Warp(p, randal.transform.position + Vector3.right * p.characterIndex);
+            battle.SelectSkill(1); battle.ConfirmSkill(); yield return .8f;
+            Require(!randal.portal && randal.magicBuff == .4f && randal.AP == 0, "Empowered codex did not consume portal/apply 40% buff/AP.");
+            randal.character.BattleCooldowns[0] = 0; Require(battle.CanUse(0) && !battle.CanUse(2), "Zero AP must still allow a ready basic attack.");
+            Capture(battle, "battle-skills");
+            if (!File.Exists(Folder + "/travel-only"))
+            {
+                var coverage = ExtraSkills(battle);
+                while (coverage.MoveNext()) yield return coverage.Current;
+                ((IDisposable)coverage).Dispose();
+            }
+            else foreach (var p in battle.Party) p.character.UnlockUltimate();
+            foreach (var p in battle.Party) { p.character.SetCurrentHP(p.MaxHP); p.shields = 0; }
+            var living = battle.Enemies.First(e => e.Alive); Warp(living, randal.transform.position + Vector3.forward * 1.5f);
+            typeof(BattleController).GetProperty("SequenceSpeed").SetValue(battle, 4f);
+            battle.EndTurn();
+            for (int wait = 0; wait < 60 && battle.Phase == BattlePhase.Enemy; wait++) yield return .25f;
+            Require(battle.Phase == BattlePhase.Player && battle.Party.All(p => p.AP == 2), "Enemy turn did not finish/reset AP.");
+            Require(battle.Party.All(p => !p.movementLocked), "New player turn did not reset movement locks.");
+            session.OpenMenu(); Require(BattleSession.MenuOpen, "Battle menu did not open."); session.OpenMenu();
+            randal.character.BattleCooldowns[1] = 3;
+            var snapshot = save.Capture(); Require(snapshot.party[1].cooldowns[1] == 3 && Vector3.Distance(snapshot.position, position) < 2, "Battle save must retain cooldowns and encounter location.");
+            battle.DefeatAllEnemies(); Require(battle.Phase == BattlePhase.Victory && battle.hud.results.activeSelf, "Victory UI missing.");
+            string saveFile = Folder + "/battle-save-check.json"; Require(save.TrySave(out var saveError, saveFile), saveError);
+            var restored = GameSave.Read(saveFile); Require(restored.party[1].cooldowns[1] == 3 && Vector3.Distance(restored.position, position) < 2, "The written battle save lost cooldowns/location.");
+            Capture(battle, "battle-victory"); battle.ReturnFromBattle();
+            for (int wait = 0; wait < 60 && BattleSession.IsActive; wait++) yield return .25f;
+            Require(!BattleSession.IsActive && session.IsDefeated("test:encounter") && !root.activeSelf, "Defeated encounter/return state is wrong: active=" + BattleSession.IsActive + " stage=" + session.TravelStage + " editorPaused=" + EditorApplication.isPaused + " timeScale=" + Time.timeScale + " defeated=" + session.IsDefeated("test:encounter") + " encounter=" + root.activeSelf);
+            Require(Vector3.Distance(CharacterSwitchManager.CurrentCharacterTransform.position, position) < 2, "Party did not return to encounter position.");
+            Require(session.DefeatedIds.Contains("test:encounter") && randal.character.BattleCooldowns[1] == 3, "Defeat/cooldown state was lost after battle.");
+            Require(save.TrySave(out saveError, saveFile), saveError); restored = GameSave.Read(saveFile);
+            Require(restored.defeatedEnemies.Contains("test:encounter"), "Written save lost the defeated encounter.");
+            var dungeonCheck = DungeonTravel(session);
+            while (dungeonCheck.MoveNext()) yield return dungeonCheck.Current;
+            ((IDisposable)dungeonCheck).Dispose();
+            // A second encounter proves defeat state does not prevent future battles or repeated scene loads.
+            var again = Object.Instantiate(session.settings.enemies[1].prefab, position + Vector3.forward * 2, Quaternion.identity);
+            var ranged = again.GetComponent<EncounterEnemy>(); ranged.Configure(session.settings.enemies[1], "test:ranged");
+            for (int wait = 0; wait < 40 && (!BattleSession.IsActive || BattleController.Instance == null || !BattleController.Instance.Ready); wait++) yield return .25f;
+            Require(BattleController.Instance != null && BattleController.Instance.Ready, "The minion projectile did not start a second battle.");
+            battle = BattleController.Instance;
+            foreach (var p in battle.Party) { p.character.SetCurrentHP(0); p.Refresh(); }
+            battle.CheckEnd(); Require(battle.Phase == BattlePhase.GameOver && battle.hud.resultTitle.text == "Game Over", "Game Over UI did not appear.");
+            Capture(battle, "battle-gameover");
+            foreach (var unit in battle.Party.Concat(battle.Enemies)) if (unit.Agent != null) unit.Agent.enabled = false;
+            for (int layout = 0; layout < battle.layouts.Length; layout++)
+            {
+                foreach (var otherLayout in battle.layouts) otherLayout.gameObject.SetActive(false);
+                var candidate = battle.layouts[layout]; candidate.gameObject.SetActive(true); candidate.surface.BuildNavMesh();
+                foreach (var spawn in candidate.partySpawns.Concat(candidate.enemySpawns))
+                    Require(NavMesh.SamplePosition(spawn.position, out var point, 2, NavMesh.AllAreas), "Layout " + layout + " has a spawn off the NavMesh.");
+            }
+        }
+        finally { if (save != null) save.RestorePartyAndInventory(original); }
+    }
+    static IEnumerator DungeonTravel(BattleSession session)
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        var travel = Object.FindAnyObjectByType<DungeonSession>();
+        DungeonSession.OpenEntry("DungeonScene");
+        var button = (Button)typeof(DungeonSession).GetField("proceed", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(travel);
+        Require(button.interactable, "Dungeon entry should accept the unlocked party."); button.onClick.Invoke();
+        for (int wait = 0; wait < 120 && (!DungeonSession.IsInside || DungeonSession.IsTransitioning); wait++) yield return .25f;
+        Require(DungeonSession.IsInside && !DungeonSession.IsTransitioning, "Dungeon entry failed during battle integration check.");
+        var generator = DungeonSession.Generator;
+        int room = generator.Layout.Rooms.FindIndex(r => r.Kind == DungeonRoomKind.Enemy);
+        if (room < 0) room = generator.Layout.SpawnRoom;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>(FindObjectsInactive.Include)) enemy.enabled = false;
+        foreach (var npc in Object.FindObjectsByType<NPCBase>(FindObjectsInactive.Include)) npc.enabled = false;
+        generator.TeleportToRoom(room, generator.RoomCentre(room) + Vector3.up * .15f, Quaternion.identity); yield return .3f;
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var encounter = generator.GetComponentsInChildren<EncounterEnemy>().FirstOrDefault(e => e.dungeon && !e.IsBoss);
+        if (encounter == null)
+        {
+            var foe = Object.Instantiate(session.settings.enemies[0].prefab, generator.RoomCentre(room) + Vector3.forward * 5, Quaternion.identity, generator.transform);
+            encounter = foe.GetComponent<EncounterEnemy>(); encounter.Configure(session.settings.enemies[0], "test:dungeon", true); encounter.enabled = false;
+        }
+        Vector3 position = CharacterSwitchManager.CurrentCharacterTransform.position;
+        Require(session.Begin(encounter), "Dungeon encounter did not enter battle.");
+        for (int wait = 0; wait < 60 && (BattleController.Instance == null || !BattleController.Instance.Ready); wait++) yield return .25f;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Dungeon battle did not load."); yield return .7f;
+        battle.DefeatAllEnemies(); Require(battle.hud.returnButton.GetComponentInChildren<TMP_Text>().text == "Return to Dungeon", "Dungeon return button is mislabeled."); battle.ReturnFromBattle();
+        for (int wait = 0; wait < 80 && BattleSession.IsActive; wait++) yield return .25f;
+        Require(!BattleSession.IsActive && DungeonSession.IsInside && generator.CurrentRoom == room && session.IsDefeated(encounter.identity), "Dungeon victory did not restore the room/defeat state: active=" + BattleSession.IsActive + " inside=" + DungeonSession.IsInside + " room=" + generator.CurrentRoom + "/" + room + " defeated=" + session.IsDefeated(encounter.identity) + " stage=" + session.TravelStage + " manager=" + session.isActiveAndEnabled + " paused=" + EditorApplication.isPaused);
+        Require(Vector3.Distance(CharacterSwitchManager.CurrentCharacterTransform.position, position) < 2, "Dungeon battle returned to the wrong location.");
+        DungeonSession.ReturnToSurface();
+        for (int wait = 0; wait < 80 && (DungeonSession.IsInside || DungeonSession.IsTransitioning); wait++) yield return .25f;
+        Require(!DungeonSession.IsInside && !DungeonSession.IsTransitioning, "Returning from dungeon failed.");
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+    }
+    static IEnumerator ExtraSkills(BattleController battle)
+    {
+        var wise = battle.Party[0]; var randal = battle.Party[1]; var druid = battle.Party[2];
+        var target = battle.Enemies.First(e => e.Alive); Vector3 centre = battle.Layout.transform.position;
+        foreach (var cover in battle.Layout.cover) cover.gameObject.SetActive(false);
+        foreach (var enemy in battle.Enemies.Where(e => e.Alive)) Warp(enemy, centre + new Vector3(13, 0, 13));
+        foreach (var p in battle.Party) { Warp(p, centre + Vector3.left * p.characterIndex * 2); p.StartTurn(); p.character.RestoreSP(p.character.GetMaxSP()); }
+        Warp(target, centre + Vector3.forward * 4); int hp = target.CurrentHP;
+        battle.SelectCharacter(0); wise.character.BattleCooldowns[2] = 0; Require(battle.CanUse(2), "Dragonfire not usable: " + battle.Phase + " AP " + wise.AP + " SP " + wise.character.GetCurrSP());
+        battle.SelectSkill(2); Set(battle, "AimPoint", target.transform.position); battle.ConfirmSkill();
+        Require(battle.Phase == BattlePhase.Acting, "Dragonfire confirmation did not start casting.");
+        yield return .5f; Require(battle.settings.dragon.GetComponent<BattleDragonVisual>().mouth != null, "Dragonfire dragon/mouth is missing.");
+        for (int wait = 0; wait < 60 && battle.Phase == BattlePhase.Acting; wait++) yield return .2f;
+        Require(target.CurrentHP < hp && battle.Phase == BattlePhase.Player, "Dragonfire volley did not damage its target/finish: HP " + hp + " → " + target.CurrentHP + ", phase " + battle.Phase);
+        wise.character.UnlockUltimate(); wise.character.BattleCooldowns[3] = 0; battle.SelectSkill(3); battle.ConfirmSkill(); yield return .6f;
+        Require(wise.dodgeTurns == 2 && wise.AP == 0, "Flurry Rush stance/SP/AP failed.");
+        // Exercise the real input timing windows and all five perfect-dodge counter inputs.
+        Set(battle, "Phase", BattlePhase.Enemy); int savedTargetHP = target.HP;
+        foreach (float timing in new[] { .2f, .7f, .89f, -1f })
+        {
+            Warp(wise, centre); Warp(target, centre + Vector3.forward * 2); target.HP = 1000;
+            bool finished = false, evaded = false;
+            var dodge = (IEnumerator)typeof(BattleController).GetMethod("Dodge", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(battle, new object[] { target, wise, (Action<bool>)(value => evaded = value) });
+            battle.StartCoroutine(Complete(dodge, () => finished = true));
+            if (timing >= 0) battle.StartCoroutine(DodgeInput(timing, timing == .7f));
+            for (int wait = 0; wait < 40 && !finished; wait++) yield return .2f;
+            Require(finished && evaded == (timing >= 0), "Flurry Rush dodge window failed at " + timing + " seconds.");
+            int counters = timing == .7f ? 5 * Mathf.Max(1, 3 + wise.Attack - target.Defense) : 0;
+            Require(target.HP == 1000 - counters, "Perfect dodge must counter five times; early/late must not counter.");
+        }
+        target.HP = savedTargetHP; Set(battle, "Phase", BattlePhase.Player);
+        battle.SelectCharacter(2); druid.character.BattleCooldowns[0] = 0;
+        Warp(druid, centre); Warp(wise, centre + Vector3.right); wise.character.SetCurrentHP(wise.MaxHP - 100);
+        Warp(target, centre + Vector3.forward); hp = target.CurrentHP;
+        battle.SelectSkill(0); Set(battle, "AimPoint", centre); battle.ConfirmSkill(); yield return .6f;
+        Require(target.CurrentHP < hp && wise.CurrentHP > wise.MaxHP - 100 && druid.movementLocked && druid.AP == 2, "Radiant Chorus must damage/heal/lock without spending AP.");
+        if (!target.Alive) target = battle.SpawnEnemy(battle.settings.enemies[0], centre + Vector3.forward * 6, false);
+        Warp(target, centre + Vector3.forward * 6); druid.character.BattleCooldowns[1] = 0;
+        float distance = BattleController.FlatDistance(target.transform.position, druid.transform.position);
+        battle.SelectSkill(1); battle.ConfirmSkill();
+        for (int wait = 0; wait < 60 && battle.Phase == BattlePhase.Acting; wait++) yield return .2f;
+        Require(BattleController.FlatDistance(target.transform.position, druid.transform.position) < distance - .5f, "Luring Melody did not pull enemies.");
+        druid.character.BattleCooldowns[2] = 0; var destination = centre + Vector3.right * 7;
+        Require(NavMesh.SamplePosition(destination, out var landing, 1, NavMesh.AllAreas), "Teleport test has no clear ground.");
+        battle.SelectSkill(2); Set(battle, "AimPoint", landing.position); battle.ConfirmSkill(); yield return .6f;
+        Require(BattleController.FlatDistance(druid.transform.position, landing.position) < .3f && druid.AP == 0, "Resonant Passage did not teleport/spend AP.");
+        randal.StartTurn(); randal.character.BattleCooldowns[3] = 0; randal.character.RestoreSP(randal.character.GetMaxSP());
+        Warp(randal, centre + Vector3.left * 8); randal.transform.rotation = Quaternion.identity;
+        if (!target.Alive) target = battle.SpawnEnemy(battle.settings.enemies[0], randal.transform.position + Vector3.forward * 6, false);
+        Warp(target, randal.transform.position + Vector3.forward * 6); hp = target.CurrentHP;
+        battle.SelectCharacter(1); battle.SelectSkill(3); battle.ConfirmSkill(); yield return .6f;
+        Require(battle.cameraRig.FirstPerson && battle.hud.crosshair.activeSelf, "Arcane Barrage did not switch to first-person.");
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState().WithButton(MouseButton.Left)); yield return 1.6f;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState()); yield return .8f;
+        Require(target.CurrentHP < hp, "The charged, aimed Barrage projectile did not hit its target.");
+        for (int wait = 0; wait < 60 && battle.Phase == BattlePhase.Acting; wait++) yield return .2f;
+        Require(!battle.cameraRig.FirstPerson && !battle.hud.crosshair.activeSelf, "Barrage did not restore the camera/crosshair.");
+        druid.StartTurn(); druid.character.UnlockUltimate(); druid.character.BattleCooldowns[3] = 0; druid.character.RestoreSP(druid.character.GetMaxSP());
+        battle.SelectCharacter(2); battle.SelectSkill(3); battle.ConfirmSkill(); yield return 1.8f;
+        Require(PinkRhythmController.IsOpen, "Grand Ensemble did not open the healer rhythm challenge.");
+        Object.FindAnyObjectByType<PinkRhythmController>().ExitChallenge(); yield return .4f;
+        Require(battle.Phase == BattlePhase.Player && !PinkRhythmController.IsOpen, "Leaving the healer rhythm did not return to battle.");
+        // Actual raycasts must reach the saved UI; invoking listeners alone cannot catch layering errors.
+        Canvas.ForceUpdateCanvases(); var hits = new System.Collections.Generic.List<RaycastResult>();
+        var pointer = new PointerEventData(EventSystem.current) { position = RectTransformUtility.WorldToScreenPoint(null, battle.hud.portraits[0].transform.position) };
+        EventSystem.current.RaycastAll(pointer, hits); Require(hits.Any(h => h.gameObject == battle.hud.portraits[0].gameObject), "Portrait buttons do not receive UI raycasts.");
+        BattleSession.Instance.OpenMenu(); yield return .2f;
+        Require(BattleSession.Instance.menu.GetComponentInParent<Canvas>().sortingOrder > battle.hud.GetComponent<Canvas>().sortingOrder, "Battle menu is covered by the battle HUD.");
+        var inventoryUI = Object.FindAnyObjectByType<InventoryUI>(FindObjectsInactive.Include); var potion = AssetDatabase.LoadAssetAtPath<Consumable>("Assets/Scripts/Inventory/Items/Consumable/HealthPotion.asset");
+        PlayerInventory.Instance.AddItem(potion); wise.character.SetCurrentHP(wise.MaxHP - 100); inventoryUI.ShowItemDetails(potion); inventoryUI.UseOnCharacter(0);
+        Require(wise.CurrentHP > wise.MaxHP - 100, "Battle menu potion did not heal.");
+        wise.character.SetCurrentHP(0); wise.Refresh(); Require(!wise.GetComponent<CapsuleCollider>().enabled, "A dead character is still detected by attacks.");
+        var diamond = AssetDatabase.LoadAssetAtPath<Consumable>("Assets/Scripts/Inventory/Items/Consumable/Diamond.asset"); PlayerInventory.Instance.AddItem(diamond);
+        inventoryUI.ShowItemDetails(diamond); inventoryUI.UseOnCharacter(0); Require(wise.Alive && wise.CurrentHP == wise.MaxHP && wise.GetComponent<CapsuleCollider>().enabled, "Diamond did not revive/re-enable the character.");
+        BattleSession.Instance.OpenMenu();
+        var boss = battle.SpawnEnemy(battle.settings.boss, centre + Vector3.forward * 8, false);
+        for (int pattern = 0; pattern < 5; pattern++)
+        {
+            wise.character.SetCurrentHP(wise.MaxHP); bool done = false;
+            battle.StartCoroutine(Complete(battle.bossGame.Play(boss, wise, pattern, 4), () => done = true)); yield return .7f;
+            Require(battle.bossGame.panel.activeSelf && battle.bossGame.spadeTemplate.sprite != null && battle.bossGame.heartTemplate.sprite != null && battle.bossGame.scytheTemplate.sprite != null, "Boss UI/templates are missing: panel=" + battle.bossGame.panel.activeSelf + " spade=" + battle.bossGame.spadeTemplate.sprite + " heart=" + battle.bossGame.heartTemplate.sprite + " scythe=" + battle.bossGame.scytheTemplate.sprite);
+            if (pattern == 0) Capture(battle, "battle-jevil");
+            if (pattern == 1)
+            {
+                yield return .55f;
+                var bullets = (System.Collections.IList)typeof(BattleBossGame).GetField("bullets", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(battle.bossGame);
+                int spinning = 0;
+                foreach (var bullet in bullets)
+                {
+                    var type = bullet.GetType();
+                    if ((int)type.GetField("type").GetValue(bullet) != 4) continue;
+                    spinning++; Require(((Vector2)type.GetField("velocity").GetValue(bullet)).magnitude > 100, "Jevil's exploded hearts lost their tracked movement direction.");
+                }
+                Require(spinning >= 4, "Jevil's bomb did not explode into four moving hearts.");
+            }
+            for (int wait = 0; wait < 55 && !done; wait++) yield return .2f;
+            Require(done && !battle.bossGame.panel.activeSelf, "Jevil pattern failed to finish: " + pattern);
+        }
+        wise.character.SetCurrentHP(wise.MaxHP); wise.Refresh();
+        int aliveBefore = battle.Enemies.Count(e => e.Alive), summoned = aliveBefore <= 4 ? 3 : 2;
+        bool bossFinished = false;
+        var bossAction = (IEnumerator)typeof(BattleController).GetMethod("BossTurn", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(battle, new object[] { boss, wise });
+        battle.StartCoroutine(Complete(bossAction, () => bossFinished = true)); yield return .3f;
+        Require(battle.Enemies.Count(e => e.Alive) == aliveBefore + summoned, "Jevil summoned the wrong number of enemies.");
+        Require(BattleController.FlatDistance(boss.transform.position, boss.moveOrigin) <= boss.moveRange && BattleController.FlatDistance(wise.transform.position, wise.moveOrigin) < .1f, "Jevil's kidnapping/movement origin was not updated.");
+        for (int wait = 0; wait < 55 && !bossFinished; wait++) yield return .2f;
+        Require(bossFinished, "Jevil's turn did not complete.");
+        boss.HP = 0; boss.Refresh(); wise.character.SetCurrentHP(wise.MaxHP); wise.Refresh();
+        foreach (var p in battle.Party) { p.dodgeTurns = 0; p.StartTurn(); }
+    }
+    static void Set(object target, string property, object value) => target.GetType().GetProperty(property).SetValue(target, value);
+    static void Warp(BattleUnit unit, Vector3 position)
+    {
+        Require(NavMesh.SamplePosition(position, out var point, 3, NavMesh.AllAreas), "No ground for the test placement.");
+        unit.HoldPosition(); Require(unit.Agent.Warp(point.position), "Test placement failed to reach the NavMesh."); unit.ResetMovement(); Physics.SyncTransforms();
+    }
+    static IEnumerator Complete(IEnumerator action, Action completed) { yield return action; completed(); }
+    static IEnumerator DodgeInput(float delay, bool counter)
+    {
+        yield return new WaitForSeconds(delay);
+        InputSystem.QueueStateEvent(Keyboard.current, new KeyboardState(Key.Space)); yield return null;
+        InputSystem.QueueStateEvent(Keyboard.current, new KeyboardState());
+        if (!counter) yield break;
+        for (int i = 0; i < 5; i++)
+        {
+            yield return new WaitForSeconds(.15f); InputSystem.QueueStateEvent(Mouse.current, new MouseState().WithButton(MouseButton.Right));
+            yield return null; InputSystem.QueueStateEvent(Mouse.current, new MouseState());
+        }
+    }
+    static void Capture(BattleController battle, string name)
+    {
+        if (File.Exists(Folder + "/no-capture")) return;
+        var camera = battle.cameraRig.view; var canvas = battle.hud.GetComponent<Canvas>(); var mode = canvas.renderMode; var previousCamera = canvas.worldCamera;
+        var target = new RenderTexture(1280, 720, 24); var texture = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = .4f; camera.targetTexture = target;
+            Canvas.ForceUpdateCanvases();
+            RenderPipeline.SubmitRenderRequest(camera, new RenderPipeline.StandardRequest { destination = target });
+            RenderTexture.active = target; texture.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); texture.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", texture.EncodeToPNG());
+        }
+        finally { camera.targetTexture = null; canvas.renderMode = mode; canvas.worldCamera = previousCamera; RenderTexture.active = previous; Object.DestroyImmediate(target); Object.DestroyImmediate(texture); }
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+    static void Log(string message, string stack, LogType type) { if ((type == LogType.Error || type == LogType.Exception || type == LogType.Assert) && (stack.Contains("Battle") || message.Contains("NavMesh") || message.Contains("Thread group count"))) errorLog = message + "\n" + stack; }
+}

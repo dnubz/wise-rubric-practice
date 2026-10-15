@@ -1,0 +1,80 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+public sealed class OverworldObstacleSpawner : MonoBehaviour
+{
+    public OverworldPlatformObstacle platformPrefab;
+    [Range(0, 1)] public float platformChance = .35f;
+    readonly HashSet<Vector2Int> opened = new HashSet<Vector2Int>();
+    readonly Dictionary<Vector2Int, OverworldPlatformObstacle> active = new Dictionary<Vector2Int, OverworldPlatformObstacle>();
+    int currentSeed = int.MinValue;
+
+    void UseSeed(int seed)
+    {
+        if (seed == currentSeed) return;
+        currentSeed = seed; opened.Clear(); active.Clear();
+    }
+    public Vector2Int[] GetOpenedChests()
+    {
+        var result = new Vector2Int[opened.Count]; opened.CopyTo(result);
+        Array.Sort(result, (a, b) => a.x != b.x ? a.x.CompareTo(b.x) : a.y.CompareTo(b.y));
+        return result;
+    }
+    public void RestoreOpenedChests(int seed, Vector2Int[] chunks)
+    { UseSeed(seed); if (chunks != null) foreach (var chunk in chunks) opened.Add(chunk); }
+    public bool IsReserved(Vector3 point)
+    {
+        foreach (var obstacle in active.Values)
+            if (obstacle != null && obstacle.gameObject.activeInHierarchy && obstacle.Reserves(point)) return true;
+        return false;
+    }
+
+    public void SpawnChunk(Vector2Int chunk, int seed, Transform parent)
+    {
+        UseSeed(seed);
+        var random = new System.Random(WorldRandom.Seed(seed, chunk.x, chunk.y, 0x504C4154));
+        if (chunk != Vector2Int.zero && random.NextDouble() >= platformChance) return;
+        if (platformPrefab == null) platformPrefab = Resources.Load<OverworldPlatformObstacle>("Overworld/PlatformObstacle");
+        if (platformPrefab == null) { Debug.LogError("Missing saved overworld platform obstacle prefab."); return; }
+        var terrain = ChunkSpawnUtility.GetOwnedTerrain(parent);
+        float width = ChunkSpawnUtility.ChunkWidth;
+        Vector3 origin = new Vector3(chunk.x * width, 0, chunk.y * width);
+        Physics.SyncTransforms();
+        for (int attempt = 0; attempt < 60; attempt++)
+        {
+            Quaternion rotation = Quaternion.Euler(0, random.Next(4) * 90, 0);
+            Vector3 position = origin + new Vector3(Range(random, 20, width - 20), 0, Range(random, 20, width - 20));
+            Vector3 localSize = rotation * platformPrefab.LocalFootprint.size;
+            Bounds footprint = new Bounds(position + rotation * platformPrefab.LocalFootprint.center,
+                new Vector3(Mathf.Abs(localSize.x), 3, Mathf.Abs(localSize.z)));
+            if (!ChunkSpawnUtility.Contains(chunk, footprint.min.x, footprint.max.x, footprint.min.z, footprint.max.z, 3)) continue;
+            Vector3 nearSpawn = footprint.ClosestPoint(Vector3.zero); nearSpawn.y = 0;
+            if (nearSpawn.sqrMagnitude < 12 * 12) continue;
+            float lowest = float.MaxValue, highest = float.MinValue; bool valid = true;
+            for (float x = footprint.min.x; x <= footprint.max.x && valid; x += 2)
+                for (float z = footprint.min.z; z <= footprint.max.z; z += 2)
+                {
+                    if (!ChunkSpawnUtility.TryGetGround(terrain, x, z, true, out var ground)) { valid = false; break; }
+                    lowest = Mathf.Min(lowest, ground.y); highest = Mathf.Max(highest, ground.y);
+                }
+            if (!valid || highest - lowest > .5f) continue;
+            footprint.center = new Vector3(footprint.center.x, highest + 6, footprint.center.z);
+            footprint.size = new Vector3(footprint.size.x + 4, 16, footprint.size.z + 4);
+            foreach (var collider in parent.GetComponentsInChildren<Collider>())
+                if (ChunkSpawnUtility.IsOwnedObstacle(collider, parent) && footprint.Intersects(collider.bounds)) { valid = false; break; }
+            if (!valid) continue;
+            position.y = highest;
+            var obstacle = Instantiate(platformPrefab, position, rotation, parent);
+            obstacle.name = "Druid Glide Platform Challenge " + chunk;
+            active[chunk] = obstacle;
+            obstacle.Destroyed += removed =>
+            {
+                if (active.TryGetValue(chunk, out var current) && ReferenceEquals(current, removed)) active.Remove(chunk);
+            };
+            obstacle.Configure(WorldRandom.Seed(seed, chunk.x, chunk.y, 0x4449414D), opened.Contains(chunk), () => opened.Add(chunk));
+            Physics.SyncTransforms(); return;
+        }
+    }
+    static float Range(System.Random random, float min, float max) => Mathf.Lerp(min, max, (float)random.NextDouble());
+}

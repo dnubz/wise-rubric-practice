@@ -1,0 +1,110 @@
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using UnityEngine.Rendering;
+using Object = UnityEngine.Object;
+
+// Author a replaceable dragon prefab and a real looping animation asset in the editor.
+public static class BattleDragonBuilder
+{
+    const string Folder = "Assets/Resources/Battle/";
+    public static GameObject Build()
+    {
+        var root = new GameObject("DragonfireDragon"); var visual = root.AddComponent<BattleDragonVisual>();
+        var skin = Material("DragonGold", new Color(.44f, .095f, .04f));
+        var belly = Material("DragonBelly", new Color(.8f, .39f, .12f));
+        var wingMaterial = Material("DragonWings", new Color(.76f, .2f, .055f)); wingMaterial.SetFloat("_Cull", 0);
+        var hornMaterial = Material("DragonHorn", new Color(.2f, .12f, .085f));
+        var eye = Material("DragonEye", new Color(1, .75f, .05f)); eye.EnableKeyword("_EMISSION"); eye.SetColor("_EmissionColor", new Color(1, .45f, .015f) * 2);
+        var body = Joint("FlightBody", root.transform, Vector3.zero);
+        Sphere("Chest", body, Vector3.zero, new Vector3(1.05f, .95f, 2.1f), skin);
+        Sphere("Belly", body, new Vector3(0, -.29f, .15f), new Vector3(.75f, .52f, 1.65f), belly);
+        Sphere("Shoulders", body, new Vector3(0, .17f, .6f), new Vector3(.95f, .85f, 1), skin);
+        Tube("Neck", body, new Vector3(0, .25f, .75f), new Vector3(0, .78f, 1.3f), .3f, skin);
+        Sphere("Head", body, new Vector3(0, .86f, 1.5f), new Vector3(.65f, .53f, .83f), skin);
+        Sphere("Muzzle", body, new Vector3(0, .71f, 1.99f), new Vector3(.47f, .3f, .7f), skin);
+        Sphere("Jaw", body, new Vector3(0, .54f, 1.94f), new Vector3(.43f, .14f, .65f), belly);
+        var hornMesh = Cone();
+        for (int side = -1; side <= 1; side += 2)
+        {
+            var horn = MeshPart("Horn", body, hornMesh, hornMaterial); horn.localPosition = new Vector3(side * .23f, 1.05f, 1.3f); horn.localRotation = Quaternion.Euler(-40, 0, side * -20); horn.localScale = new Vector3(.16f, .65f, .16f);
+            Sphere("Eye", body, new Vector3(side * .31f, .89f, 1.69f), new Vector3(.085f, .11f, .17f), eye);
+            Tube("Brow", body, new Vector3(side * .3f, .99f, 1.48f), new Vector3(side * .33f, .94f, 1.81f), .07f, skin);
+            Tube("Thigh", body, new Vector3(side * .38f, -.19f, -.6f), new Vector3(side * .56f, -.48f, -.2f), .19f, skin);
+            Tube("Shin", body, new Vector3(side * .56f, -.48f, -.2f), new Vector3(side * .43f, -.72f, -.5f), .095f, skin);
+            Sphere("Claws", body, new Vector3(side * .44f, -.75f, -.35f), new Vector3(.2f, .12f, .39f), hornMaterial);
+            var wing = Joint(side < 0 ? "LeftWing" : "RightWing", body, new Vector3(side * .43f, .23f, .25f));
+            MeshPart("WingMembrane", wing, Wing(side), wingMaterial);
+            Tube("WingArm", wing, Vector3.zero, new Vector3(side * 1.2f, .54f, .14f), .085f, skin);
+            Tube("LeadingEdge", wing, new Vector3(side * 1.2f, .54f, .14f), new Vector3(side * 3.2f, .05f, -.7f), .055f, skin);
+            Tube("WingFinger1", wing, new Vector3(side * 1.2f, .54f, .14f), new Vector3(side * 2.4f, -.05f, -.95f), .035f, skin);
+            Tube("WingFinger2", wing, new Vector3(side * 1.2f, .54f, .14f), new Vector3(side * 1.7f, .02f, -1.4f), .035f, skin);
+            if (side < 0) visual.leftWing = wing; else visual.rightWing = wing;
+        }
+        var tail = Joint("Tail", body, new Vector3(0, 0, -.8f));
+        Tube("TailBase", tail, Vector3.zero, new Vector3(0, -.1f, -1), .18f, skin);
+        Tube("TailTip", tail, new Vector3(0, -.1f, -1), new Vector3(0, .05f, -2.15f), .085f, skin);
+        for (int i = 0; i < 6; i++)
+        {
+            var spike = MeshPart("BackSpine", body, hornMesh, hornMaterial); spike.localPosition = new Vector3(0, .36f, .55f - i * .42f); spike.localScale = new Vector3(.11f, .29f - i * .025f, .16f); spike.localRotation = Quaternion.Euler(-25, 0, 0);
+        }
+        visual.mouth = Joint("Mouth", body, new Vector3(0, .62f, 2.35f));
+        root.AddComponent<Animator>().runtimeAnimatorController = FlightAnimation();
+        try { return PrefabUtility.SaveAsPrefabAsset(root, Folder + "Dragon.prefab"); }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static RuntimeAnimatorController FlightAnimation()
+    {
+        string path = Folder + "DragonFlight.anim"; var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(path);
+        if (clip == null) { clip = new AnimationClip(); AssetDatabase.CreateAsset(clip, path); }
+        clip.ClearCurves(); clip.frameRate = 60;
+        var settings = AnimationUtility.GetAnimationClipSettings(clip); settings.loopTime = true; AnimationUtility.SetAnimationClipSettings(clip, settings);
+        Curve(clip, "FlightBody", "localPosition.y", .08f, .22f, .08f, -.04f, .08f);
+        Curve(clip, "FlightBody/LeftWing", "localEulerAnglesRaw.z", -12, 32, -12, -38, -12);
+        Curve(clip, "FlightBody/RightWing", "localEulerAnglesRaw.z", 12, -32, 12, 38, 12);
+        Curve(clip, "FlightBody/Tail", "localEulerAnglesRaw.y", -7, 0, 7, 0, -7);
+        Curve(clip, "FlightBody", "localEulerAnglesRaw.x", -2, 2, -2, -5, -2);
+        string controllerPath = Folder + "DragonFlight.controller";
+        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(controllerPath);
+        if (controller == null) controller = AnimatorController.CreateAnimatorControllerAtPath(controllerPath);
+        var machine = controller.layers[0].stateMachine;
+        var state = machine.defaultState ?? machine.AddState("Fly"); state.motion = clip; machine.defaultState = state;
+        EditorUtility.SetDirty(clip); EditorUtility.SetDirty(controller); return controller;
+    }
+    static void Curve(AnimationClip clip, string path, string property, params float[] values)
+    {
+        var keys = new Keyframe[values.Length]; for (int i = 0; i < keys.Length; i++) keys[i] = new Keyframe(i * .2f, values[i]);
+        var curve = new AnimationCurve(keys); for (int i = 0; i < keys.Length; i++) { AnimationUtility.SetKeyLeftTangentMode(curve, i, AnimationUtility.TangentMode.Auto); AnimationUtility.SetKeyRightTangentMode(curve, i, AnimationUtility.TangentMode.Auto); }
+        AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve(path, typeof(Transform), property), curve);
+    }
+    static Mesh Wing(int side)
+    {
+        var mesh = new Mesh { name = side < 0 ? "DragonLeftWing" : "DragonRightWing" };
+        mesh.vertices = new[] { new Vector3(side * 1.2f, .12f, -.4f), Vector3.zero, new Vector3(side * 1.2f, .54f, .14f), new Vector3(side * 2.7f, .4f, .1f), new Vector3(side * 3.2f, .05f, -.7f), new Vector3(side * 2.4f, -.05f, -.95f), new Vector3(side * 1.7f, .02f, -1.4f), new Vector3(side * 1.1f, -.1f, -1.1f), new Vector3(side * .4f, -.1f, -.9f) };
+        var triangles = new int[24]; for (int i = 0; i < 8; i++) { triangles[i * 3] = 0; triangles[i * 3 + 1] = i + 1; triangles[i * 3 + 2] = i == 7 ? 1 : i + 2; }
+        mesh.triangles = triangles; mesh.RecalculateNormals(); mesh.RecalculateBounds(); return SaveMesh(mesh);
+    }
+    static Mesh Cone()
+    {
+        var mesh = new Mesh { name = "DragonSpike" }; var vertices = new Vector3[13]; vertices[0] = Vector3.up;
+        for (int i = 0; i < 12; i++) vertices[i + 1] = new Vector3(Mathf.Sin(i * Mathf.PI / 6), 0, Mathf.Cos(i * Mathf.PI / 6));
+        var triangles = new int[36]; for (int i = 0; i < 12; i++) { triangles[i * 3] = 0; triangles[i * 3 + 1] = i + 1; triangles[i * 3 + 2] = (i + 1) % 12 + 1; }
+        mesh.vertices = vertices; mesh.triangles = triangles; mesh.RecalculateNormals(); mesh.RecalculateBounds(); return SaveMesh(mesh);
+    }
+    static Mesh SaveMesh(Mesh mesh)
+    {
+        string path = Folder + mesh.name + ".asset"; var existing = AssetDatabase.LoadAssetAtPath<Mesh>(path);
+        if (existing != null) { EditorUtility.CopySerialized(mesh, existing); Object.DestroyImmediate(mesh); EditorUtility.SetDirty(existing); return existing; }
+        AssetDatabase.CreateAsset(mesh, path); return mesh;
+    }
+    static Transform Joint(string name, Transform parent, Vector3 position)
+    { var obj = new GameObject(name); obj.transform.SetParent(parent, false); obj.transform.localPosition = position; return obj.transform; }
+    static Transform MeshPart(string name, Transform parent, Mesh mesh, Material material)
+    { var joint = Joint(name, parent, Vector3.zero); joint.gameObject.AddComponent<MeshFilter>().sharedMesh = mesh; joint.gameObject.AddComponent<MeshRenderer>().sharedMaterial = material; return joint; }
+    static void Sphere(string name, Transform parent, Vector3 position, Vector3 scale, Material material)
+    { var obj = GameObject.CreatePrimitive(PrimitiveType.Sphere); obj.name = name; obj.transform.SetParent(parent, false); obj.transform.localPosition = position; obj.transform.localScale = scale; obj.GetComponent<Renderer>().sharedMaterial = material; Object.DestroyImmediate(obj.GetComponent<Collider>()); }
+    static void Tube(string name, Transform parent, Vector3 start, Vector3 end, float radius, Material material)
+    { var obj = GameObject.CreatePrimitive(PrimitiveType.Capsule); obj.name = name; obj.transform.SetParent(parent, false); obj.transform.localPosition = (start + end) * .5f; obj.transform.localRotation = Quaternion.FromToRotation(Vector3.up, end - start); obj.transform.localScale = new Vector3(radius * 2, Vector3.Distance(start, end) * .5f, radius * 2); obj.GetComponent<Renderer>().sharedMaterial = material; Object.DestroyImmediate(obj.GetComponent<Collider>()); }
+    static Material Material(string name, Color color)
+    { string path = Folder + name + ".mat"; var material = AssetDatabase.LoadAssetAtPath<Material>(path); if (material == null) { material = new Material(Shader.Find("Universal Render Pipeline/Lit")); AssetDatabase.CreateAsset(material, path); } material.color = color; material.SetFloat("_Smoothness", .22f); EditorUtility.SetDirty(material); return material; }
+}

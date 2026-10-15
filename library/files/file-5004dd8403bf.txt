@@ -1,0 +1,94 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+// One-time editor setup. The five item buttons are saved in the scene hierarchy.
+[InitializeOnLoad]
+public static class ConsumableMenuSetup
+{
+    const string Folder = "Temp/ConsumableMenu";
+    const string DiamondPath = "Assets/Scripts/Inventory/Items/Consumable/Diamond.asset";
+    static ConsumableMenuSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode || !File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved centered consumable row with five existing-style buttons, assigned Diamond icon/revive effect, rare overworld and dungeon chest loot, and excluded Diamond from shop inventories."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); }
+    }
+
+    [MenuItem("WiSe/UI/Set Up Consumable Row")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        var diamond = AssetDatabase.LoadAssetAtPath<Consumable>(DiamondPath);
+        if (diamond == null) throw new InvalidOperationException("Diamond asset is missing.");
+        var diamondFields = new SerializedObject(diamond);
+        diamondFields.FindProperty("revivesAndFullRestore").boolValue = true;
+        diamondFields.FindProperty("cost").intValue = 0;
+        diamondFields.FindProperty("icon").objectReferenceValue = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/Sprites/GPT Sprites/diamond ahh.png");
+        diamondFields.ApplyModifiedPropertiesWithoutUndo(); EditorUtility.SetDirty(diamond);
+
+        var scene = SceneManager.GetSceneByName("GameScene");
+        if (!scene.IsValid() || !scene.isLoaded) throw new InvalidOperationException("Open GameScene first.");
+        var ui = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<InventoryUI>(true)).Single();
+        var uiFields = new SerializedObject(ui); var array = uiFields.FindProperty("itemSlots");
+        var slots = Enumerable.Range(0, array.arraySize).Select(i => (ItemSlotUI)array.GetArrayElementAtIndex(i).objectReferenceValue).Where(s => s != null).ToList();
+        var row = (RectTransform)slots[0].transform.parent;
+        if (row.GetComponent<HorizontalLayoutGroup>() == null)
+        {
+            row.name = "ConsumableItems";
+            row.anchoredPosition += new Vector2(0, ((RectTransform)slots[0].transform).anchoredPosition.y);
+            row.sizeDelta = new Vector2(row.sizeDelta.x, 160);
+            var layout = row.gameObject.AddComponent<HorizontalLayoutGroup>();
+            layout.childAlignment = TextAnchor.MiddleCenter;
+            layout.spacing = 25;
+            layout.childControlWidth = true; layout.childControlHeight = true;
+            layout.childForceExpandWidth = false; layout.childForceExpandHeight = false;
+        }
+        var diamondSlot = slots.FirstOrDefault(s => s.Item == diamond);
+        if (diamondSlot == null)
+        {
+            diamondSlot = UnityEngine.Object.Instantiate(slots[0], row);
+            diamondSlot.name = "DiamondBtn";
+            var fields = new SerializedObject(diamondSlot); fields.FindProperty("item").objectReferenceValue = diamond;
+            fields.ApplyModifiedPropertiesWithoutUndo(); slots.Add(diamondSlot);
+        }
+        foreach (var slot in slots)
+        {
+            var rect = (RectTransform)slot.transform; rect.localScale = Vector3.one;
+            var element = slot.GetComponent<LayoutElement>() ?? slot.gameObject.AddComponent<LayoutElement>();
+            element.minWidth = element.preferredWidth = 160;
+            element.minHeight = element.preferredHeight = 160;
+            element.flexibleWidth = element.flexibleHeight = 0;
+            var image = slot.GetComponent<Image>(); image.sprite = slot.Item.Icon; image.preserveAspect = true;
+            slot.gameObject.SetActive(true); // All five remain editable before Play.
+        }
+        array.arraySize = slots.Count;
+        for (int i = 0; i < slots.Count; i++) array.GetArrayElementAtIndex(i).objectReferenceValue = slots[i];
+        uiFields.ApplyModifiedPropertiesWithoutUndo();
+
+        var loot = AssetDatabase.LoadAssetAtPath<LootTable>("Assets/OverworldChestLootTable.asset");
+        var lootFields = new SerializedObject(loot); var entries = lootFields.FindProperty("entries");
+        int diamondIndex = -1;
+        for (int i = 0; i < entries.arraySize; i++) if (entries.GetArrayElementAtIndex(i).FindPropertyRelative("item").objectReferenceValue == diamond) diamondIndex = i;
+        if (diamondIndex < 0) { diamondIndex = entries.arraySize; entries.arraySize++; }
+        var entry = entries.GetArrayElementAtIndex(diamondIndex);
+        entry.FindPropertyRelative("item").objectReferenceValue = diamond; entry.FindPropertyRelative("weight").intValue = 2;
+        lootFields.ApplyModifiedPropertiesWithoutUndo(); EditorUtility.SetDirty(loot);
+
+        var settings = AssetDatabase.LoadAssetAtPath<DungeonSettings>("Assets/Resources/Dungeon/Settings.asset");
+        settings.diamondChestLoot = diamond; settings.diamondChestChance = .025f; EditorUtility.SetDirty(settings);
+        foreach (string guid in AssetDatabase.FindAssets("t:ShopInventory"))
+        {
+            var shop = AssetDatabase.LoadAssetAtPath<ShopInventory>(AssetDatabase.GUIDToAssetPath(guid));
+            if (shop.items.RemoveAll(e => e != null && e.item == diamond) > 0) EditorUtility.SetDirty(shop);
+        }
+        AssetDatabase.SaveAssets(); EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+    }
+}

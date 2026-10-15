@@ -1,0 +1,367 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public class RandaL : CharacterBase
+{
+    [Header("Book")]
+    [SerializeField] private GameObject bookPrefab;
+    [SerializeField] private GameObject ghostPrefab;
+
+    [Header("Placement")]
+    [SerializeField] private Camera placementCamera;
+    [SerializeField] private LayerMask groundLayers = ~0;
+    [SerializeField, Range(0f, 89f)] private float maxGroundSlope = 35f;
+    [SerializeField, Min(0.1f)] private float maxPlacementDistance = 40f;
+    [SerializeField, Min(0.1f)] private float cursorRayDistance = 500f;
+
+    private readonly RaycastHit[] groundHits = new RaycastHit[64];
+    private readonly Collider[] overlapHits = new Collider[32];
+    private InputSystem_Actions inputActions;
+    private GameObject preview;
+    private GameObject fallbackBook;
+    private static GameObject activeBook;
+    private Renderer[] previewRenderers;
+    private MaterialPropertyBlock tintBlock;
+    private Vector3 placementPosition;
+    private Quaternion placementRotation;
+    private Quaternion bookRotation;
+    private float groundY;
+    private float previewBottomOffset;
+    private bool canPlace;
+    private bool isPlacing;
+    private bool? previewWasValid;
+    private bool warnedAboutMissingBook;
+
+    protected override void Awake()
+    {
+        base.Awake();
+        inputActions = new InputSystem_Actions();
+        tintBlock = new MaterialPropertyBlock();
+        var bodyAnimator = GetComponentInChildren<Animator>();
+        if (bodyAnimator != null) bodyAnimator.applyRootMotion = false;
+    }
+
+    private void OnEnable()
+    {
+        if (inputActions == null)
+            inputActions = new InputSystem_Actions();
+
+        inputActions.Enable();
+        // Interact uses a Hold interaction; started responds immediately to F.
+        inputActions.Player.Interact.started += OnInteract;
+        CreatePreview();
+    }
+
+    private void OnDisable()
+    {
+        if (inputActions != null)
+        {
+            inputActions.Player.Interact.started -= OnInteract;
+            inputActions.Disable();
+        }
+
+        if (preview != null)
+            Destroy(preview);
+        if (fallbackBook != null)
+            Destroy(fallbackBook);
+        preview = null;
+        fallbackBook = null;
+        previewRenderers = null;
+        canPlace = false;
+        isPlacing = false;
+        previewWasValid = null;
+    }
+
+    private void Update()
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput)
+        {
+            if (preview != null) preview.SetActive(false);
+            return;
+        }
+        if (!isPlacing || preview == null)
+            return;
+
+        canPlace = FindPlacement();
+        if (previewWasValid != canPlace)
+        {
+            TintPreview(canPlace ? new Color(0.25f, 1f, 0.4f, 0.65f)
+                                 : new Color(1f, 0.2f, 0.2f, 0.65f));
+            previewWasValid = canPlace;
+        }
+
+        Mouse mouse = Mouse.current;
+        if (mouse != null && mouse.leftButton.wasPressedThisFrame)
+            TryPlaceBook();
+    }
+
+    private void OnInteract(InputAction.CallbackContext context)
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput) return;
+        if (isPlacing)
+        {
+            StopPlacement();
+            return;
+        }
+
+        isPlacing = true;
+        previewWasValid = null;
+    }
+
+    private void StopPlacement()
+    {
+        isPlacing = false;
+        canPlace = false;
+        previewWasValid = null;
+        if (preview != null)
+            preview.SetActive(false);
+    }
+
+    private void TryPlaceBook()
+    {
+        if (!isPlacing)
+            return;
+
+        // Recheck on the click so a moved obstacle cannot make stale preview data valid.
+        if (!FindPlacement())
+        {
+            Debug.Log("RandaL: The book needs clear, level ground.");
+            return;
+        }
+
+        GameObject source = bookPrefab != null ? bookPrefab : fallbackBook;
+        if (source == null)
+            return;
+
+        GameObject newBook = Instantiate(source, placementPosition, placementRotation);
+        newBook.name = "Summoned Book";
+        newBook.SetActive(true);
+        AlignBottomToGround(newBook, groundY);
+        EnsureSolidCollider(newBook);
+
+        // Keep the existing book until a new valid placement succeeds.
+        if (activeBook != null)
+        {
+            activeBook.SetActive(false);
+            Destroy(activeBook);
+        }
+        activeBook = newBook;
+        var world = WFCWorldManager.Instance;
+        if (world != null && world.isActiveAndEnabled)
+        {
+            newBook.transform.SetParent(world.transform, true);
+            world.GetComponent<ExplorationNavigation>()?.RequestRebuild();
+        }
+        StopPlacement();
+    }
+
+    private void CreatePreview()
+    {
+        GameObject source = bookPrefab;
+        if (source == null)
+        {
+            if (!warnedAboutMissingBook)
+            {
+                Debug.LogWarning("RandaL's Book Prefab reference is missing. Using a simple book platform until a prefab is assigned.", this);
+                warnedAboutMissingBook = true;
+            }
+            fallbackBook = CreateFallbackBook();
+            source = fallbackBook;
+        }
+
+        // Keep the prefab's authored tilt (for example, a book laid flat).
+        bookRotation = source.transform.rotation;
+
+        preview = Instantiate(ghostPrefab != null ? ghostPrefab : source);
+        preview.name = "Book Placement Preview";
+        preview.SetActive(true);
+        preview.transform.rotation = bookRotation;
+
+        foreach (Collider collider in preview.GetComponentsInChildren<Collider>(true))
+            collider.enabled = false;
+        foreach (Rigidbody body in preview.GetComponentsInChildren<Rigidbody>(true))
+        {
+            body.isKinematic = true;
+            body.detectCollisions = false;
+        }
+
+        previewRenderers = preview.GetComponentsInChildren<Renderer>(true);
+        if (TryGetVisualBounds(previewRenderers, out Bounds bounds))
+        {
+            previewBottomOffset = bounds.min.y - preview.transform.position.y;
+        }
+        preview.SetActive(false);
+        previewWasValid = null;
+    }
+
+    private bool FindPlacement()
+    {
+        if (preview == null)
+            return false;
+
+        Camera camera = placementCamera != null && placementCamera.isActiveAndEnabled
+            ? placementCamera : Camera.main;
+        Mouse mouse = Mouse.current;
+        if (camera == null || mouse == null)
+        {
+            preview.SetActive(false);
+            return false;
+        }
+
+        Vector2 cursor = mouse.position.ReadValue();
+        if (!camera.pixelRect.Contains(cursor))
+        {
+            preview.SetActive(false);
+            return false;
+        }
+
+        Ray cursorRay = camera.ScreenPointToRay(cursor);
+        placementRotation = bookRotation;
+
+        // Query every solid layer so a prop in front of the ground blocks placement.
+        int count = Physics.RaycastNonAlloc(cursorRay, groundHits,
+            cursorRayDistance, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+
+        RaycastHit surfaceHit = default;
+        float closest = float.MaxValue;
+        for (int i = 0; i < count; i++)
+        {
+            RaycastHit hit = groundHits[i];
+            if (hit.collider == null || hit.collider.transform.IsChildOf(transform))
+                continue;
+            if (hit.distance < closest)
+            {
+                closest = hit.distance;
+                surfaceHit = hit;
+            }
+        }
+
+        if (surfaceHit.collider == null || count == groundHits.Length)
+        {
+            preview.SetActive(false);
+            return false;
+        }
+
+        preview.SetActive(true);
+        groundY = surfaceHit.point.y;
+        placementPosition = surfaceHit.point - Vector3.up * previewBottomOffset;
+        preview.transform.SetPositionAndRotation(placementPosition, placementRotation);
+
+        Vector2 fromPlayer = new Vector2(surfaceHit.point.x - transform.position.x,
+            surfaceHit.point.z - transform.position.z);
+        if (fromPlayer.sqrMagnitude > maxPlacementDistance * maxPlacementDistance)
+            return false;
+
+        int allowedGroundLayers = groundLayers.value == 0
+            ? Physics.DefaultRaycastLayers : groundLayers.value;
+        if ((allowedGroundLayers & (1 << surfaceHit.collider.gameObject.layer)) == 0 ||
+            surfaceHit.normal.y < Mathf.Cos(maxGroundSlope * Mathf.Deg2Rad) ||
+            (WFCWorldManager.Instance != null && WFCWorldManager.Instance.isActiveAndEnabled && !(surfaceHit.collider is TerrainCollider)))
+            return false;
+
+        if (!TryGetVisualBounds(previewRenderers, out Bounds visualBounds))
+            return false;
+
+        Vector3 extents = visualBounds.extents;
+        Vector3 halfSize = new Vector3(
+            Mathf.Max(0.01f, extents.x - 0.01f),
+            Mathf.Max(0.01f, extents.y - 0.01f),
+            Mathf.Max(0.01f, extents.z - 0.01f));
+        int overlaps = Physics.OverlapBoxNonAlloc(visualBounds.center, halfSize,
+            overlapHits, Quaternion.identity, Physics.DefaultRaycastLayers,
+            QueryTriggerInteraction.Ignore);
+
+        for (int i = 0; i < overlaps; i++)
+        {
+            Collider other = overlapHits[i];
+            if (other == null || other == surfaceHit.collider ||
+                other.transform.IsChildOf(preview.transform) ||
+                other is TerrainCollider)
+                continue;
+            return false;
+        }
+
+        return overlaps < overlapHits.Length;
+    }
+
+    private void TintPreview(Color color)
+    {
+        foreach (Renderer renderer in previewRenderers)
+        {
+            renderer.GetPropertyBlock(tintBlock);
+            tintBlock.SetColor("_BaseColor", color);
+            tintBlock.SetColor("_Color", color);
+            renderer.SetPropertyBlock(tintBlock);
+        }
+    }
+
+    private static bool TryGetVisualBounds(Renderer[] renderers, out Bounds bounds)
+    {
+        bounds = default;
+        if (renderers == null || renderers.Length == 0)
+            return false;
+
+        bounds = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+            bounds.Encapsulate(renderers[i].bounds);
+        return true;
+    }
+
+    private static void AlignBottomToGround(GameObject book, float surfaceY)
+    {
+        if (TryGetVisualBounds(book.GetComponentsInChildren<Renderer>(true), out Bounds bounds))
+            book.transform.position += Vector3.up * (surfaceY - bounds.min.y);
+    }
+
+    private static void EnsureSolidCollider(GameObject book)
+    {
+        foreach (Collider collider in book.GetComponentsInChildren<Collider>(true))
+        {
+            if (collider.enabled && !collider.isTrigger)
+                return;
+        }
+
+        if (!TryGetVisualBounds(book.GetComponentsInChildren<Renderer>(true), out Bounds bounds))
+            return;
+
+        BoxCollider box = book.AddComponent<BoxCollider>();
+        box.center = book.transform.InverseTransformPoint(bounds.center);
+        Vector3 scale = book.transform.lossyScale;
+        box.size = new Vector3(bounds.size.x / Mathf.Max(0.001f, Mathf.Abs(scale.x)),
+            bounds.size.y / Mathf.Max(0.001f, Mathf.Abs(scale.y)),
+            bounds.size.z / Mathf.Max(0.001f, Mathf.Abs(scale.z)));
+    }
+
+    private static GameObject CreateFallbackBook()
+    {
+        GameObject root = new GameObject("Fallback Book Platform");
+        BoxCollider platform = root.AddComponent<BoxCollider>();
+        platform.center = new Vector3(0f, 0.2f, 0f);
+        platform.size = new Vector3(2.5f, 0.4f, 1.8f);
+
+        AddBookPart(root.transform, "Cover", new Vector3(0f, 0.15f, 0f),
+            new Vector3(2.5f, 0.3f, 1.8f), new Color(0.18f, 0.3f, 0.65f));
+        AddBookPart(root.transform, "Pages", new Vector3(0f, 0.35f, 0f),
+            new Vector3(2.3f, 0.1f, 1.6f), new Color(0.9f, 0.86f, 0.7f));
+
+        root.SetActive(false);
+        return root;
+    }
+
+    private static void AddBookPart(Transform parent, string partName, Vector3 position,
+        Vector3 size, Color color)
+    {
+        GameObject part = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        part.name = partName;
+        part.transform.SetParent(parent, false);
+        part.transform.localPosition = position;
+        part.transform.localScale = size;
+        part.GetComponent<Collider>().enabled = false;
+
+        Renderer renderer = part.GetComponent<Renderer>();
+        MaterialPropertyBlock block = new MaterialPropertyBlock();
+        block.SetColor("_BaseColor", color);
+        block.SetColor("_Color", color);
+        renderer.SetPropertyBlock(block);
+    }
+}

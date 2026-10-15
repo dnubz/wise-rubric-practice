@@ -1,0 +1,199 @@
+using System;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.UI;
+using UnityEngine.UI;
+
+/// <summary>One shared screen-space Yes/No prompt for both challenge NPCs.</summary>
+public sealed class NPCChallengePrompt : MonoBehaviour
+{
+    static NPCChallengePrompt instance;
+    static int closedFrame = -1;
+    public static bool IsOpen => instance != null && instance.owner != null && instance.gameObject.activeInHierarchy;
+    public static bool BlocksGameplayInput => IsOpen || closedFrame == Time.frameCount || SceneTravelFade.IsTransitioning || BerdlyBattleController.BlocksGameplayInput || PinkRhythmController.BlocksGameplayInput || DungeonSession.BlocksGameplayInput || CheatConsole.BlocksGameplayInput || ResourceSellUI.BlocksGameplayInput || ShopUI.BlocksGameplayInput || BattleSession.BlocksGameplayInput || BattleBossDialogue.IsOpen;
+    public string Title => title != null ? title.Text : "";
+    public int SelectedChoice => selectedChoice;
+
+    MinigameNPC owner;
+    Action accept;
+    Action decline;
+    ChallengePromptPixelText title;
+    ChallengePromptPixelText yesText;
+    ChallengePromptPixelText noText;
+    RectTransform panel;
+    RectTransform pointer;
+    int selectedChoice;
+    int openedFrame;
+    bool waitingForDialogueKeyRelease;
+
+    public static NPCChallengePrompt GetOrCreate()
+    {
+        if (instance != null) return instance;
+        GameObject root = new GameObject("NPC Challenge Prompt", typeof(RectTransform), typeof(Canvas),
+            typeof(CanvasScaler), typeof(GraphicRaycaster));
+        return root.AddComponent<NPCChallengePrompt>();
+    }
+
+    void Awake()
+    {
+        if (instance != null && instance != this) { Destroy(gameObject); return; }
+        instance = this;
+        BuildUI();
+        gameObject.SetActive(false);
+    }
+
+    public void Open(MinigameNPC npc, string challenger, Action onAccept, Action onDecline)
+    {
+        if (npc == null) return;
+        if (owner != null && owner != npc) owner.CancelChallengePrompt();
+        EnsureEventSystem();
+        EventSystem.current.SetSelectedGameObject(null);
+        owner = npc;
+        accept = onAccept;
+        decline = onDecline;
+        title.Text = "ACCEPT " + challenger.ToUpperInvariant() + " CHALLENGE?";
+        openedFrame = Time.frameCount;
+        waitingForDialogueKeyRelease = Keyboard.current != null && Keyboard.current.fKey.isPressed;
+        gameObject.SetActive(true);
+        SelectChoice(0);
+    }
+
+    public void Close(MinigameNPC npc)
+    {
+        if (owner != npc) return;
+        owner = null;
+        accept = null;
+        decline = null;
+        closedFrame = Time.frameCount;
+        gameObject.SetActive(false);
+    }
+
+    void OnDisable()
+    {
+        // Also release NPC state when a scene or a custom prompt is disabled.
+        MinigameNPC previousOwner = owner;
+        owner = null;
+        accept = null;
+        decline = null;
+        if (previousOwner != null) previousOwner.CancelChallengePrompt();
+    }
+
+    void OnDestroy()
+    {
+        if (instance == this) instance = null;
+    }
+
+    void Update()
+    {
+        if (CheatConsole.BlocksGameplayInput) return;
+        if (owner == null) { gameObject.SetActive(false); return; }
+        // An F press/hold which finishes dialogue must not also accept the challenge.
+        if (Time.frameCount <= openedFrame) return;
+        Keyboard keyboard = Keyboard.current;
+        if (keyboard == null) return;
+        if (!keyboard.fKey.isPressed) waitingForDialogueKeyRelease = false;
+        if (keyboard.leftArrowKey.wasPressedThisFrame || keyboard.aKey.wasPressedThisFrame) SelectChoice(0);
+        if (keyboard.rightArrowKey.wasPressedThisFrame || keyboard.dKey.wasPressedThisFrame) SelectChoice(1);
+        if (keyboard.escapeKey.wasPressedThisFrame) { Choose(false); return; }
+        if (keyboard.enterKey.wasPressedThisFrame || keyboard.spaceKey.wasPressedThisFrame ||
+            (!waitingForDialogueKeyRelease && keyboard.fKey.wasPressedThisFrame))
+            Choose(selectedChoice == 0);
+    }
+
+    public void SelectChoice(int choice)
+    {
+        selectedChoice = Mathf.Clamp(choice, 0, 1);
+        pointer.anchoredPosition = new Vector2(-422f + selectedChoice * 436f, -62f);
+        yesText.color = selectedChoice == 0 ? Color.white : new Color(0.66f, 0.67f, 0.73f);
+        noText.color = selectedChoice == 1 ? Color.white : new Color(0.66f, 0.67f, 0.73f);
+    }
+
+    public void Choose(bool yes)
+    {
+        if (owner == null || Time.frameCount <= openedFrame) return;
+        Action callback = yes ? accept : decline;
+        MinigameNPC previousOwner = owner;
+        Close(previousOwner);
+        callback?.Invoke();
+    }
+
+    void BuildUI()
+    {
+        Canvas canvas = GetComponent<Canvas>();
+        if (canvas == null) canvas = gameObject.AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        canvas.sortingOrder = 250;
+        CanvasScaler scaler = GetComponent<CanvasScaler>();
+        if (scaler == null) scaler = gameObject.AddComponent<CanvasScaler>();
+        scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+        scaler.referenceResolution = new Vector2(1920f, 1080f);
+        scaler.matchWidthOrHeight = 0.5f;
+        if (GetComponent<GraphicRaycaster>() == null) gameObject.AddComponent<GraphicRaycaster>();
+
+        RectTransform blocker = MakeRect("Input Blocker", transform, Vector2.zero, Vector2.zero);
+        blocker.anchorMin = Vector2.zero; blocker.anchorMax = Vector2.one; blocker.sizeDelta = Vector2.zero;
+        Image blockerImage = blocker.gameObject.AddComponent<Image>();
+        blockerImage.color = Color.clear;
+
+        panel = MakeRect("Challenge Panel", transform, new Vector2(0f, 60f), new Vector2(960f, 300f));
+        panel.anchorMin = panel.anchorMax = new Vector2(0.5f, 0f);
+        panel.pivot = new Vector2(0.5f, 0f);
+        ChallengePromptGraphic background = panel.gameObject.AddComponent<ChallengePromptGraphic>();
+        background.color = new Color(0.055f, 0.067f, 0.11f, 0.94f);
+
+        title = MakeText("Challenge Title", panel, new Vector2(0f, 83f), new Vector2(880f, 70f), "ACCEPT BERDLY CHALLENGE?", 5f);
+        yesText = MakeChoice("Yes", new Vector2(-218f, -62f), true);
+        noText = MakeChoice("No", new Vector2(218f, -62f), false);
+        pointer = MakeRect("Selection Pointer", panel, new Vector2(-422f, -62f), new Vector2(42f, 30f));
+        ChallengePromptGraphic hand = pointer.gameObject.AddComponent<ChallengePromptGraphic>();
+        hand.handPointer = true;
+        hand.color = Color.white;
+        hand.raycastTarget = false;
+    }
+
+    ChallengePromptPixelText MakeChoice(string name, Vector2 position, bool yes)
+    {
+        RectTransform rect = MakeRect(name + " Button", panel, position, new Vector2(320f, 104f));
+        ChallengePromptGraphic graphic = rect.gameObject.AddComponent<ChallengePromptGraphic>();
+        graphic.color = new Color(0.145f, 0.15f, 0.235f, 1f);
+        graphic.borderWidth = 0f;
+        graphic.cornerRadius = 28f;
+        Button button = rect.gameObject.AddComponent<Button>();
+        button.targetGraphic = graphic;
+        button.navigation = new Navigation { mode = Navigation.Mode.None };
+        button.onClick.AddListener(() => Choose(yes));
+        EventTrigger hover = rect.gameObject.AddComponent<EventTrigger>();
+        EventTrigger.Entry entry = new EventTrigger.Entry { eventID = EventTriggerType.PointerEnter };
+        entry.callback.AddListener(_ => SelectChoice(yes ? 0 : 1));
+        hover.triggers.Add(entry);
+        return MakeText(name + " Label", rect, Vector2.zero, new Vector2(300f, 85f), name, 6f);
+    }
+
+    static RectTransform MakeRect(string name, Transform parent, Vector2 position, Vector2 size)
+    {
+        RectTransform rect = new GameObject(name, typeof(RectTransform)).GetComponent<RectTransform>();
+        rect.SetParent(parent, false);
+        rect.anchorMin = rect.anchorMax = new Vector2(0.5f, 0.5f);
+        rect.sizeDelta = size;
+        rect.anchoredPosition = position;
+        return rect;
+    }
+
+    static ChallengePromptPixelText MakeText(string name, Transform parent, Vector2 position, Vector2 size, string text, float pixels)
+    {
+        ChallengePromptPixelText label = MakeRect(name, parent, position, size).gameObject.AddComponent<ChallengePromptPixelText>();
+        label.Text = text;
+        label.pixelSize = pixels;
+        label.color = Color.white;
+        label.raycastTarget = false;
+        return label;
+    }
+
+    static void EnsureEventSystem()
+    {
+        if (EventSystem.current != null) return;
+        GameObject events = new GameObject("Challenge EventSystem", typeof(EventSystem));
+        events.AddComponent<InputSystemUIInputModule>().AssignDefaultActions();
+    }
+}

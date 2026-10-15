@@ -1,0 +1,144 @@
+using System.Collections;
+using System.Collections.Generic;
+using TMPro;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+// All Images are authored scene templates; only projectile copies are pooled during the attack.
+public sealed class BattleBossGame : MonoBehaviour
+{
+    public const float ProjectileSpeedMultiplier = 1.5f;
+    public GameObject panel;
+    public RectTransform box, heart, jevil;
+    public Image spadeTemplate, heartTemplate, scytheTemplate;
+    public TMP_Text caption;
+    sealed class Bullet
+    {
+        public Image image; public Vector2 velocity; public float age, angle, radius; public int type; public Vector2 point;
+    }
+    readonly List<Bullet> bullets = new List<Bullet>();
+    readonly Dictionary<Image, Stack<Image>> pool = new Dictionary<Image, Stack<Image>>();
+    float invincible;
+    public IEnumerator Play(BattleUnit boss, BattleUnit victim, int pattern, int enemies)
+    {
+        panel.SetActive(true); heart.anchoredPosition = Vector2.zero; invincible = 0;
+        caption.text = victim.DisplayName + " · WASD to dodge";
+        spadeTemplate.gameObject.SetActive(false); heartTemplate.gameObject.SetActive(false); scytheTemplate.gameObject.SetActive(false);
+        float elapsed = 0, next = 0; int wave = 0; float halfX = box.rect.width * .5f, halfY = box.rect.height * .5f;
+        while (elapsed < 10 && victim.Alive)
+        {
+            if (BattleSession.MenuOpen) { yield return null; continue; }
+            float delta = Time.deltaTime; elapsed += delta; invincible = Mathf.Max(0, invincible - delta);
+            float projectileDelta = delta * ProjectileSpeedMultiplier;
+            var keys = CheatConsole.BlocksGameplayInput ? null : Keyboard.current; Vector2 move = keys != null ? new Vector2((keys.dKey.isPressed ? 1 : 0) - (keys.aKey.isPressed ? 1 : 0), (keys.wKey.isPressed ? 1 : 0) - (keys.sKey.isPressed ? 1 : 0)) : Vector2.zero;
+            Vector2 position = heart.anchoredPosition + Vector2.ClampMagnitude(move, 1) * 240 * delta;
+            heart.anchoredPosition = new Vector2(Mathf.Clamp(position.x, -halfX + 14, halfX - 14), Mathf.Clamp(position.y, -halfY + 14, halfY - 14));
+            heart.GetComponent<Image>().enabled = invincible <= 0 || Mathf.FloorToInt(invincible * 12) % 2 == 0;
+            // Pattern 3 owns one formation for the entire turn, rather than repeated waves.
+            if (elapsed >= next && (pattern != 2 || wave == 0))
+            {
+                wave++; next = elapsed + (pattern == 4 ? .18f : pattern == 0 ? 1.1f : 1.7f);
+                float angle = Random.Range(0, Mathf.PI * 2); Vector2 directionOut = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
+                float outsideDistance = Mathf.Min((halfX + 55) / Mathf.Max(.001f, Mathf.Abs(directionOut.x)), (halfY + 55) / Mathf.Max(.001f, Mathf.Abs(directionOut.y)));
+                Vector2 outside = directionOut * outsideDistance;
+                if (pattern == 0)
+                {
+                    jevil.anchoredPosition = outside; Vector2 direction = (heart.anchoredPosition - outside).normalized;
+                    for (int i = -2; i <= 2; i++) Add(spadeTemplate, outside, Rotate(direction, i * 15) * 190, 0);
+                }
+                else if (pattern == 1) { var bullet = Add(heartTemplate, outside, (heart.anchoredPosition - outside).normalized * 130, 1); bullet.point = heart.anchoredPosition; bullet.angle = wave % 2 == 0 ? 1 : -1; }
+                else if (pattern == 2)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        var bullet = Add(scytheTemplate, Vector2.zero, Vector2.zero, 2);
+                        bullet.angle = Mathf.PI * .25f + i * Mathf.PI * .5f;
+                        bullet.radius = Mathf.Min(halfX, halfY);
+                        bullet.image.rectTransform.sizeDelta = Vector2.one * 120;
+                        bullet.image.preserveAspect = true;
+                        MoveScythe(bullet);
+                    }
+                }
+                else if (pattern == 3) for (int i = 0; i < 10; i++) { int order = wave % 2 == 0 ? 9 - i : i; float a = order * Mathf.PI / 5; var bullet = Add(spadeTemplate, new Vector2(Mathf.Cos(a) * (halfX + 20), Mathf.Sin(a) * (halfY + 20)), Vector2.zero, 3); bullet.age = -i * .12f; }
+                else Add(spadeTemplate, new Vector2(Random.Range(-halfX, halfX), -halfY - 30), Vector2.up * 230, 0);
+            }
+            for (int i = bullets.Count - 1; i >= 0; i--)
+            {
+                var b = bullets[i]; var rect = b.image.rectTransform; b.age += delta;
+                if (b.type == 1)
+                {
+                    if (b.age < .65f)
+                    {
+                        b.point = heart.anchoredPosition;
+                        Vector2 direction = b.point - rect.anchoredPosition;
+                        if (direction.sqrMagnitude > .01f) b.velocity = direction.normalized * 130;
+                    }
+                    rect.anchoredPosition = Vector2.MoveTowards(rect.anchoredPosition, b.point, 350 * projectileDelta);
+                    if (b.age >= 1)
+                    {
+                        Vector2 centre = rect.anchoredPosition; float sign = b.angle;
+                        // Keep the tracked direction even if the bomb has already reached its target.
+                        for (int j = 0; j < 4; j++) { var child = Add(heartTemplate, centre, b.velocity, 4); child.point = centre; child.angle = j * Mathf.PI / 2; child.radius = sign; }
+                        Recycle(i); continue;
+                    }
+                }
+                else if (b.type == 2) MoveScythe(b);
+                else if (b.type == 3) { if (b.age >= 0) { if (b.velocity == Vector2.zero) { b.velocity = -rect.anchoredPosition.normalized * 220; rect.localRotation = Quaternion.Euler(0, 0, Mathf.Atan2(b.velocity.y, b.velocity.x) * Mathf.Rad2Deg - 90); } rect.anchoredPosition += b.velocity * projectileDelta; } }
+                else if (b.type == 4) { b.point += b.velocity * projectileDelta; b.angle += 4 * b.radius * projectileDelta; rect.anchoredPosition = b.point + new Vector2(Mathf.Cos(b.angle), Mathf.Sin(b.angle)) * 30; rect.Rotate(0, 0, 140 * projectileDelta * b.radius); }
+                else rect.anchoredPosition += b.velocity * projectileDelta;
+                bool hit = b.type == 2 ? ScytheHits(rect, heart.anchoredPosition) : Vector2.Distance(rect.anchoredPosition, heart.anchoredPosition) < 24;
+                if (invincible <= 0 && hit)
+                { victim.Damage(boss.Attack, 1 + enemies / 100f); invincible = 1.5f; }
+                if (b.type != 2 && (b.age > 5 || Mathf.Abs(rect.anchoredPosition.x) > halfX + 240 || Mathf.Abs(rect.anchoredPosition.y) > halfY + 240)) Recycle(i);
+            }
+            yield return null;
+        }
+        while (bullets.Count > 0) Recycle(bullets.Count - 1); heart.GetComponent<Image>().enabled = true; panel.SetActive(false);
+    }
+    static void MoveScythe(Bullet bullet)
+    {
+        // Each inner circle has a separate centre. The outer rotation carries both
+        // that centre and its orbiting scythe, while the blade also spins on its own.
+        float motionTime = bullet.age * ProjectileSpeedMultiplier;
+        float outer = motionTime * .45f;
+        float inner = motionTime * 1.9f;
+        Vector2 centre = Direction(bullet.angle) * (bullet.radius * .65f);
+        Vector2 offset = Direction(bullet.angle + inner) * (bullet.radius * .5f);
+        var rect = bullet.image.rectTransform;
+        rect.anchoredPosition = Rotate(centre + offset, outer * Mathf.Rad2Deg);
+        rect.localRotation = Quaternion.Euler(0, 0, (bullet.angle + outer) * Mathf.Rad2Deg + motionTime * 210);
+    }
+    static Vector2 Direction(float radians) => new Vector2(Mathf.Cos(radians), Mathf.Sin(radians));
+    static bool ScytheHits(RectTransform rect, Vector2 heartPosition)
+    {
+        Vector2 point = Rotate(heartPosition - rect.anchoredPosition, -rect.localEulerAngles.z) / rect.rect.width;
+        // Follow the imported blade and handle, keeping the transparent corners safe.
+        float padding = .065f + 10 / rect.rect.width;
+        return NearSegment(point, new Vector2(-.08f, -.4f), new Vector2(.1f, .28f), padding)
+            || NearSegment(point, new Vector2(-.43f, .16f), new Vector2(-.18f, .4f), padding)
+            || NearSegment(point, new Vector2(-.18f, .4f), new Vector2(.03f, .43f), padding)
+            || NearSegment(point, new Vector2(.03f, .43f), new Vector2(.39f, .4f), padding);
+    }
+    static bool NearSegment(Vector2 point, Vector2 start, Vector2 end, float radius)
+    {
+        Vector2 segment = end - start;
+        float t = Mathf.Clamp01(Vector2.Dot(point - start, segment) / segment.sqrMagnitude);
+        return (point - start - segment * t).sqrMagnitude <= radius * radius;
+    }
+    Bullet Add(Image template, Vector2 position, Vector2 velocity, int type)
+    {
+        if (!pool.ContainsKey(template)) pool[template] = new Stack<Image>();
+        var image = pool[template].Count > 0 ? pool[template].Pop() : Instantiate(template, box);
+        image.gameObject.name = template.name; image.gameObject.SetActive(true); image.rectTransform.anchoredPosition = position;
+        image.rectTransform.localRotation = velocity == Vector2.zero ? Quaternion.identity : Quaternion.Euler(0, 0, Mathf.Atan2(velocity.y, velocity.x) * Mathf.Rad2Deg - 90);
+        var bullet = new Bullet { image = image, velocity = velocity, type = type }; bullets.Add(bullet); return bullet;
+    }
+    void Recycle(int index)
+    {
+        var image = bullets[index].image; image.gameObject.SetActive(false);
+        Image template = image.name == spadeTemplate.name ? spadeTemplate : image.name == scytheTemplate.name ? scytheTemplate : heartTemplate;
+        pool[template].Push(image); bullets.RemoveAt(index);
+    }
+    static Vector2 Rotate(Vector2 v, float degrees) { float rad = degrees * Mathf.Deg2Rad; return new Vector2(v.x * Mathf.Cos(rad) - v.y * Mathf.Sin(rad), v.x * Mathf.Sin(rad) + v.y * Mathf.Cos(rad)); }
+}

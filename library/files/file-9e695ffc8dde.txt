@@ -1,0 +1,20 @@
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Controls the saved lock Canvas. Does not create any UI objects.</summary>
+public sealed class DungeonDoorUI : MonoBehaviour
+{
+    [SerializeField] GameObject lockIcon;
+    [SerializeField] Image[] colouredParts;
+
+    public void SetLock(DungeonKeyKind key, bool locked)
+    {
+        lockIcon.SetActive(locked && key != DungeonKeyKind.None);
+        foreach (Image part in colouredParts) part.color = DungeonKeyHud.KeyColour(key);
+    }
+
+    void LateUpdate()
+    {
+        if (lockIcon.activeSelf && Camera.main != null) transform.rotation = Camera.main.transform.rotation;
+    }
+}

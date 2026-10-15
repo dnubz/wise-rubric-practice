@@ -1,0 +1,26 @@
+using UnityEngine;
+
+[System.Serializable]
+public sealed class SaveGameSettings
+{
+    public float music = 1, sfx = 1;
+    public int fps = 60, width = 1920, height = 1080;
+    public bool fullscreen;
+
+    public static SaveGameSettings Capture() => new SaveGameSettings {
+        music = PlayerPrefs.GetFloat("MusicVolume", 1), sfx = PlayerPrefs.GetFloat("SFXVolume", 1),
+        fps = PlayerPrefs.GetInt("TargetFPS", 60), width = PlayerPrefs.GetInt("ScreenWidth", 1920),
+        height = PlayerPrefs.GetInt("ScreenHeight", 1080), fullscreen = PlayerPrefs.GetInt("Fullscreen", 0) == 1 };
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    static void ApplyPreferences() => Capture().Apply();
+
+    public void Apply()
+    {
+        GameAudio.SetMusic(music); GameAudio.SetSFX(sfx);
+        PlayerPrefs.SetInt("TargetFPS", fps); PlayerPrefs.SetInt("ScreenWidth", width);
+        PlayerPrefs.SetInt("ScreenHeight", height); PlayerPrefs.SetInt("Fullscreen", fullscreen ? 1 : 0);
+        PlayerPrefs.Save(); QualitySettings.vSyncCount = 0; Application.targetFrameRate = fps;
+        Screen.SetResolution(width, height, fullscreen ? FullScreenMode.FullScreenWindow : FullScreenMode.Windowed);
+    }
+}

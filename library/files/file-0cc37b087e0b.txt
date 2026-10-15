@@ -1,0 +1,93 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+// Exercises the generated doorway and its real imported sprite in GameScene.
+[InitializeOnLoad]
+public static class DungeonEntrancePromptChecks
+{
+    const string Folder = "Temp/DungeonEntrancePrompt";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double next;
+    static DungeonEntrancePromptChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying) return;
+            try { if (!routine.MoveNext()) Finish("PASS: generated entrance uses the saved F sprite in a screen overlay; readable size and doorway tracking at both zoom distances, proximity hide/show and chunk-destruction cleanup verified."); }
+            catch (Exception error) { Finish("FAIL: " + error); Debug.LogException(error); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        EditorApplication.isPaused = false;
+        if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3 || WFCWorldManager.Instance == null) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result)
+    {
+        File.WriteAllText(Folder + "/result.txt", result);
+        routine = null; EditorApplication.isPlaying = false;
+    }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static WorldInteractionPrompt Prompt(DungeonEntrance entrance) =>
+        (WorldInteractionPrompt)typeof(DungeonEntrance).GetField("spritePrompt", Private).GetValue(entrance);
+    static void Refresh(DungeonEntrance entrance) => typeof(DungeonEntrance).GetMethod("CheckPlayerDistance", Private).Invoke(entrance, null);
+    static IEnumerator Run()
+    {
+        WFCWorldManager.Instance.enabled = false;
+        foreach (var rig in Object.FindObjectsByType<CameraController>()) rig.enabled = false;
+        var entrance = Object.FindObjectsByType<DungeonEntrance>().FirstOrDefault(e => e.TargetSceneName == "DungeonScene");
+        Require(entrance != null, "Generated dungeon entrance missing.");
+        var prompt = Prompt(entrance);
+        Require(prompt != null && prompt.Bubble.sprite != null, "F sprite prompt missing.");
+        Require(AssetDatabase.GetAssetPath(prompt.Bubble.sprite) == "Assets/UI/Interaction/InteractF.png", "Prompt must use the imported F sprite.");
+        var canvas = prompt.GetComponent<Canvas>();
+        Require(canvas.renderMode == RenderMode.ScreenSpaceOverlay && prompt.transform.parent == null, "Walls/building scale can still obscure the prompt.");
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = player.GetComponent<CharacterMovement>(); movement.enabled = false;
+        Vector3 nearby = entrance.transform.position - entrance.transform.forward * 1.5f;
+        movement.Teleport(nearby, player.rotation);
+        var camera = Camera.main;
+        Vector3 focus = entrance.transform.position + Vector3.up * 1.8f;
+        camera.transform.position = focus + entrance.transform.TransformDirection(new Vector3(8, 12, -10));
+        camera.transform.LookAt(focus);
+        Refresh(entrance); yield return null;
+        Require(prompt.gameObject.activeSelf && prompt.Bubble.isActiveAndEnabled, "Nearby doorway must display F.");
+        Canvas.ForceUpdateCanvases(); prompt.RefreshPosition();
+        var corners = new Vector3[4]; prompt.Bubble.rectTransform.GetWorldCorners(corners);
+        float width = Vector3.Distance(corners[0], corners[3]);
+        Require(width >= 80 && width <= 84, "Doorway F bubble is too small: " + width);
+        Require(prompt.Bubble.rectTransform.position.x > 0 && prompt.Bubble.rectTransform.position.x < Screen.width &&
+            prompt.Bubble.rectTransform.position.y > 0 && prompt.Bubble.rectTransform.position.y < Screen.height, "Doorway bubble lies off screen.");
+        Vector3 point = entrance.transform.position + (Vector3)typeof(DungeonEntrance).GetField("promptOffset", Private).GetValue(entrance);
+        Vector3 expected = camera.WorldToScreenPoint(point);
+        Require(Vector2.Distance(prompt.Bubble.rectTransform.position, expected) < 1f, "Bubble does not track the doorway.");
+        camera.transform.position -= camera.transform.forward * 12;
+        prompt.RefreshPosition(); Canvas.ForceUpdateCanvases();
+        prompt.Bubble.rectTransform.GetWorldCorners(corners);
+        Require(Mathf.Abs(Vector3.Distance(corners[0], corners[3]) - width) < .1f, "Zoom shrinks the interaction sprite.");
+        movement.Teleport(nearby + Vector3.right * 20, player.rotation); Refresh(entrance);
+        Require(!prompt.gameObject.activeSelf, "Prompt remains after leaving range.");
+        movement.Teleport(nearby, player.rotation); Refresh(entrance);
+        Require(prompt.gameObject.activeSelf, "Prompt fails to reappear on returning.");
+        // Restore the close view and capture the actual Game view, including overlay UI.
+        camera.transform.position += camera.transform.forward * 12; prompt.RefreshPosition();
+        yield return null;
+        ScreenCapture.CaptureScreenshot(Folder + "/entrance-prompt-preview.png");
+        yield return null; yield return null;
+        Object.Destroy(entrance.gameObject);
+        yield return null; yield return null;
+        Require(prompt == null, "Entrance overlay leaked after its owning chunk object was destroyed.");
+    }
+}

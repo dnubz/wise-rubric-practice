@@ -1,0 +1,58 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>Places one rock summit and loot chest at the center of each pool.</summary>
+internal sealed class PoolBoatContent
+{
+    readonly GameObject chestPrefab;
+    readonly HashSet<Vector2Int> openedChests = new HashSet<Vector2Int>();
+    public Vector2Int[] GetOpenedChests()
+    {
+        var result = new Vector2Int[openedChests.Count]; openedChests.CopyTo(result);
+        System.Array.Sort(result, (a, b) => a.x != b.x ? a.x.CompareTo(b.x) : a.y.CompareTo(b.y));
+        return result;
+    }
+    public void RestoreOpenedChests(Vector2Int[] chunks) { if (chunks != null) foreach (var chunk in chunks) openedChests.Add(chunk); }
+
+    public PoolBoatContent(GameObject chest) => chestPrefab = chest;
+
+    public void Create(Vector2Int chunk, int seed, Vector4 pool, float waterHeight, Transform parent)
+    {
+        if (chestPrefab == null)
+        {
+            Debug.LogWarning("Assign the pool chest prefab on WFCWorldManager.");
+            return;
+        }
+
+        // The midpoint is the center of tile (3,3) in a 5x5 pool.
+        Vector3 centre = new Vector3((pool.x + pool.z) * 0.5f, waterHeight, (pool.y + pool.w) * 0.5f);
+        var cliffPrefab = Resources.Load<PoolGlideCliff>("Interaction/PoolGlideCliff");
+        if (cliffPrefab == null) { Debug.LogError("Missing saved pool cliff prefab."); return; }
+        var cliff = Object.Instantiate(cliffPrefab, centre, Quaternion.identity, parent);
+        cliff.name = "Druid Glide Cliff " + chunk;
+        cliff.Place(new System.Random(WorldRandom.Seed(seed, chunk.x, chunk.y, 0x434C4946)));
+        Physics.SyncTransforms();
+
+        Vector3 summit = new Vector3(centre.x, cliff.TopHeight, centre.z);
+        GameObject chestObject = Object.Instantiate(chestPrefab, summit,
+            cliff.transform.rotation * chestPrefab.transform.rotation, cliff.transform);
+        chestObject.name = "Pool Chest " + chunk;
+        // Centre the visible chest, even if its prefab pivot is offset.
+        if (ChunkSpawnUtility.TryGetVisualBounds(chestObject, out Bounds chestBounds))
+            chestObject.transform.position += new Vector3(centre.x - chestBounds.center.x,
+                summit.y + .02f - chestBounds.min.y, centre.z - chestBounds.center.z);
+
+        Chest chest = chestObject.GetComponent<Chest>();
+        if (chest == null)
+        {
+            Debug.LogError("The pool chest prefab must have a Chest component.", chestObject);
+            return;
+        }
+        chest.RequireDruidLanding(cliff);
+        chest.ConfigureLootSeed(WorldRandom.Seed(seed, chunk.x, chunk.y, 0x4C4F4F54));
+        if (openedChests.Contains(chunk)) chest.RestoreOpenedState();
+        chest.Opened += () => openedChests.Add(chunk);
+        Physics.SyncTransforms();
+    }
+
+}

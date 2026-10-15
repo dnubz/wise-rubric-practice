@@ -1,0 +1,150 @@
+using System;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
+using UnityEngine.SceneManagement;
+using UnityEngine.Rendering.Universal;
+using Object = UnityEngine.Object;
+
+/// <summary>Checks actual cameras, Q/E callbacks, view restoration and rotated minimap translations.</summary>
+[InitializeOnLoad]
+public static class DungeonCameraChecks
+{
+    const string Folder = "Temp/DungeonCamera";
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static DungeonCameraChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (File.Exists(Folder + "/apply.request"))
+        {
+            var camera = Object.FindAnyObjectByType<CameraController>();
+            if (camera == null) return;
+            var saved = new SerializedObject(camera);
+            saved.FindProperty("dungeonTilt").floatValue = 65;
+            saved.FindProperty("dungeonYaw").floatValue = 45;
+            saved.ApplyModifiedProperties();
+            File.Delete(Folder + "/apply.request");
+        }
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: scene camera setting and four 65-degree dungeon views, Q/E cycles without angle/position drift, camera aim/distance/zoom retained, original poses restored, screen-relative I/J/K/L translations at cardinal/diagonal/intermediate angles."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Validate Dungeon Camera")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        CameraController source = Object.FindAnyObjectByType<CameraController>();
+        Require(source != null, "Open GameScene to check its assigned camera views.");
+        float tilt = new SerializedObject(source).FindProperty("dungeonTilt").floatValue;
+        Require(Mathf.Abs(tilt - 65) < .01f, "The scene camera still has an older dungeon angle.");
+        var originalCameras = (Camera[])typeof(CameraController).GetField("cameras", Private).GetValue(source);
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var owned = new GameObject("DungeonCameraCheck"); SceneManager.MoveGameObjectToScene(owned, scene);
+        Keyboard keyboard = null; InputAction q = null, e = null;
+        try
+        {
+            var rig = owned.AddComponent<CameraController>();
+            Set(rig, "dungeonTilt", tilt);
+            var cameras = new Camera[originalCameras.Length];
+            var positions = new Vector3[cameras.Length]; var rotations = new Quaternion[cameras.Length];
+            var backgrounds = new Color[cameras.Length]; var clears = new CameraClearFlags[cameras.Length];
+            var postProcessing = new bool[cameras.Length];
+            for (int i = 0; i < cameras.Length; i++)
+            {
+                var child = new GameObject("Camera_" + i); child.transform.SetParent(owned.transform);
+                cameras[i] = child.AddComponent<Camera>(); cameras[i].fieldOfView = originalCameras[i].fieldOfView;
+                clears[i] = cameras[i].clearFlags = i % 2 == 0 ? CameraClearFlags.Skybox : CameraClearFlags.SolidColor;
+                backgrounds[i] = cameras[i].backgroundColor = new Color(.1f * i, .2f, .5f);
+                postProcessing[i] = cameras[i].GetUniversalAdditionalCameraData().renderPostProcessing = i % 2 == 0;
+                positions[i] = child.transform.localPosition = originalCameras[i].transform.localPosition;
+                rotations[i] = child.transform.localRotation = originalCameras[i].transform.localRotation;
+            }
+            Set(rig, "cameras", cameras); Invoke(rig, "Start"); rig.SetDungeonView(true);
+            var dungeonPositions = new Vector3[cameras.Length]; var dungeonRotations = new Quaternion[cameras.Length];
+            Vector3 focus = Vector3.up * 1.5f;
+            for (int i = 0; i < cameras.Length; i++)
+            {
+                dungeonPositions[i] = cameras[i].transform.localPosition; dungeonRotations[i] = cameras[i].transform.localRotation;
+                Require(cameras[i].clearFlags == CameraClearFlags.SolidColor && cameras[i].backgroundColor == Color.black &&
+                    cameras[i].GetUniversalAdditionalCameraData().renderPostProcessing, "Dungeon view is not black with post processing enabled.");
+                Require(Mathf.Abs(Mathf.DeltaAngle(cameras[i].transform.localEulerAngles.x, 65)) < .01f, "Dungeon tilt differs from 65 degrees.");
+                Require(Mathf.Abs(Vector3.Distance(positions[i], focus) - Vector3.Distance(dungeonPositions[i], focus)) < .01f, "View distance changed.");
+                Require(Vector3.Angle(focus - cameras[i].transform.position, cameras[i].transform.forward) < .01f,
+                    "Camera does not aim at the character.");
+                // Allow subpixel editor projection jitter as well as checking the exact aim above.
+                cameras[i].ResetWorldToCameraMatrix(); cameras[i].ResetProjectionMatrix();
+                Vector3 viewport = cameras[i].WorldToViewportPoint(focus);
+                Require(Mathf.Abs(viewport.x - .5f) < .002f && Mathf.Abs(viewport.y - .5f) < .002f,
+                    $"Camera {i} does not centre the character: viewport=({viewport.x:R}, {viewport.y:R}, {viewport.z:R}), position={cameras[i].transform.position}, local={dungeonPositions[i]}, rig={owned.transform.position}.");
+                Require(Mathf.Abs(cameras[i].fieldOfView - originalCameras[i].fieldOfView) < .001f, "Zoom changed.");
+            }
+            Require(Mathf.Abs(Mathf.DeltaAngle(cameras[0].transform.localEulerAngles.y, 45)) < .01f, "Initial view is not diagonal.");
+
+            keyboard = InputSystem.AddDevice<Keyboard>();
+            InputSystem.SetDeviceUsage(keyboard, "DungeonCameraCheck");
+            q = new InputAction("TestQ", InputActionType.Button, "<Keyboard>{DungeonCameraCheck}/q");
+            e = new InputAction("TestE", InputActionType.Button, "<Keyboard>{DungeonCameraCheck}/e");
+            q.performed += context => Invoke(rig, "ChangeCamera", context);
+            e.performed += context => Invoke(rig, "ChangeCamera", context);
+            q.Enable(); e.Enable();
+            for (int press = 0; press < 8; press++)
+            {
+                Key key = press < 4 ? Key.Q : Key.E;
+                InputSystem.QueueStateEvent(keyboard, new KeyboardState(key)); InputSystem.Update();
+                Set(rig, "transitionTimer", 1f); Invoke(rig, "LateUpdate");
+                int index = (int)typeof(CameraController).GetField("currentCamera", Private).GetValue(rig);
+                Require(Vector3.Distance(rig.ActiveCamera.transform.localPosition, dungeonPositions[index]) < .001f &&
+                    Quaternion.Angle(rig.ActiveCamera.transform.localRotation, dungeonRotations[index]) < .01f, "Q/E changed a canonical view.");
+                InputSystem.QueueStateEvent(keyboard, new KeyboardState()); InputSystem.Update();
+            }
+            rig.SetDungeonView(false);
+            for (int i = 0; i < cameras.Length; i++)
+            {
+                Require(Vector3.Distance(cameras[i].transform.localPosition, positions[i]) < .001f &&
+                    Quaternion.Angle(cameras[i].transform.localRotation, rotations[i]) < .01f, "Overworld view was not restored.");
+                Require(cameras[i].clearFlags == clears[i] && cameras[i].backgroundColor == backgrounds[i] &&
+                    cameras[i].GetUniversalAdditionalCameraData().renderPostProcessing == postProcessing[i],
+                    "Overworld background or post processing was not restored.");
+            }
+
+            var holder = new GameObject("MapPanCheck", typeof(RectTransform)); holder.transform.SetParent(owned.transform);
+            var map = holder.AddComponent<DungeonMinimap>();
+            var rotation = new GameObject("Rotation", typeof(RectTransform)); rotation.transform.SetParent(holder.transform, false);
+            var grid = new GameObject("RoomGrid", typeof(RectTransform)); grid.transform.SetParent(rotation.transform, false);
+            Set(map, "rotation", (RectTransform)rotation.transform); Set(map, "map", (RectTransform)grid.transform);
+            Set(map, "width", 100); Set(map, "height", 100);
+            foreach (float angle in new[] { 0f, 45f, 90f, 135f, 180f, 225f, 270f, 315f, 63f })
+                foreach (Vector2 direction in new[] { Vector2.up, Vector2.down, Vector2.left, Vector2.right })
+                {
+                    rotation.transform.localRotation = Quaternion.Euler(0, 0, angle);
+                    ((RectTransform)grid.transform).anchoredPosition = Vector2.zero;
+                    Vector3 before = grid.transform.position;
+                    Invoke(map, "PanInScreenDirections", direction * 10);
+                    Vector3 movement = holder.transform.InverseTransformVector(grid.transform.position - before);
+                    Require(Vector2.Distance(new Vector2(movement.x, movement.y), direction * 10) < .001f,
+                        "Minimap pan direction changes with camera heading.");
+                }
+        }
+        finally
+        {
+            q?.Dispose(); e?.Dispose();
+            if (keyboard != null) InputSystem.RemoveDevice(keyboard);
+            Object.DestroyImmediate(owned);
+            SceneManager.SetActiveScene(original); EditorSceneManager.CloseScene(scene, true);
+        }
+    }
+    static void Set(object target, string field, object value) => target.GetType().GetField(field, Private).SetValue(target, value);
+    static void Invoke(object target, string method, params object[] values) => target.GetType().GetMethod(method, Private).Invoke(target, values);
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

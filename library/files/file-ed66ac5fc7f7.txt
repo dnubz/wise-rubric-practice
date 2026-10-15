@@ -1,0 +1,20 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d33af0a0370258d4aa0995651179053d, type: 3}
+  m_Name: HealthPotionDX
+  m_EditorClassIdentifier: Assembly-CSharp::Consumable
+  itemName: Health Potion DX
+  icon: {fileID: 21300000, guid: 58e88e4374c446c4496ec5bd031d9cd8, type: 3}
+  description: Heals for 55 Health.
+  healAmount: 55
+  manaAmount: 0
+  cost: 500

@@ -1,0 +1,171 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+/// <summary>Checks timing, the real humanoid swing, cancellation, collision and duplicate-hit prevention.</summary>
+[InitializeOnLoad]
+public static class DungeonBreakingChecks
+{
+    const string Folder = "Temp/DungeonBreaking";
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static DungeonBreakingChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: existing humanoid melee clip animates WiSe, faces target, keeps prop solid through windup, breaks at impact, creates fragments and exactly one coin, rejects repeated F/wrong character/out-of-range hits, cancellation leaves prop intact and retryable, recovery restores movement."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Validate Dungeon Breaking")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings.breakingEffect != null && settings.breakingSwingSound != null && settings.breakingImpactSound != null,
+            "Run dungeon breaking setup first.");
+        WiSe source = Object.FindObjectsByType<WiSe>(FindObjectsInactive.Include, FindObjectsSortMode.None)
+            .First(c => c.GetComponentInParent<CharacterMovement>(true) != null);
+        var sourceMovement = source.GetComponentInParent<CharacterMovement>(true);
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var owned = new GameObject("BreakingChecks"); SceneManager.MoveGameObjectToScene(owned, scene);
+        FieldInfo activePlayer = typeof(CharacterSwitchManager).GetField("<CurrentCharacterTransform>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
+        object savedPlayer = activePlayer.GetValue(null);
+        RenderTexture target = null;
+        try
+        {
+            var generator = owned.AddComponent<DungeonGenerator>(); Set(generator, "settings", settings);
+            Set(generator, "<Exploring>k__BackingField", true); Set(generator, "<CurrentRoom>k__BackingField", 0);
+            var room = new GameObject("Room"); room.transform.SetParent(owned.transform);
+            ((List<GameObject>)Get(generator, "roomRoots")).Add(room);
+            ((List<List<GameObject>>)Get(generator, "roomCoins")).Add(new List<GameObject>());
+            var player = Object.Instantiate(sourceMovement.gameObject, owned.transform); player.SetActive(true);
+            player.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            var movement = player.GetComponent<CharacterMovement>(); Invoke(movement, "Awake");
+            activePlayer.SetValue(null, player.transform);
+            var wise = player.GetComponentInChildren<WiSe>();
+            var animator = (Animator)Get(movement, "animator");
+            animator.enabled = true; animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+            animator.applyRootMotion = false; animator.Rebind(); animator.Update(0);
+            Require(animator.isHuman && animator.HasState(0, Animator.StringToHash("Base Layer.BreakDecoration")), "WiSe's real avatar/controller cannot play the swing.");
+            var samples = new System.Text.StringBuilder();
+            foreach (float time in new[] { 0f, .16f, .32f, .4f, .48f, .56f, .64f })
+            {
+                animator.Play("Base Layer.BreakDecoration", 0, time * 1.2f / .866667f); animator.Update(0);
+                samples.AppendLine($"t={time:F2}: hand={animator.GetBoneTransform(HumanBodyBones.RightHand).position}");
+            }
+            File.WriteAllText(Folder + "/swing-samples.txt", samples.ToString());
+            animator.Play("Base Layer.Idle", 0, 0); animator.Update(0);
+
+            var propObject = Object.Instantiate(settings.breakableDecorations[0], room.transform);
+            var propRenderer = propObject.GetComponentInChildren<Renderer>();
+            propObject.transform.localScale *= 1.8f / Mathf.Max(propRenderer.bounds.size.x, propRenderer.bounds.size.z);
+            propObject.transform.position = new Vector3(0, 0, 2);
+            var blocker = propObject.AddComponent<BoxCollider>();
+            var prop = propObject.AddComponent<DungeonBreakable>(); prop.Initialize(generator, 0, true);
+            Require(prop.TryBreak(wise) && movement.IsBreakingDecoration && prop.IsBreaking, "Swing did not start.");
+            Require(!prop.IsBroken && blocker.enabled && !prop.TryBreak(wise), "Prop broke before contact or repeated F starts another swing.");
+            Require(Vector3.Dot(player.transform.forward, Vector3.forward) > .99f, "WiSe is not facing the target.");
+            animator.Update(.08f);
+            Transform hand = animator.GetBoneTransform(HumanBodyBones.RightHand);
+            var sword = hand.Find("WiSeSword");
+            Require(sword != null && sword.GetComponentsInChildren<MeshRenderer>().Any(r => r.enabled && r.sharedMaterial != null && r.sharedMaterial.name == "Sword"),
+                "WiSe is missing the imported, textured sword on his right hand.");
+            Require(sword.GetComponentsInChildren<Collider>().Length == 0, "The visual sword must not push WiSe or decorations.");
+            Vector3 handBefore = hand.position; animator.Update(.15f);
+            Require(Vector3.Distance(hand.position, handBefore) > .03f, "Imported swing does not move WiSe's hand.");
+            Invoke(movement, "AdvanceBreaking", .2f);
+            Require(!prop.IsBroken && blocker.enabled, "Windup removed the solid prop.");
+            animator.Play("Base Layer.BreakDecoration", 0, .2f); animator.Update(0);
+            SavePreview(owned, player, "windup", ref target);
+            Invoke(movement, "AdvanceBreaking", .13f);
+            Require(!prop.IsBroken, "Elapsed time broke the prop before the animation reached contact.");
+            animator.Play("Base Layer.BreakDecoration", 0, .45f); animator.Update(0);
+            File.WriteAllText(Folder + "/weapon-grip.txt", "Right=" + animator.GetBoneTransform(HumanBodyBones.RightHand).position + "; Left=" + animator.GetBoneTransform(HumanBodyBones.LeftHand).position + "; sword=" + sword.position + "; child=" + sword.GetChild(0).localPosition + "; scale=" + sword.lossyScale);
+            Invoke(movement, "AdvanceBreaking", .01f);
+            Require(prop.IsBroken && !blocker.enabled, "Impact did not break the prop and release its collider.");
+            var coins = ((List<List<GameObject>>)Get(generator, "roomCoins"))[0];
+            Require(coins.Count == 1 && !prop.TryBreak(wise), "Impact creates duplicate loot.");
+            Require(room.GetComponentsInChildren<ParticleSystem>().Length == 1, "Wood-fragment effect did not spawn.");
+            foreach (Renderer renderer in propObject.GetComponentsInChildren<Renderer>()) renderer.enabled = false;
+            room.GetComponentInChildren<ParticleSystem>().Simulate(.15f, true, true);
+            SavePreview(owned, player, "impact", ref target);
+            Invoke(movement, "AdvanceBreaking", .5f);
+            Require(!movement.IsBreakingDecoration && coins.Count == 1, "Swing recovery or one-coin rule failed.");
+
+            var otherObject = Object.Instantiate(settings.breakableDecorations[1], room.transform);
+            otherObject.transform.position = player.transform.position + Vector3.forward * 2;
+            var other = otherObject.AddComponent<DungeonBreakable>(); other.Initialize(generator, 0, false);
+            Require(!other.TryBreak(null), "Wrong character can break the prop.");
+            otherObject.transform.position += Vector3.forward * 5;
+            Require(!other.TryBreak(wise), "Out-of-range prop can be broken.");
+            otherObject.transform.position -= Vector3.forward * 5;
+            Require(other.TryBreak(wise), "Second prop cannot start.");
+            movement.Teleport(player.transform.position, player.transform.rotation);
+            Require(!movement.IsBreakingDecoration && !other.IsBreaking && !other.IsBroken, "Cancelling the swing destroys or locks the prop.");
+            Require(other.TryBreak(wise), "Cancelled prop cannot be retried.");
+            Invoke(movement, "FinishBreaking");
+
+            int swingCues = 0, impactCues = 0;
+            Require(movement.TryPlayBreakAction(player.transform.position + Vector3.forward * 2,
+                () => impactCues++, () => { }, () => swingCues++), "Sound-cue swing cannot start.");
+            animator.Play("Base Layer.BreakDecoration", 0, .1f); animator.Update(0);
+            Invoke(movement, "AdvanceBreaking", .1f);
+            Require(swingCues == 0 && impactCues == 0, "Sound plays during the initial windup.");
+            animator.Play("Base Layer.BreakDecoration", 0, .21f); animator.Update(0);
+            Invoke(movement, "AdvanceBreaking", .06f);
+            Require(swingCues == 1 && impactCues == 0, "Whoosh is not aligned with the forward swing.");
+            animator.Play("Base Layer.BreakDecoration", 0, .45f); animator.Update(0);
+            Invoke(movement, "AdvanceBreaking", .2f); Invoke(movement, "AdvanceBreaking", .02f);
+            Require(swingCues == 1 && impactCues == 1, "Impact cue is missing or duplicated.");
+            Invoke(movement, "FinishBreaking");
+            movement.TryPlayBreakAction(player.transform.position, () => impactCues++, () => { }, () => swingCues++);
+            movement.Teleport(player.transform.position, player.transform.rotation);
+            Require(Get(movement, "breakSwing") == null && Get(movement, "breakImpact") == null &&
+                swingCues == 1 && impactCues == 1, "Cancelled swing retains an audio cue.");
+        }
+        finally
+        {
+            activePlayer.SetValue(null, savedPlayer);
+            if (target != null) { target.Release(); Object.DestroyImmediate(target); }
+            Object.DestroyImmediate(owned); SceneManager.SetActiveScene(original); EditorSceneManager.CloseScene(scene, true);
+        }
+    }
+
+    static void SavePreview(GameObject owned, GameObject player, string name, ref RenderTexture target)
+    {
+        var cameraObject = new GameObject("PreviewCamera"); cameraObject.transform.SetParent(owned.transform);
+        var camera = cameraObject.AddComponent<Camera>(); camera.orthographic = true; camera.orthographicSize = 2.7f;
+        var renderers = player.GetComponentsInChildren<Renderer>();
+        Bounds bounds = renderers[0].bounds; foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+        camera.orthographicSize = Mathf.Max(2.7f, bounds.size.y * .7f);
+        camera.transform.position = bounds.center + new Vector3(7, 4, -7); camera.transform.LookAt(bounds.center);
+        camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.06f, .07f, .1f);
+        var lamp = cameraObject.AddComponent<Light>(); lamp.type = LightType.Directional; lamp.intensity = 1.5f;
+        foreach (Transform child in owned.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+        camera.cullingMask = 1 << 30; lamp.cullingMask = 1 << 30;
+        if (target == null) target = new RenderTexture(700, 700, 24);
+        camera.targetTexture = target; camera.Render();
+        RenderTexture previous = RenderTexture.active; RenderTexture.active = target;
+        var image = new Texture2D(700, 700, TextureFormat.RGB24, false);
+        image.ReadPixels(new Rect(0, 0, 700, 700), 0, 0); image.Apply();
+        File.WriteAllBytes(Folder + "/" + name + ".png", image.EncodeToPNG());
+        RenderTexture.active = previous; Object.DestroyImmediate(image); Object.DestroyImmediate(cameraObject);
+    }
+    static object Get(object target, string name) => target.GetType().GetField(name, Private).GetValue(target);
+    static void Set(object target, string name, object value) => target.GetType().GetField(name, Private).SetValue(target, value);
+    static void Invoke(object target, string name, params object[] args) => target.GetType().GetMethod(name, Private).Invoke(target, args);
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

@@ -1,0 +1,147 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+/// <summary>Repaints only on room entry; camera rotation and map panning move the UI rather than rebuilding pixels.</summary>
+public sealed class DungeonMinimap : MonoBehaviour
+{
+    DungeonGenerator dungeon;
+    RawImage display;
+    RectTransform rotation, map;
+    GameObject panel;
+    Texture2D texture;
+    Color32[] pixels;
+    readonly HashSet<int> revealed = new HashSet<int>(), visited = new HashSet<int>();
+    Vector2Int minimum;
+    int width, height;
+    const int Cell = 20;
+    RectTransform icon;
+    Image portrait;
+    CharacterBase activeCharacter;
+    CharacterSwitchManager party;
+    CameraController cameraRig;
+    bool showMain, colourDegrees;
+    TMPro.TextMeshProUGUI legend;
+    public int RevealedRoomCount => revealed.Count;
+    public int VisitedRoomCount => visited.Count;
+    public bool ColoursByDegree => colourDegrees;
+
+    public void Initialize(DungeonGenerator generator, Transform parent)
+    {
+        dungeon = generator;
+        party = FindFirstObjectByType<CharacterSwitchManager>();
+        cameraRig = FindFirstObjectByType<CameraController>();
+        int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue, maxY = int.MinValue;
+        foreach (var room in dungeon.Layout.Rooms)
+        { minX = Mathf.Min(minX, room.Grid.x); minY = Mathf.Min(minY, room.Grid.y); maxX = Mathf.Max(maxX, room.Grid.x); maxY = Mathf.Max(maxY, room.Grid.y); }
+        minimum = new Vector2Int(minX, minY); width = (maxX - minX + 1) * Cell; height = (maxY - minY + 1) * Cell;
+        texture = new Texture2D(width, height, TextureFormat.RGBA32, false); texture.filterMode = FilterMode.Point; texture.wrapMode = TextureWrapMode.Clamp;
+        pixels = new Color32[width * height];
+        Sprite circle = Resources.Load<Sprite>("Dungeon/MapCircle");
+        panel = DungeonSession.UIBox("DungeonMinimap", parent, Vector2.zero, new Vector2(260, 260), new Color(.55f, .53f, .48f));
+        var panelRect = (RectTransform)panel.transform;
+        panelRect.anchorMin = panelRect.anchorMax = Vector2.one;
+        panelRect.anchoredPosition = new Vector2(-150, -155);
+        panel.GetComponent<Image>().sprite = circle;
+        var viewport = DungeonSession.UIBox("CircleViewport", panel.transform, Vector2.zero, new Vector2(246, 246), new Color(.06f, .07f, .09f, .94f));
+        viewport.GetComponent<Image>().sprite = circle;
+        viewport.AddComponent<Mask>().showMaskGraphic = true;
+        var rotationObj = new GameObject("Rotation", typeof(RectTransform)); rotationObj.transform.SetParent(viewport.transform, false); rotation = (RectTransform)rotationObj.transform;
+        var mapObj = new GameObject("RoomGrid", typeof(RectTransform)); mapObj.transform.SetParent(rotation, false); map = (RectTransform)mapObj.transform;
+        map.sizeDelta = new Vector2(width, height) * 2;
+        display = mapObj.AddComponent<RawImage>(); display.texture = texture; display.raycastTarget = false;
+        var marker = DungeonSession.UIBox("CurrentCharacter", map, Vector2.zero, new Vector2(24, 24), Color.white); icon = (RectTransform)marker.transform; portrait = marker.GetComponent<Image>(); portrait.raycastTarget = false;
+        portrait.preserveAspect = true;
+        legend = DungeonSession.UILabel("DegreeLegend", panel.transform, new Vector2(0, -160), new Vector2(310, 45), 15);
+    }
+
+    public void Visit(int room)
+    {
+        visited.Add(room); revealed.Add(room);
+        foreach (int neighbour in dungeon.Layout.Graph.Bonds[room]) revealed.Add(neighbour);
+        Paint();
+        Vector2 current = Centre(room); map.anchoredPosition = -current; icon.anchoredPosition = current;
+    }
+    public void RevealMainPath()
+    {
+        showMain = true;
+        foreach (int room in dungeon.Layout.Chains[0]) revealed.Add(room);
+        if (!colourDegrees) legend.text = "<color=#F5CD58>Gold: degree 1 path</color>";
+        panel.SetActive(true); Paint();
+    }
+    public void RevealAllRooms()
+    {
+        colourDegrees = true;
+        foreach (var room in dungeon.Layout.Rooms) revealed.Add(room.Index);
+        var labels = new System.Text.StringBuilder();
+        for (int degree = 1; degree <= dungeon.Layout.MaximumDegree; degree++)
+            labels.Append("<color=#").Append(ColorUtility.ToHtmlStringRGB(DegreeColour(degree))).Append(">Degree ")
+                .Append(degree).Append("</color>  ");
+        legend.text = labels.ToString(); panel.SetActive(true); Paint();
+    }
+    Color DegreeColour(int degree) => Color.HSVToRGB((degree - 1f) / Mathf.Max(1, dungeon.Layout.MaximumDegree), .6f, .95f);
+    public bool IsConnectionRevealed(int from, int to)
+    {
+        // Seeing an adjacent room does not reveal its other exits. Explicit map
+        // rewards still reveal their promised path or full map.
+        return visited.Contains(from) || visited.Contains(to) || colourDegrees ||
+            showMain && dungeon.Layout.Chains[0].Contains(from) && dungeon.Layout.Chains[0].Contains(to);
+    }
+    void Paint()
+    {
+        System.Array.Clear(pixels, 0, pixels.Length);
+        foreach (int index in revealed)
+        {
+            Vector2Int cell = dungeon.Layout.Rooms[index].Grid - minimum;
+            Color32 color = visited.Contains(index) ? new Color32(74, 150, 88, 255) : new Color32(110, 108, 120, 255);
+            if (colourDegrees) color = DegreeColour(dungeon.Layout.Rooms[index].Degree);
+            else if (showMain && dungeon.Layout.Rooms[index].Degree == 1) color = new Color32(245, 205, 88, 255);
+            Fill(cell.x * Cell + 3, cell.y * Cell + 3, 14, 14, color);
+            foreach (int next in dungeon.Layout.Graph.Bonds[index])
+            {
+                if (!IsConnectionRevealed(index, next)) continue;
+                Vector2Int direction = dungeon.Layout.Rooms[next].Grid - dungeon.Layout.Rooms[index].Grid;
+                Fill(cell.x * Cell + 8 + direction.x * 7, cell.y * Cell + 8 + direction.y * 7, 4, 4, new Color32(206, 194, 221, 255));
+            }
+        }
+        texture.SetPixels32(pixels); texture.Apply(false);
+    }
+    Vector2 Centre(int room)
+    {
+        Vector2Int cell = dungeon.Layout.Rooms[room].Grid - minimum;
+        return new Vector2((cell.x * Cell + Cell / 2f - width / 2f) * 2, (cell.y * Cell + Cell / 2f - height / 2f) * 2);
+    }
+    void Fill(int x, int y, int w, int h, Color32 color)
+    {
+        for (int row = y; row < y + h; row++) for (int col = x; col < x + w; col++)
+            if (col >= 0 && row >= 0 && col < width && row < height) pixels[row * width + col] = color;
+    }
+    void LateUpdate()
+    {
+        if (dungeon == null || !dungeon.Exploring) return;
+        Camera camera = cameraRig != null && cameraRig.ActiveCamera != null ? cameraRig.ActiveCamera : Camera.main;
+        if (camera != null) rotation.localRotation = Quaternion.Euler(0, 0, camera.transform.eulerAngles.y);
+        icon.localRotation = Quaternion.Inverse(rotation.localRotation);
+        if (party != null && party.CurrentCharacter != activeCharacter)
+        {
+            activeCharacter = party.CurrentCharacter;
+            portrait.sprite = activeCharacter != null && activeCharacter.characterData != null ? activeCharacter.characterData.portrait : null;
+            portrait.color = portrait.sprite == null ? Color.yellow : Color.white;
+        }
+        Keyboard keys = Keyboard.current; if (keys == null || NPCChallengePrompt.BlocksGameplayInput) return;
+        if (keys.mKey.wasPressedThisFrame) panel.SetActive(!panel.activeSelf);
+        if (!panel.activeSelf) return;
+        Vector2 delta = new Vector2((keys.jKey.isPressed ? 1 : 0) - (keys.lKey.isPressed ? 1 : 0), (keys.kKey.isPressed ? 1 : 0) - (keys.iKey.isPressed ? 1 : 0));
+        PanInScreenDirections(delta * (120 * Time.unscaledDeltaTime));
+    }
+
+    void PanInScreenDirections(Vector2 screenDelta)
+    {
+        // RoomGrid is under a rotating parent. Undo that rotation for screen-relative I/J/K/L.
+        Vector3 localDelta = Quaternion.Inverse(rotation.localRotation) * (Vector3)screenDelta;
+        map.anchoredPosition += new Vector2(localDelta.x, localDelta.y);
+        map.anchoredPosition = new Vector2(Mathf.Clamp(map.anchoredPosition.x, -width * 2, width * 2), Mathf.Clamp(map.anchoredPosition.y, -height * 2, height * 2));
+    }
+    void OnDestroy() { if (texture != null) Destroy(texture); }
+}

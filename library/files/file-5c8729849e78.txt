@@ -1,0 +1,97 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+
+/// <summary>Controls the scene-authored cheat panel, including additive dungeon and challenge screens.</summary>
+[DefaultExecutionOrder(-250)]
+public sealed class CheatConsole : MonoBehaviour
+{
+    static CheatConsole instance;
+    static int closedFrame = -1;
+    public static bool IsOpen => instance != null && instance.overlay != null && instance.overlay.activeSelf;
+    public static bool BlocksGameplayInput => IsOpen || closedFrame == Time.frameCount;
+    [SerializeField] GameObject overlay;
+    [SerializeField] TMP_InputField input;
+    [SerializeField] TextMeshProUGUI feedback;
+    GameObject previousSelection;
+    string lastAttemptedCode;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics()
+    {
+        instance = null; closedFrame = -1;
+    }
+    void Awake()
+    {
+        if (instance != null && instance != this) { Destroy(gameObject); return; }
+        instance = this;
+        if (overlay == null || input == null || feedback == null)
+        {
+            Debug.LogError("Assign the cheat panel UI references in the Inspector.", this);
+            enabled = false;
+            return;
+        }
+        input.onValueChanged.AddListener(RunWhenValid);
+        overlay.SetActive(false);
+    }
+    void Update()
+    {
+        var keys = Keyboard.current;
+        if (keys == null || DungeonSession.IsTransitioning) return;
+        if (keys.leftCtrlKey.wasPressedThisFrame || keys.rightCtrlKey.wasPressedThisFrame)
+        { if (IsOpen) Close(); else Open(); return; }
+        if (!IsOpen) return;
+        if (keys.escapeKey.wasPressedThisFrame) { Close(); return; }
+    }
+    public void Open()
+    {
+        if (IsOpen || DungeonSession.IsTransitioning) return;
+        previousSelection = EventSystem.current != null ? EventSystem.current.currentSelectedGameObject : null;
+        lastAttemptedCode = null;
+        overlay.SetActive(true); input.SetTextWithoutNotify("");
+        feedback.text = "";
+        input.Select(); input.ActivateInputField();
+    }
+    public void Close()
+    {
+        if (!IsOpen) return;
+        overlay.SetActive(false); closedFrame = Time.frameCount;
+        if (EventSystem.current != null)
+            EventSystem.current.SetSelectedGameObject(previousSelection != null && previousSelection.activeInHierarchy ? previousSelection : null);
+    }
+    void RunWhenValid(string code)
+    {
+        if (!IsOpen || feedback == null || input.text != code) return;
+        var definition = CheatCodes.Find(code);
+        if (definition == null)
+        {
+            lastAttemptedCode = null;
+            feedback.text = "";
+            return;
+        }
+        if (lastAttemptedCode == definition.Code) return;
+        lastAttemptedCode = definition.Code;
+        bool success = CheatCodes.Execute(code, out string result);
+        feedback.color = new Color(.66f, 1, .76f);
+        feedback.text = success ? result : "";
+        if (success)
+        {
+            // Clear without another callback so the next code can be typed or pasted immediately.
+            input.SetTextWithoutNotify(""); lastAttemptedCode = null;
+        }
+        input.ActivateInputField(); input.caretPosition = input.text.Length;
+    }
+    void LateUpdate()
+    {
+        // Keep typing focused even if Enter deactivates TMP's single-line field.
+        if (IsOpen && !input.isFocused) input.ActivateInputField();
+    }
+    void OnDisable() { if (instance == this) Close(); }
+    void OnDestroy()
+    {
+        if (input != null) input.onValueChanged.RemoveListener(RunWhenValid);
+        if (instance == this) { Close(); instance = null; }
+    }
+
+}

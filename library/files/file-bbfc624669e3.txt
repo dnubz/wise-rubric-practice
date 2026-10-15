@@ -1,0 +1,187 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class PinkMarioSetup
+{
+    const string Folder = "Temp/PinkMario";
+    const string ModelPath = "Assets/Imported Assets/MarioN64/MarioSmoothed.fbx";
+    public const string MarioPath = "Assets/Prefabs/MarioN64Visual.prefab";
+    static double nextCheck;
+    static PinkMarioSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: imported supplied Mario model/textures, assigned URP materials, replaced Pink overworld and stage visuals; Rainbow Road and scheduled Fond Vert countdown assigned in saved GameScene."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Set Up Pink Mario Model and Music")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        AssetDatabase.ImportAsset(ModelPath);
+        var importer = (ModelImporter)AssetImporter.GetAtPath(ModelPath);
+        // The FBX contains a modelling camera. Import only the character so it cannot render over gameplay.
+        importer.importCameras = false; importer.importLights = false;
+        importer.importAnimation = false; importer.materialImportMode = ModelImporterMaterialImportMode.ImportStandard;
+        importer.SaveAndReimport();
+        var model = (GameObject)PrefabUtility.InstantiatePrefab(AssetDatabase.LoadAssetAtPath<GameObject>(ModelPath));
+        GameObject mario;
+        try
+        {
+            model.name = "MarioN64Visual";
+            var converted = new Dictionary<Material, Material>();
+            Directory.CreateDirectory("Assets/Imported Assets/MarioN64/Materials"); AssetDatabase.Refresh();
+            var report = new System.Text.StringBuilder();
+            foreach (Renderer renderer in model.GetComponentsInChildren<Renderer>(true))
+            {
+                var slots = renderer.sharedMaterials;
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    Material source = slots[i]; if (source == null) continue;
+                    if (!converted.TryGetValue(source, out var material))
+                    {
+                        string path = "Assets/Imported Assets/MarioN64/Materials/" + source.name.Replace("/", "_") + ".mat";
+                        material = AssetDatabase.LoadAssetAtPath<Material>(path);
+                        if (material == null) { material = new Material(Shader.Find("Universal Render Pipeline/Lit")); AssetDatabase.CreateAsset(material,path); }
+                        material.SetColor("_BaseColor", source.HasProperty("_Color") ? source.color : Color.white);
+                        material.SetTexture("_BaseMap", source.mainTexture); material.SetFloat("_Smoothness", .15f);
+                        converted.Add(source,material); EditorUtility.SetDirty(material);
+                        report.AppendLine(source.name + ": texture=" + (source.mainTexture != null ? source.mainTexture.name : "none") + ", color=" + material.GetColor("_BaseColor"));
+                    }
+                    slots[i] = material;
+                }
+                renderer.sharedMaterials = slots;
+            }
+            MarioIdleSetup.AssignAnimator(model);
+            Fit(model, 3);
+            mario = PrefabUtility.SaveAsPrefabAsset(model, MarioPath);
+            File.WriteAllText(Folder + "/materials.txt", report.ToString());
+        }
+        finally { Object.DestroyImmediate(model); }
+        var pink = PrefabUtility.LoadPrefabContents("Assets/Prefabs/Pink.prefab");
+        var song = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/Music/Wii Rainbow Road - Mario Kart 8 Deluxe Booster Course Pass Music.mp3");
+        var countdown = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/SFX/Overworld/Mario 3 2 1 Go.mp3");
+        if (song == null || countdown == null) throw new InvalidOperationException("Import the supplied music and countdown files first.");
+        try
+        {
+            Undo.RegisterFullObjectHierarchyUndo(pink,"Replace Pink visual with Mario");
+            Transform oldMario = pink.transform.Find("MarioN64Visual"); if (oldMario != null) Object.DestroyImmediate(oldMario.gameObject);
+            foreach (Renderer renderer in pink.GetComponentsInChildren<Renderer>(true)) renderer.enabled = false;
+            foreach (Animator animator in pink.GetComponentsInChildren<Animator>(true)) animator.enabled = false;
+            pink.transform.localScale = Vector3.one;
+            var visual = (GameObject)PrefabUtility.InstantiatePrefab(mario); visual.transform.SetParent(pink.transform,false);
+            Fit(visual,3); Bounds bounds = BoundsOf(visual);
+            var collider = pink.GetComponent<BoxCollider>(); if (collider == null) collider = pink.AddComponent<BoxCollider>();
+            collider.center = bounds.center - pink.transform.position; collider.size = bounds.size;
+            var npc = pink.GetComponent<MinigameNPC>(); var fields = new SerializedObject(npc);
+            fields.FindProperty("exclusiveThemeMusic").objectReferenceValue = song; fields.ApplyModifiedPropertiesWithoutUndo();
+            PrefabUtility.SaveAsPrefabAsset(pink,"Assets/Prefabs/Pink.prefab");
+        }
+        finally { PrefabUtility.UnloadPrefabContents(pink); }
+        Scene original = SceneManager.GetActiveScene(); Scene scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        bool opened = !scene.isLoaded; if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity",OpenSceneMode.Additive);
+        try
+        {
+            var controller = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<PinkRhythmController>(true)).First();
+            Undo.RegisterCompleteObjectUndo(controller,"Set Rainbow Road and countdown");
+            Transform child = controller.transform.Find("CountdownAudio");
+            if (child == null) { child = new GameObject("CountdownAudio").transform; child.SetParent(controller.transform,false); }
+            var source = child.GetComponent<AudioSource>(); if (source == null) source = child.gameObject.AddComponent<AudioSource>();
+            source.playOnAwake = false; source.loop = false; source.spatialBlend = 0; source.volume = .8f;
+            var cues = CueStarts(countdown);
+            var fields = new SerializedObject(controller);
+            fields.FindProperty("song").objectReferenceValue = song;
+            fields.FindProperty("pinkBeatmap").objectReferenceValue = FitBeatmap(song);
+            fields.FindProperty("countdownSource").objectReferenceValue = source;
+            fields.FindProperty("countdownSound").objectReferenceValue = countdown;
+            fields.FindProperty("countdownGoSeconds").floatValue = cues.Count >= 4 ? cues[3] : 3;
+            fields.FindProperty("countdownNumberCueSeconds").vector3Value = cues.Count >= 4 ? new Vector3(cues[0],cues[1],cues[2]) : new Vector3(0,1,2);
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            var stage = scene.GetRootGameObjects().First(r => r.name == "PinkStage");
+            Undo.RegisterFullObjectHierarchyUndo(stage,"Replace rhythm preview with Mario");
+            bool stageActive = stage.activeSelf; stage.SetActive(true);
+            Transform old = stage.transform.Find("PinkModel"); if (old != null) Object.DestroyImmediate(old.gameObject);
+            var preview = (GameObject)PrefabUtility.InstantiatePrefab(mario); preview.name = "PinkModel"; preview.transform.SetParent(stage.transform,false);
+            Camera camera = stage.GetComponentInChildren<Camera>(); int layer = camera.gameObject.layer;
+            // Preserve the isolated preview layer from its culling mask.
+            for (int i = 0; i < 32; i++) if (camera.cullingMask == (1 << i)) layer = i;
+            foreach (Transform item in preview.GetComponentsInChildren<Transform>(true)) item.gameObject.layer = layer;
+            Bounds bounds = BoundsOf(preview); camera.orthographicSize = Mathf.Max(bounds.extents.y * 1.12f,bounds.extents.x / camera.aspect * 1.12f);
+            camera.transform.position = bounds.center + Vector3.forward * 6; camera.transform.LookAt(bounds.center);
+            camera.ResetWorldToCameraMatrix(); camera.ResetProjectionMatrix(); camera.Render(); stage.SetActive(stageActive);
+            foreach (TMP_Text text in scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<TMP_Text>(true)))
+                if (text.name == "PinkNameText") text.text = "MARIO";
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene); AssetDatabase.SaveAssets();
+            File.WriteAllText(Folder + "/audio.txt", $"Rainbow Road length={song.length:F3}s\nCountdown length={countdown.length:F3}s\nDetected cues: {string.Join(", ", cues.Select(v => v.ToString("F3")))}\nGO={fields.FindProperty("countdownGoSeconds").floatValue:F3}s\n");
+        }
+        finally { SceneManager.SetActiveScene(original); if (opened) EditorSceneManager.CloseScene(scene,true); }
+    }
+    static List<float> CueStarts(AudioClip clip)
+    {
+        clip.LoadAudioData(); var data = new float[clip.samples * clip.channels]; clip.GetData(data,0);
+        int block = Mathf.Max(1,clip.frequency / 100); var levels = new List<float>();
+        for (int start = 0; start < clip.samples; start += block)
+        {
+            double sum = 0; int end = Math.Min(clip.samples,start + block);
+            for (int i = start * clip.channels; i < end * clip.channels; i++) sum += data[i] * data[i];
+            levels.Add((float)Math.Sqrt(sum / ((end-start)*clip.channels)));
+        }
+        var cues = new List<float>(); float threshold = levels.Max() * .22f; float last = -1;
+        for (int i = 0; i < levels.Count; i++) if (levels[i] >= threshold)
+        {
+            float time = (float)i * block / clip.frequency;
+            if (time - last > .45f) cues.Add(time);
+            last = time;
+        }
+        File.WriteAllLines(Folder + "/countdown-levels.csv", levels.Select((v,i) => ((float)i * block / clip.frequency).ToString("F3") + "," + v.ToString("F5")));
+        return cues;
+    }
+    public static TextAsset FitBeatmap(AudioClip song)
+    {
+        const string fullPath = "Assets/Resources/Rhythm/RainbowRoad_Full.txt";
+        if (File.Exists(fullPath))
+        {
+            AssetDatabase.ImportAsset(fullPath);
+            var authored = AssetDatabase.LoadAssetAtPath<TextAsset>(fullPath);
+            var full = PinkBeatmap.Parse(authored.text);
+            if (full.AudioStartSeconds + full.Notes.Max(n => n.End) > song.length)
+                throw new InvalidOperationException("The full Rainbow Road chart does not fit this song.");
+            File.WriteAllText(Folder + "/beatmap.txt", $"Full Rainbow Road chart: {full.Notes.Length} notes, {full.Notes.Count(n => n.IsHold)} holds; authored for the supplied MK8 Deluxe track.");
+            return authored;
+        }
+        // Preserve the designer's keys/holds and original file; scale the copy to finish before this shorter track ends.
+        string original = File.ReadAllText("Assets/Resources/Rhythm/PinkRythm.txt");
+        var map = PinkBeatmap.Parse(original);
+        double last = map.Notes.Max(n => n.End);
+        double scale = Math.Min(1,(song.length - 2) / last);
+        string adjusted = System.Text.RegularExpressions.Regex.Replace(original,@"(?<=\bt=)\d+|(?<=\bt_start=)\d+|(?<=\bt_end=)\d+",
+            m => Math.Round(double.Parse(m.Value,System.Globalization.CultureInfo.InvariantCulture) * scale).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        const string path = "Assets/Resources/Rhythm/RainbowRoad.txt";
+        File.WriteAllText(path,adjusted); AssetDatabase.ImportAsset(path);
+        File.WriteAllText(Folder + "/beatmap.txt",$"Original duration={last:F3}s; adjusted duration={last*scale:F3}s; scale={scale:F6}; original keys and holds retained. Chart fitted to duration; it is not a newly authored Rainbow Road beatmap.");
+        return AssetDatabase.LoadAssetAtPath<TextAsset>(path);
+    }
+    static Bounds BoundsOf(GameObject obj)
+    {
+        var renderers = obj.GetComponentsInChildren<Renderer>(); Bounds bounds = renderers[0].bounds;
+        foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds); return bounds;
+    }
+    static void Fit(GameObject model, float height)
+    {
+        model.transform.localPosition = Vector3.zero; model.transform.localRotation = Quaternion.identity;
+        model.transform.localScale *= height / BoundsOf(model).size.y;
+        Bounds bounds = BoundsOf(model); model.transform.position += Vector3.up * (model.transform.parent != null ? model.transform.parent.position.y - bounds.min.y : -bounds.min.y);
+    }
+}

@@ -1,0 +1,20 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 82a97fa309a7ce74d83c762bd7659a0f, type: 3}
+  m_Name: PotionShop
+  m_EditorClassIdentifier: Assembly-CSharp::ShopInventory
+  shopName: Potion Merchant
+  items:
+  - item: {fileID: 11400000, guid: d5d61505ce635424f9bc3979ae4388f1, type: 2}
+  - item: {fileID: 11400000, guid: 7704dfb54cb01bb48b320087f1ad7631, type: 2}
+  - item: {fileID: 11400000, guid: 4b44f9e756b58ab4ab7b44e1b8578ac7, type: 2}
+  - item: {fileID: 11400000, guid: f14499485ecee9446912ab949e49ef86, type: 2}

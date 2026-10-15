@@ -1,0 +1,91 @@
+
+using UnityEngine;
+using System;
+
+public class ResourceSpawner : MonoBehaviour
+{
+    [SerializeField] GameObject[] treePrefabs;
+    [SerializeField] GameObject mushroom;
+    [SerializeField] GameObject rock;
+    [SerializeField] GameObject[] cactusPrefabs;
+
+    [SerializeField] float treeChance = 0.25f;
+    [SerializeField] float mushroomChance = 0.15f;
+    [SerializeField] float rockChance = 0.12f;
+    [SerializeField] float cactusChance = 0.20f;
+
+    public void Spawn(Vector3 position, float tileSize, System.Random random, Transform parent, int terrainType)
+    {
+        if (terrainType == 0)
+            SpawnGrass(position, tileSize, random, parent);
+
+        if (terrainType == 2)
+            SpawnSand(position, tileSize, random, parent);
+    }
+
+    void SpawnGrass(Vector3 position, float tileSize, System.Random random, Transform parent)
+    {
+        double roll = random.NextDouble();
+        GameObject prefab = null;
+
+        if (roll < treeChance)
+            prefab = GetRandom(treePrefabs, random);
+        else if (roll < treeChance + mushroomChance)
+            prefab = mushroom;
+        else if (roll < treeChance + mushroomChance + rockChance)
+            prefab = rock;
+
+        if (prefab != null)
+            SpawnObject(prefab, position, tileSize, random, parent, 0);
+    }
+
+    void SpawnSand(Vector3 position, float tileSize, System.Random random, Transform parent)
+    {
+        if (random.NextDouble() >= cactusChance)
+            return;
+
+        GameObject prefab = GetRandom(cactusPrefabs, random);
+
+        if (prefab != null)
+            SpawnObject(prefab, position, tileSize, random, parent, 2);
+    }
+
+    GameObject GetRandom(GameObject[] objects, System.Random random)
+    {
+        if (objects == null || objects.Length == 0)
+            return null;
+
+        return objects[random.Next(objects.Length)];
+    }
+
+    void SpawnObject(GameObject prefab, Vector3 position, float tileSize, System.Random random, Transform parent, int terrainType)
+    {
+        float half = tileSize * 0.4f;
+
+        float x = (float)(random.NextDouble() * 2 - 1) * half;
+        float z = (float)(random.NextDouble() * 2 - 1) * half;
+
+        Vector3 spawnPosition = new Vector3(
+            position.x + tileSize / 2 + x,
+            position.y,
+            position.z + tileSize / 2 + z
+        );
+
+        WFCWorldManager world = WFCWorldManager.Instance;
+        if (world != null && (world.GetTerrainBlend(spawnPosition).y > 0.15f ||
+            world.GetTerrainAt(spawnPosition) != terrainType))
+            return;
+
+        // Use the instantiated terrain prefab's actual surface height.
+        if (parent != null)
+        {
+            if (!ChunkSpawnUtility.TryGetGround(ChunkSpawnUtility.GetOwnedTerrain(parent),
+                spawnPosition.x, spawnPosition.z, true, out Vector3 ground)) return;
+            spawnPosition.y = ground.y;
+        }
+
+        float rotation = (float)(random.NextDouble() * 360);
+        GameObject resource = Instantiate(prefab, spawnPosition, Quaternion.Euler(0, rotation, 0), parent);
+        resource.AddComponent<GeneratedResourceMarker>();
+    }
+}

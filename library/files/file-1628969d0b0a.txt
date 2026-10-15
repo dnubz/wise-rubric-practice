@@ -1,0 +1,10 @@
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "New Resource", menuName = "Inventory/Resource")]
+public class ResourceItem : Item
+{
+    [Header("Shop")]
+    [SerializeField] private int cost;
+
+    public override int Cost => cost;
+}

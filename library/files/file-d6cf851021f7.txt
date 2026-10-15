@@ -1,0 +1,261 @@
+using System;
+using System.IO;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>One-time editor setup. Saves normal Images, text and Buttons in GameScene.</summary>
+[InitializeOnLoad]
+public static class DungeonEntryUIBuilder
+{
+    const string Folder = "Assets/UI/DungeonEntry";
+    const string Request = "Temp/DungeonEntryUI/build.request";
+    const string RemoveDotsRequest = "Temp/DungeonEntryUI/remove-dots.request";
+    static double nextCheck;
+    static Sprite rounded, outline, white;
+    static TMP_FontAsset font;
+
+    static DungeonEntryUIBuilder() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (File.Exists(RemoveDotsRequest))
+        {
+            File.Delete(RemoveDotsRequest);
+            try
+            {
+                RemoveDots();
+                File.WriteAllText("Temp/DungeonEntryUI/remove-dots-result.txt", "Removed the dot backgrounds and saved GameScene.");
+            }
+            catch (Exception error)
+            {
+                File.WriteAllText("Temp/DungeonEntryUI/remove-dots-result.txt", error.ToString());
+                Debug.LogException(error);
+            }
+            return;
+        }
+        if (!File.Exists(Request)) return;
+        File.Delete(Request);
+        try
+        {
+            Build();
+            File.WriteAllText("Temp/DungeonEntryUI/result.txt", "Saved GameScene / GameplayCanvas / DungeonEntryUI. Three portrait cards and all session UI references assigned.");
+        }
+        catch (Exception error)
+        {
+            File.WriteAllText("Temp/DungeonEntryUI/result.txt", error.ToString());
+            Debug.LogException(error);
+        }
+    }
+
+    [MenuItem("WiSe/UI/Remove Dungeon Entry Dots")]
+    public static void RemoveDots()
+    {
+        Scene scene = SceneManager.GetSceneByName("GameScene");
+        if (!scene.IsValid() || !scene.isLoaded) throw new InvalidOperationException("Open GameScene first.");
+        foreach (GameObject root in scene.GetRootGameObjects())
+            foreach (DungeonSession session in root.GetComponentsInChildren<DungeonSession>(true))
+                foreach (RectTransform child in session.GetComponentsInChildren<RectTransform>(true))
+                    if (child.name == "Dots") Undo.DestroyObjectImmediate(child.gameObject);
+        EditorSceneManager.MarkSceneDirty(scene);
+        if (!EditorSceneManager.SaveScene(scene)) throw new IOException("Could not save GameScene.");
+    }
+
+    [MenuItem("WiSe/UI/Add Dungeon Entry UI to GameScene")]
+    public static void Build()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) throw new InvalidOperationException("Exit Play mode first.");
+        Scene scene = SceneManager.GetSceneByName("GameScene");
+        if (!scene.IsValid() || !scene.isLoaded) throw new InvalidOperationException("Open GameScene first.");
+        Canvas main = null;
+        foreach (GameObject root in scene.GetRootGameObjects())
+        {
+            foreach (Canvas canvas in root.GetComponentsInChildren<Canvas>(true))
+                if (canvas.name == "GameplayCanvas") main = canvas;
+            if (root.GetComponentInChildren<DungeonSession>(true) != null)
+                throw new InvalidOperationException("DungeonEntryUI already exists; edit its children in the Hierarchy.");
+        }
+        if (main == null) throw new InvalidOperationException("GameplayCanvas is missing.");
+        Directory.CreateDirectory("Temp/DungeonEntryUI");
+        string backup = "Temp/DungeonEntryUI/GameScene-before-entry-ui.unity";
+        if (!File.Exists(backup)) File.Copy(scene.path, backup);
+        Directory.CreateDirectory(Folder);
+        AssetDatabase.Refresh();
+        rounded = SpriteAsset("Rounded", 128, 128, (x, y) => RoundedAlpha(x, y, 44), 48);
+        outline = SpriteAsset("Outline", 128, 128, (x, y) => Mathf.Clamp01(RoundedAlpha(x, y, 44) - InnerAlpha(x, y)), 48);
+        white = SpriteAsset("White", 2, 2, (x, y) => 1, 0);
+        font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>("Assets/Fonts/MedievalSharp/MedievalSharp-Regular SDF.asset");
+        if (font == null) font = TMP_Settings.defaultFontAsset;
+
+        RectTransform manager = Rect("DungeonEntryUI", main.transform, Vector2.zero, Vector2.zero);
+        Undo.RegisterCreatedObjectUndo(manager.gameObject, "Add Dungeon Entry UI");
+        Stretch(manager);
+        Canvas layer = manager.gameObject.AddComponent<Canvas>(); layer.overrideSorting = true; layer.sortingOrder = 160;
+        manager.gameObject.AddComponent<GraphicRaycaster>();
+        Image modal = Image("EntryOverlay", manager, Vector2.zero, Vector2.zero, new Color(0, 0, 0, .60f));
+        Stretch(modal.rectTransform); modal.raycastTarget = true;
+        RectTransform layout = Rect("Layout", modal.transform, Vector2.zero, new Vector2(1280, 720));
+        // Match the existing GameplayCanvas's 1920-wide design without changing other UI.
+        CanvasScaler scaler = main.GetComponent<CanvasScaler>();
+        float scale = scaler != null ? scaler.referenceResolution.x / 1280 : 1;
+        layout.localScale = Vector3.one * scale;
+
+        Image board = RoundedBox("EntryCard", layout, Vector2.zero, new Vector2(1140, 660), new Color(.047f, .078f, .118f), Color.white);
+        var title = Label("Title", board.transform, new Vector2(0, 267), new Vector2(1000, 52), 34, "ENTER THE DUNGEON?");
+        title.characterSpacing = 5; title.fontStyle = FontStyles.Bold;
+        var subtitle = Label("Subtitle", board.transform, new Vector2(0, 221), new Vector2(1000, 35), 20, "Review your party before beginning a new run.");
+        subtitle.color = new Color(.73f, .73f, .82f);
+        RectTransform party = Rect("PartyCards", board.transform, Vector2.zero, new Vector2(1050, 340));
+        var cards = new DungeonPartyCard[3];
+        string[] dataPaths = { "WiSe", "RandaL", "Druid" };
+        for (int i = 0; i < 3; i++)
+        {
+            CharacterData data = AssetDatabase.LoadAssetAtPath<CharacterData>("Assets/CharacterData/" + dataPaths[i] + ".asset");
+            if (data == null) throw new InvalidOperationException("Missing character data: " + dataPaths[i]);
+            cards[i] = PartyCard(party, data, (i - 1) * 338);
+        }
+        var status = Label("RequirementText", board.transform, new Vector2(0, -185), new Vector2(1000, 55), 19, "");
+        status.color = new Color(.95f, .78f, .43f); status.enableAutoSizing = true; status.fontSizeMin = 16; status.fontSizeMax = 19;
+        Button proceed = ActionButton("ProceedButton", board.transform, -185, "PROCEED", out TextMeshProUGUI proceedLabel);
+        Button retreat = ActionButton("RetreatButton", board.transform, 185, "RETREAT", out _);
+        Border(board.transform, Color.white);
+
+        DungeonSession session = manager.gameObject.AddComponent<DungeonSession>();
+        var serialized = new SerializedObject(session);
+        Assign(serialized, "modal", modal.gameObject); Assign(serialized, "partyPanel", party.gameObject);
+        Assign(serialized, "title", title); Assign(serialized, "subtitle", subtitle); Assign(serialized, "body", status);
+        Assign(serialized, "proceedLabel", proceedLabel); Assign(serialized, "proceed", proceed); Assign(serialized, "retreat", retreat);
+        SerializedProperty list = serialized.FindProperty("partyCards"); list.arraySize = cards.Length;
+        for (int i = 0; i < cards.Length; i++) list.GetArrayElementAtIndex(i).objectReferenceValue = cards[i];
+        serialized.ApplyModifiedPropertiesWithoutUndo();
+        // Leave this new panel visible for editing. Awake hides it before gameplay starts.
+        foreach (GameObject root in scene.GetRootGameObjects())
+            foreach (CheatConsole console in root.GetComponentsInChildren<CheatConsole>(true))
+            {
+                var cheat = new SerializedObject(console).FindProperty("overlay").objectReferenceValue as GameObject;
+                if (cheat != null && cheat.activeSelf) { Undo.RecordObject(cheat, "Hide cheat UI preview"); cheat.SetActive(false); }
+            }
+        EditorSceneManager.MarkSceneDirty(scene);
+        if (!EditorSceneManager.SaveScene(scene)) throw new IOException("Could not save GameScene.");
+        AssetDatabase.SaveAssets(); Selection.activeGameObject = board.gameObject; EditorGUIUtility.PingObject(board.gameObject);
+    }
+
+    static DungeonPartyCard PartyCard(Transform parent, CharacterData data, float x)
+    {
+        Image card = RoundedBox(data.name + "Card", parent, new Vector2(x, 15), new Vector2(302, 314), new Color(.145f, .15f, .205f), new Color(.57f, .57f, .62f));
+        Image portrait = Image("Portrait", card.transform, new Vector2(0, 88), new Vector2(126, 114), Color.white);
+        portrait.sprite = data.portrait; portrait.preserveAspect = true;
+        var name = Label("CharacterName", card.transform, new Vector2(0, 16), new Vector2(264, 38), 25, data.displayName);
+        name.characterSpacing = 2; name.fontStyle = FontStyles.Bold;
+        var level = Label("Level", card.transform, new Vector2(0, -18), new Vector2(264, 28), 18, "Lv. " + data.level);
+        level.color = new Color(.73f, .73f, .82f);
+        Image hp = StatBar("HPBar", card.transform, -76, new Color(0, .51f, .69f), "HP - " + data.maxHP + "/" + data.maxHP, out TextMeshProUGUI hpText);
+        Image sp = StatBar("SPBar", card.transform, -120, new Color(1, .67f, .10f), "SP - " + data.maxSP + "/" + data.maxSP, out TextMeshProUGUI spText);
+        Border(card.transform, new Color(.57f, .57f, .62f));
+        var component = card.gameObject.AddComponent<DungeonPartyCard>();
+        var serialized = new SerializedObject(component);
+        Assign(serialized, "characterData", data); Assign(serialized, "portrait", portrait);
+        Assign(serialized, "characterName", name); Assign(serialized, "level", level);
+        Assign(serialized, "hpText", hpText); Assign(serialized, "spText", spText);
+        Assign(serialized, "hpFill", hp); Assign(serialized, "spFill", sp);
+        serialized.ApplyModifiedPropertiesWithoutUndo();
+        return component;
+    }
+
+    static Image StatBar(string name, Transform parent, float y, Color colour, string text, out TextMeshProUGUI label)
+    {
+        Image edge = RoundedBox(name, parent, new Vector2(0, y), new Vector2(260, 24), new Color(.025f, .04f, .055f), Color.clear);
+        Image track = RoundedBox("Track", edge.transform, Vector2.zero, new Vector2(254, 18), new Color(.08f, .09f, .12f), Color.clear);
+        Image fill = Image("Fill", track.transform, Vector2.zero, Vector2.zero, colour);
+        Stretch(fill.rectTransform); fill.sprite = white; fill.type = UnityEngine.UI.Image.Type.Filled;
+        fill.fillMethod = UnityEngine.UI.Image.FillMethod.Horizontal; fill.fillOrigin = 0; fill.fillAmount = 1;
+        label = Label("Value", edge.transform, Vector2.zero, new Vector2(250, 23), 17, text);
+        label.fontStyle = FontStyles.Bold;
+        return fill;
+    }
+
+    static Button ActionButton(string name, Transform parent, float x, string text, out TextMeshProUGUI label)
+    {
+        Image face = RoundedBox(name, parent, new Vector2(x, -272), new Vector2(288, 68), new Color(.145f, .15f, .205f), Color.white);
+        face.raycastTarget = true;
+        label = Label("Label", face.transform, Vector2.zero, new Vector2(270, 50), 25, text);
+        label.fontStyle = FontStyles.Bold; label.characterSpacing = 3;
+        Button button = face.gameObject.AddComponent<Button>(); button.targetGraphic = face;
+        ColorBlock colours = button.colors; colours.highlightedColor = new Color(1.4f, 1.4f, 1.4f); colours.pressedColor = new Color(.7f, .7f, .7f);
+        colours.disabledColor = new Color(.5f, .5f, .5f, .75f); button.colors = colours;
+        Border(face.transform, Color.white);
+        return button;
+    }
+
+    static RectTransform Rect(string name, Transform parent, Vector2 position, Vector2 size)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.layer = 5; obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = new Vector2(.5f, .5f);
+        rect.anchoredPosition = position; rect.sizeDelta = size; return rect;
+    }
+    static void Stretch(RectTransform rect)
+    {
+        rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one; rect.offsetMin = rect.offsetMax = Vector2.zero;
+    }
+    static Image Image(string name, Transform parent, Vector2 position, Vector2 size, Color colour)
+    {
+        var image = Rect(name, parent, position, size).gameObject.AddComponent<Image>(); image.color = colour; image.raycastTarget = false; return image;
+    }
+    static Image RoundedBox(string name, Transform parent, Vector2 position, Vector2 size, Color colour, Color border)
+    {
+        Image image = Image(name, parent, position, size, colour); image.sprite = rounded; image.type = UnityEngine.UI.Image.Type.Sliced;
+        image.gameObject.AddComponent<Mask>().showMaskGraphic = true;
+        return image;
+    }
+    static void Border(Transform parent, Color colour)
+    {
+        Image stroke = Image("Border", parent, Vector2.zero, Vector2.zero, colour); Stretch(stroke.rectTransform);
+        stroke.sprite = outline; stroke.type = UnityEngine.UI.Image.Type.Sliced;
+    }
+    static TextMeshProUGUI Label(string name, Transform parent, Vector2 position, Vector2 size, float fontSize, string text)
+    {
+        var label = Rect(name, parent, position, size).gameObject.AddComponent<TextMeshProUGUI>();
+        label.font = font; label.fontSize = fontSize; label.color = Color.white; label.text = text;
+        label.alignment = TextAlignmentOptions.Center; label.raycastTarget = false; return label;
+    }
+    static void Assign(SerializedObject target, string name, Object value) { target.FindProperty(name).objectReferenceValue = value; }
+
+    // Static, editable sprite assets; no runtime drawing or UI generation.
+    static Sprite SpriteAsset(string name, int width, int height, Func<float, float, float> alpha, int border)
+    {
+        string path = Folder + "/" + name + ".png";
+        if (!File.Exists(path))
+        {
+            var texture = new Texture2D(width, height, TextureFormat.RGBA32, false);
+            var pixels = new Color[width * height];
+            for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) pixels[y * width + x] = new Color(1, 1, 1, alpha(x + .5f, y + .5f));
+            texture.SetPixels(pixels); texture.Apply(); File.WriteAllBytes(path, texture.EncodeToPNG()); Object.DestroyImmediate(texture);
+            AssetDatabase.ImportAsset(path);
+            var importer = (TextureImporter)AssetImporter.GetAtPath(path); importer.textureType = TextureImporterType.Sprite;
+            importer.spriteImportMode = SpriteImportMode.Single; importer.spritePixelsPerUnit = 100;
+            importer.spriteBorder = new Vector4(border, border, border, border); importer.alphaIsTransparency = true;
+            importer.textureCompression = TextureImporterCompression.Uncompressed; importer.mipmapEnabled = false;
+            importer.filterMode = FilterMode.Bilinear; importer.wrapMode = TextureWrapMode.Repeat;
+            importer.SaveAndReimport();
+        }
+        return AssetDatabase.LoadAssetAtPath<Sprite>(path);
+    }
+    static float RoundedAlpha(float x, float y, float radius)
+    {
+        float dx = Mathf.Max(Mathf.Abs(x - 64) - (64 - radius), 0);
+        float dy = Mathf.Max(Mathf.Abs(y - 64) - (64 - radius), 0);
+        return Mathf.Clamp01(radius + .5f - Mathf.Sqrt(dx * dx + dy * dy));
+    }
+    static float InnerAlpha(float x, float y)
+    {
+        if (x < 4 || y < 4 || x > 124 || y > 124) return 0;
+        float dx = Mathf.Max(Mathf.Abs(x - 64) - 20, 0), dy = Mathf.Max(Mathf.Abs(y - 64) - 20, 0);
+        return Mathf.Clamp01(40.5f - Mathf.Sqrt(dx * dx + dy * dy));
+    }
+}

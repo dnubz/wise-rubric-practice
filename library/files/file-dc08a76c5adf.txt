@@ -1,0 +1,58 @@
+using System;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+/// <summary>One shared mesh/material and one surface renderer per generated pool.</summary>
+internal sealed class WaterSurfaceBuilder : IDisposable
+{
+    readonly Mesh mesh;
+    readonly Material material;
+    readonly bool ownsMaterial;
+    static readonly int BoundsId = Shader.PropertyToID("_PondBounds");
+
+    public WaterSurfaceBuilder(Material surfaceMaterial)
+    {
+        material = surfaceMaterial;
+        if (material == null)
+        {
+            Shader shader = Shader.Find("WiSe/Overworld Water");
+            if (shader == null) throw new InvalidOperationException("Assign the OverworldWater material on WFCWorldManager.");
+            material = new Material(shader) { name = "Generated Overworld Water", enableInstancing = true };
+            ownsMaterial = true;
+        }
+
+        mesh = new Mesh
+        {
+            name = "Shared Water Surface",
+            vertices = new[] { Vector3.zero, Vector3.right, new Vector3(1f, 0f, 1f), Vector3.forward },
+            normals = new[] { Vector3.up, Vector3.up, Vector3.up, Vector3.up },
+            uv = new[] { Vector2.zero, Vector2.right, Vector2.one, Vector2.up },
+            triangles = new[] { 0, 2, 1, 0, 3, 2 }
+        };
+        mesh.RecalculateBounds();
+        mesh.UploadMeshData(true);
+    }
+
+    public void Create(Vector4 bounds, float height, Transform chunkParent)
+    {
+        GameObject surface = new GameObject("Water Surface");
+        surface.transform.SetParent(chunkParent, false);
+        surface.transform.position = new Vector3(bounds.x, height, bounds.y);
+        surface.transform.localScale = new Vector3(bounds.z - bounds.x, 1f, bounds.w - bounds.y);
+        surface.AddComponent<MeshFilter>().sharedMesh = mesh;
+        MeshRenderer renderer = surface.AddComponent<MeshRenderer>();
+        renderer.sharedMaterial = material;
+        renderer.shadowCastingMode = ShadowCastingMode.Off;
+        renderer.receiveShadows = true;
+        MaterialPropertyBlock properties = new MaterialPropertyBlock();
+        properties.SetVector(BoundsId, bounds);
+        renderer.SetPropertyBlock(properties);
+        // No surface collider: characters float above the sloped Terrain bed.
+    }
+
+    public void Dispose()
+    {
+        if (mesh != null) UnityEngine.Object.Destroy(mesh);
+        if (ownsMaterial && material != null) UnityEngine.Object.Destroy(material);
+    }
+}

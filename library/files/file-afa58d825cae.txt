@@ -1,0 +1,83 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+// Uses saved Canvas children. This script changes text and handles the sale only.
+public sealed class ResourceSellUI : MonoBehaviour
+{
+    [SerializeField] GameObject panel;
+    [SerializeField] TMP_Text title, details, sellLabel, closeLabel;
+    [SerializeField] Button sellButton, closeButton;
+    static ResourceSellUI instance;
+    static int closedFrame = -1;
+    InteractableNPC owner;
+    Inventory inventory;
+    ResourceItem resource;
+    public bool IsOpen => panel != null && panel.activeInHierarchy;
+    public static bool BlocksGameplayInput => (instance != null && instance.IsOpen) || closedFrame == Time.frameCount;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics() { instance = null; closedFrame = -1; }
+
+    void Awake()
+    {
+        instance = this;
+        sellButton.onClick.AddListener(SellAll); closeButton.onClick.AddListener(Close);
+        panel.SetActive(false);
+    }
+    void Update()
+    {
+        if (!IsOpen) return;
+        if (owner == null || (Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame)) Close();
+    }
+    public void Open(InteractableNPC merchant)
+    {
+        if (merchant == null || merchant.BoughtResource == null) return;
+        Unsubscribe(); owner = merchant; resource = merchant.BoughtResource;
+        inventory = FindAnyObjectByType<Inventory>();
+        if (inventory != null) inventory.OnChanged += Refresh;
+        panel.SetActive(true); Refresh();
+    }
+    string ResourceName => "<color=#F1CB61>" + resource.ItemName.ToUpperInvariant() + "</color>";
+    void Refresh()
+    {
+        int count = inventory != null ? inventory.GetItemCount(resource) : 0;
+        long total = (long)count * resource.Cost;
+        bool canSell = count > 0 && resource.Cost > 0 && total <= int.MaxValue - PlayerInventory.Instance.Gold;
+        title.text = count == 0 ? $"You have no {ResourceName} to sell." : $"Sell all {ResourceName} to {owner.DisplayName}?";
+        details.text = count == 0 ? "Gather some in the overworld, then come back." : $"{count} x {resource.Cost} coin = <color=#F1CB61>{total} COINS</color>";
+        sellLabel.text = count == 0 ? "EMPTY" : "SELL ALL";
+        closeLabel.text = count == 0 ? "CLOSE" : "CANCEL";
+        sellButton.interactable = canSell;
+    }
+    public void SellAll()
+    {
+        if (!IsOpen || resource == null || inventory == null) return;
+        int count = inventory.GetItemCount(resource);
+        long total = (long)count * resource.Cost;
+        if (count <= 0 || resource.Cost <= 0 || total > int.MaxValue - PlayerInventory.Instance.Gold) { Refresh(); return; }
+        int removed = inventory.RemoveAll(resource);
+        int coins = removed * resource.Cost;
+        PlayerInventory.Instance.AddGold(coins);
+        foreach (var ui in FindObjectsByType<InventoryUI>(FindObjectsInactive.Include)) ui.RefreshUI();
+        title.text = $"Sold {removed} {ResourceName} to {owner.DisplayName}.";
+        details.text = $"<color=#F1CB61>{coins} COINS</color> received.";
+        sellLabel.text = "SOLD"; closeLabel.text = "CLOSE"; sellButton.interactable = false;
+    }
+    public void Close()
+    {
+        if (IsOpen) closedFrame = Time.frameCount;
+        Unsubscribe(); owner = null; resource = null;
+        if (panel != null) panel.SetActive(false);
+    }
+    public static void CloseFor(InteractableNPC merchant)
+    { if (instance != null && instance.owner == merchant) instance.Close(); }
+    void Unsubscribe() { if (inventory != null) inventory.OnChanged -= Refresh; inventory = null; }
+    void OnDisable() { Close(); }
+    void OnDestroy()
+    {
+        sellButton.onClick.RemoveListener(SellAll); closeButton.onClick.RemoveListener(Close);
+        if (instance == this) instance = null;
+    }
+}

@@ -1,0 +1,23 @@
+using UnityEngine;
+
+public class ResourcePickup : MonoBehaviour
+{
+    [SerializeField] ResourceItem item;
+
+    void OnTriggerEnter(Collider other)
+    {
+        Inventory inventory = other.GetComponent<Inventory>();
+        if (inventory == null) return;
+
+        if (item == null)
+        {
+            Debug.LogWarning(gameObject.name + " has no ResourceItem assigned!");
+            return;
+        }
+
+        inventory.AddItem(item);
+        Debug.Log("Picked up: " + item.ItemName);
+
+        Destroy(gameObject);
+    }
+}

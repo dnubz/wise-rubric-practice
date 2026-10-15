@@ -1,0 +1,76 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fbc9cf17c642fd243b88ec0efda363d2, type: 3}
+  m_Name: Settings
+  m_EditorClassIdentifier: Assembly-CSharp::DungeonSettings
+  minimumRooms: 14
+  maximumRooms: 24
+  minimumRoomSize: 36
+  maximumRoomSize: 42
+  roomSpacing: 500
+  useFixedSeed: 0
+  fixedSeed: 24681
+  chestModel: {fileID: 2079795232555931656, guid: b81d7163aed62304ea1b39082bccc7db, type: 3}
+  chestLidModel: {fileID: 2244598050516371393, guid: a48146a595098ed418d54efac3d520a9, type: 3}
+  berdlyModel: {fileID: 5949611467273817325, guid: de23630efa4952543aec3bd4ae2fea96, type: 3}
+  doorModel: {fileID: 4712820069974319987, guid: c33e5853747a92f46bf8c4c778aa3eab, type: 3}
+  steelGateModel: {fileID: 2599317954098326436, guid: 1e67e1a4bd35269439f496189383fa60, type: 3}
+  doorLockUI: {fileID: 3097139457468855762, guid: f07825eb6151e5e40bbc12cb669ee941, type: 3}
+  coinSize: 1.35
+  coinPrefab: {fileID: 2517806833808708046, guid: c36c7ae5ddf95eb43a7b6cd31ef5fc64, type: 3}
+  chestWidth: 3.2
+  diamondChestLoot: {fileID: 11400000, guid: d849b05b9e5d3ba4ab7c1cbe61626b98, type: 2}
+  diamondChestChance: 0.025
+  doorHeight: 6
+  steelGateLiftHeight: 6.5
+  steelGateOpenRange: 4
+  steelGateLiftSpeed: 30
+  gateLiftSound: {fileID: 8300000, guid: 0692fde3ffb79f5499287e1982cb74de, type: 3}
+  gateLiftStartSeconds: 0.11733333
+  floorTiles:
+  - {fileID: 2472275722838735933, guid: 09d27e8e9ecd8674d8351872df8c51ea, type: 3}
+  - {fileID: 2917738818702247311, guid: d47324592bb806b44b5100e579bf393e, type: 3}
+  - {fileID: 7610330453533871796, guid: f4d271d91b82dcc4cafb0f41be614519, type: 3}
+  - {fileID: 3787698522634537214, guid: 629c1ea8b682e534087ef1033caa2812, type: 3}
+  floorTileSize: 6
+  playerLightIntensity: 80
+  breakableDecorations:
+  - {fileID: 4910221286078118866, guid: 161c0eb4163eb9b409f93cb45efb44ff, type: 3}
+  - {fileID: 4033531909399109883, guid: 2fbb35800c86d2e489f99450951a2da2, type: 3}
+  - {fileID: 294131086295788067, guid: 7b3a400f5c670cd4f9e2a16e7ba264cf, type: 3}
+  breakingEffect: {fileID: 1606853898707151722, guid: d3ef3707f0babcd4fb8cc1df8fc3253c, type: 3}
+  breakingSwingSound: {fileID: 8300000, guid: 2355037565bd66b489ddff295c714095, type: 3}
+  breakingImpactSound: {fileID: 8300000, guid: a1c9e923d065c964380dfb9ff113c76c, type: 3}
+  breakingSwingStartSeconds: 0.008916667
+  breakingImpactStartSeconds: 0
+  floorDecorations:
+  - {fileID: 6405618251236164878, guid: 1fe547b7500046a4cba67a94739d9737, type: 3}
+  - {fileID: 221665989627037998, guid: 9f43b44c8577efc4baf3845bc100dc33, type: 3}
+  - {fileID: 1590458368505511945, guid: 009b96dd0b72d2641a3502c948e37a27, type: 3}
+  minimumBreakables: 5
+  maximumBreakables: 9
+  decorationCoinChance: 0.1
+  friendlyEnemyModel: {fileID: 7100033049020845513, guid: 5281e05c3db983a4981e2e8c2cfef0ad, type: 3}
+  dungeonGuideNPC: {fileID: 6709773500704840864, guid: 63aa8535295f77e4497cc70bcf8777ba, type: 3}
+  dungeonFriendlyNPC: {fileID: 2304884527014255544, guid: a968d2e2941351d49907122d3772ebe4, type: 3}
+  friendlyEnemyChance: 0.08
+  floorMaterial: {fileID: 2100000, guid: 36b6937ddc229bc45a15313bd2ce8a5a, type: 2}
+  wallMaterial: {fileID: 2100000, guid: 016ed999c7ac3ed44ad929ad1fd14947, type: 2}
+  doorMaterial: {fileID: 2100000, guid: c590f234321b596449d1cf09927aceef, type: 2}
+  berdlyMaterial: {fileID: 2100000, guid: 336fd67a103b45b409cbcc4038b7ee8e, type: 2}
+  music: {fileID: 8300000, guid: 51f2ac471db014147afe9eb6afb778d5, type: 3}
+  areaTitlePrefab: {fileID: 2866385019334863474, guid: e5088d45a64633743b285cf249188be7, type: 3}
+  areaEnterSound: {fileID: 8300000, guid: dc72255225bfee34a84aef305d139e20, type: 3}
+  coinPickupSound: {fileID: 8300000, guid: d6a4677e8cd4d5e4fb9295e940faaed7, type: 3}
+  roomTransitionPrefab: {fileID: 3573958277703277818, guid: 6a37dad62a8e91d40b286a6a340dd927, type: 3}
+  roomFadeOutSeconds: 0.18
+  roomFadeInSeconds: 0.22

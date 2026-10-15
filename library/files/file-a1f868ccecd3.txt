@@ -1,0 +1,143 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+// Editor-only setup and checks. Gameplay still uses the existing rhythm controller and saved UI.
+[InitializeOnLoad]
+public static class MarioFullChartSetup
+{
+    public const string ChartPath = "Assets/Resources/Rhythm/RainbowRoad_Full.txt";
+    const string Folder = "Temp/RhythmAnalysis";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static MarioFullChartSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        string action = EditorApplication.isPlaying ? "full-play" : "full-setup";
+        string request = Folder + "/" + action + ".request";
+        if (!File.Exists(request) || (!EditorApplication.isPlaying && EditorApplication.isPlayingOrWillChangePlaymode)) return;
+        File.Delete(request);
+        try
+        {
+            if (EditorApplication.isPlaying) CheckPlayMode(); else Build();
+            File.WriteAllText(Folder + "/" + action + "-result.txt", "PASS: full chart with 528 taps/25 holds; approved opening preserved; perfect holds score 100000; no overlapping notes; saved full mode and 450 note speed." +
+                (EditorApplication.isPlaying ? " Full chart opens, hold tails render, result waits for the song ending, Exit releases the challenge." : ""));
+        }
+        catch (Exception error) { File.WriteAllText(Folder + "/" + action + "-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Enable Mario Full Rainbow Road Chart")]
+    public static void Build()
+    {
+        AssetDatabase.ImportAsset(ChartPath);
+        var chart = AssetDatabase.LoadAssetAtPath<TextAsset>(ChartPath);
+        ValidateChart(PinkBeatmap.Parse(chart.text));
+        Scene scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var controller = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<PinkRhythmController>(true)).First();
+            Undo.RecordObject(controller, "Enable full Rainbow Road chart");
+            var fields = new SerializedObject(controller);
+            var song = (AudioClip)fields.FindProperty("song").objectReferenceValue;
+            Require(song != null && song.name.Contains("Wii Rainbow Road") && song.length > 166 && song.length < 167, "The chart needs the supplied MK8 Deluxe track.");
+            fields.FindProperty("pinkBeatmap").objectReferenceValue = chart;
+            fields.FindProperty("usePreviewChart").boolValue = false;
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            Require(fields.FindProperty("pixelsPerSecond").floatValue == 450, "The faster note speed changed.");
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+
+    static void ValidateChart(PinkBeatmap map)
+    {
+        Require(map.AudioStartSeconds == 0 && map.Notes.Length == 553 && map.Notes.Count(n => n.IsHold) == 25, "Incorrect full chart headers or hold count.");
+        var preview = PinkBeatmap.Parse(AssetDatabase.LoadAssetAtPath<TextAsset>(MarioChartPreviewSetup.ChartPath).text);
+        for (int i = 0; i < preview.Notes.Length; i++)
+            Require(map.Notes[i].Key == preview.Notes[i].Key && map.Notes[i].Start == preview.Notes[i].Start && map.Notes[i].End == preview.Notes[i].End, "The approved opening changed.");
+        for (int i = 1; i < map.Notes.Length; i++)
+            Require(map.Notes[i].Start - map.Notes[i - 1].End > .1, "A tap overlaps a hold or lacks a release gap.");
+        Require(map.Notes.Max(n => n.End) > 164 && map.Notes.Max(n => n.End) < 166.4, "The full ending is missing or outside the song.");
+        var session = new PinkRhythmSession(map);
+        // Simulate normal 60 FPS key presses and releases throughout the entire chart.
+        double previous = -1;
+        for (int frame = 0; frame <= 166 * 60 && !session.Finished; frame++)
+        {
+            double now = frame / 60d;
+            int pressed = 0, held = 0;
+            foreach (var note in map.Notes)
+            {
+                if (note.Start > previous && note.Start <= now) pressed |= 1 << note.Key;
+                if (note.IsHold && note.Start <= now && note.End > previous) held |= 1 << note.Key;
+            }
+            session.Tick(now, pressed, held); previous = now;
+        }
+        Require(session.Complete && session.DisplayScore == 100000 && session.UnlocksUltimate, "The full chart cannot be completed perfectly at 60 FPS.");
+        var release = new PinkRhythmSession(PinkBeatmap.Parse("start=0\nnotes=1\n1 t_start=1000 t_end=2000\n"));
+        release.Tick(1, 1, 1); release.Tick(1.1, 0, 0);
+        Require(release.Complete && release.DisplayScore == 20000 && !release.UnlocksUltimate, "Early hold release incorrectly earns a perfect score.");
+    }
+
+    static void CheckPlayMode()
+    {
+        var controller = UnityEngine.Object.FindAnyObjectByType<PinkRhythmController>();
+        var fields = new SerializedObject(controller);
+        Require(!fields.FindProperty("usePreviewChart").boolValue, "The ten-second preview is still enabled.");
+        Require(PinkRhythmController.TryOpenFromNPC(null), "The full challenge cannot open.");
+        var druids = UnityEngine.Object.FindObjectsByType<Druid>(FindObjectsInactive.Include);
+        var unlocked = druids.Select(d => typeof(CharacterBase).GetField("ultimateUnlocked", Private).GetValue(d)).ToArray();
+        try
+        {
+            var session = controller.Session;
+            ValidateChart(session.Beatmap);
+            double firstHold = session.Beatmap.Notes.First(n => n.IsHold).Start;
+            var events = session.Beatmap.Notes.SelectMany(n => new[] { n.Start, n.End }).Append(firstHold + .2).Distinct().OrderBy(v => v);
+            foreach (double at in events)
+            {
+                int pressed = 0, held = 0;
+                foreach (var note in session.Beatmap.Notes)
+                {
+                    if (note.Start == at) pressed |= 1 << note.Key;
+                    if (note.IsHold && note.Start <= at && note.End >= at) held |= 1 << note.Key;
+                }
+                session.Tick(at, pressed, held);
+                if (at == firstHold + .2)
+                {
+                    typeof(PinkRhythmController).GetMethod("RenderNotes", Private).Invoke(controller, new object[] { at });
+                    var container = (RectTransform)fields.FindProperty("notesContainer").objectReferenceValue;
+                    Require(container.GetComponentsInChildren<RectTransform>().Any(r => r.name == "HoldTail" && r.gameObject.activeInHierarchy && r.rect.width > 100), "Hold tails do not render.");
+                }
+            }
+            Require(session.Complete && session.DisplayScore == 100000, "Full in-game session does not score correctly.");
+            SetClockAndUpdate(controller, session.Beatmap.Notes.Last().End + .1);
+            Require((bool)typeof(PinkRhythmController).GetField("playing", Private).GetValue(controller), "The result cuts off the final audio fade.");
+            var song = (AudioClip)fields.FindProperty("song").objectReferenceValue;
+            SetClockAndUpdate(controller, song.length + .05);
+            Require(!(bool)typeof(PinkRhythmController).GetField("playing", Private).GetValue(controller) &&
+                ((GameObject)fields.FindProperty("resultPanel").objectReferenceValue).activeSelf, "The full song does not finish into its result panel.");
+            Require(druids.All(d => d.HasUltimate), "A perfect full song does not unlock the ultimate.");
+        }
+        finally
+        {
+            controller.ExitChallenge();
+            for (int i = 0; i < druids.Length; i++) typeof(CharacterBase).GetField("ultimateUnlocked", Private).SetValue(druids[i], unlocked[i]);
+        }
+        Require(!PinkRhythmController.IsOpen, "Exit did not release the challenge.");
+    }
+    static void SetClockAndUpdate(PinkRhythmController controller, double time)
+    {
+        float offset = new SerializedObject(controller).FindProperty("timingOffset").floatValue;
+        typeof(PinkRhythmController).GetField("dspStart", Private).SetValue(controller, UnityEngine.AudioSettings.dspTime - time - offset);
+        typeof(PinkRhythmController).GetMethod("Update", Private).Invoke(controller, null);
+    }
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

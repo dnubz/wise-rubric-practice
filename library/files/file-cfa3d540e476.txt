@@ -1,0 +1,66 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class WiseSkillFeedbackSetup
+{
+    const string Folder = "Temp/WiseSkills";
+    public const string CrescentDescription = "Sweep a 180 degree crescent within 5m for 25 + 100% Physical ATK, hitting enemies and cover. A/D rotate. A kill resets movement and this cooldown, and heals 5% max HP.";
+    public const string DragonDescription = "Mark a 5m circle within 12m. Five fireballs per enemy, fired in round-robin order. Each enemy's (60 + 110% Magic ATK) x 0.7 damage is split across its five fireballs; cover hit by a fireball takes triple damage.";
+    static double next;
+    static WiseSkillFeedbackSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        if (EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = false; return; }
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved crescent sweep and dodge aura prefabs."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    [MenuItem("WiSe/Battle/Set Up WiSe Skill Feedback")]
+    public static void Build()
+    {
+        var settings = Resources.Load<BattleSettings>("Battle/Settings");
+        var root = new GameObject("StoneCrescentSweep");
+        try
+        {
+            var line = root.AddComponent<LineRenderer>();
+            line.sharedMaterial = Resources.Load<Material>("Battle/EffectLine");
+            line.useWorldSpace = false; line.positionCount = 32;
+            line.startColor = new Color(1, .55f, .08f, 0); line.endColor = new Color(1, .9f, .5f);
+            line.widthMultiplier = .32f;
+            root.AddComponent<BattleCrescentVisual>().sweep = line;
+            settings.crescentEffect = PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Battle/CrescentSweep.prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+        string statusPath = AssetDatabase.GetAssetPath(settings.statusEffect);
+        var statusRoot = PrefabUtility.LoadPrefabContents(statusPath);
+        try { AddDodgeAura(statusRoot.GetComponent<BattleStatusVisual>()); PrefabUtility.SaveAsPrefabAsset(statusRoot, statusPath); }
+        finally { PrefabUtility.UnloadPrefabContents(statusRoot); }
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssetIfDirty(settings);
+        var dragonfire = Resources.Load<BattleSkill>("Battle/Skill_0_2");
+        dragonfire.description = DragonDescription;
+        EditorUtility.SetDirty(dragonfire); AssetDatabase.SaveAssetIfDirty(dragonfire);
+        var crescent = Resources.Load<BattleSkill>("Battle/Skill_0_0"); crescent.description = CrescentDescription;
+        EditorUtility.SetDirty(crescent); AssetDatabase.SaveAssetIfDirty(crescent);
+    }
+    public static void AddDodgeAura(BattleStatusVisual status)
+    {
+        if (status.dodge != null) Object.DestroyImmediate(status.dodge);
+        var root = new GameObject("FlurryRushAura"); root.transform.SetParent(status.transform, false);
+        root.transform.localPosition = Vector3.up * .15f;
+        status.dodge = root;
+        var line = root.AddComponent<LineRenderer>(); line.useWorldSpace = false; line.loop = true;
+        line.sharedMaterial = Resources.Load<Material>("Battle/EffectLine"); line.positionCount = 64; line.widthMultiplier = .09f;
+        line.startColor = line.endColor = new Color(.15f, .5f, 1, .8f);
+        for (int i = 0; i < 64; i++)
+        { float angle = i * Mathf.PI / 32; line.SetPosition(i, new Vector3(Mathf.Sin(angle) * 1.3f, 0, Mathf.Cos(angle) * 1.3f)); }
+        root.AddComponent<BattleEffectVisual>().lifetime = 0;
+        root.SetActive(false);
+    }
+}

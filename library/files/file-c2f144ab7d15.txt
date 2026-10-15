@@ -1,0 +1,154 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.Audio;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class GameMenuChecks
+{
+    const string Folder = "Temp/GameMenu";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double resume;
+    static string relevantError;
+    static GameMenuChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < resume) return;
+        if (routine == null)
+        {
+            if (!File.Exists(Folder + "/check.request")) return;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+            File.Delete(Folder + "/check.request"); relevantError = null;
+            Application.logMessageReceived += CaptureError; routine = Run();
+        }
+        try
+        {
+            if (routine.MoveNext()) { resume = EditorApplication.timeSinceStartup + (routine.Current is float seconds ? seconds : .1f); return; }
+            ((IDisposable)routine).Dispose(); routine = null;
+            Require(relevantError == null, relevantError);
+            File.WriteAllText(Folder + "/check-result.txt", "PASS: all six buttons select exactly one panel; Resources updates when materials are added/removed; all three Stats avatars show correct HP/SP/EXP/combat stats/equipment and react to changes; Settings slider labels, saved preferences and independent mixer levels work and reopen correctly; Keep Playing closes the menu. Save/load survives a scene reload with the same procedural seed, party state, equipment, inventory, coins and location. Four menu screenshots rendered from saved UI.");
+        }
+        catch (Exception error)
+        {
+            ((IDisposable)routine)?.Dispose(); routine = null; File.WriteAllText(Folder + "/check-result.txt", error.ToString());
+        }
+        if (routine == null) { Application.logMessageReceived -= CaptureError; EditorApplication.isPlaying = false; }
+    }
+    static IEnumerator Run()
+    {
+        DisableNPCs();
+        var save = Object.FindAnyObjectByType<GameSave>(); var original = save.Capture();
+        float music = PlayerPrefs.GetFloat("MusicVolume", 1), sfx = PlayerPrefs.GetFloat("SFXVolume", 1);
+        var toggle = Object.FindAnyObjectByType<MenuToggle>(); var menu = Field<GameObject>(toggle, "menuUI");
+        var tabs = toggle.GetComponent<MenuTabManager>(); var entries = Field<List<MenuTabManager.TabEntry>>(tabs, "tabs");
+        var characters = Field<CharacterBase[]>(save, "characters"); var inventory = Field<Inventory>(save, "inventory");
+        try
+        {
+            menu.SetActive(true); yield return .2f;
+            Require(entries.Count == 6 && inventory.Slots.Count == 0, "Six tabs or the empty starting inventory is missing.");
+            for (int i = 0; i < entries.Count; i++)
+            {
+                if (i == 0) tabs.SwitchToTab(1);
+                entries[i].tabButton.onClick.Invoke(); yield return .15f;
+                Require(tabs.CurrentTabIndex == i && entries.Count(t => t.panel.activeSelf) == 1, "Navigation button does not select exactly one tab: " + i);
+                if (i >= 2) Capture(entries[i].panel.GetComponentInParent<Canvas>(), entries[i].tabName);
+            }
+            tabs.SwitchToTab(2); var resources = entries[2].panel.GetComponent<ResourceMenuPanelUI>();
+            var resourceItems = Field<ResourceItem[]>(resources, "resources"); var counts = Field<TMP_Text[]>(resources, "quantities");
+            for (int i = 0; i < resourceItems.Length; i++)
+            {
+                inventory.AddItem(resourceItems[i]); inventory.AddItem(resourceItems[i]);
+                Require(counts[i].text == "2", "Resource count does not update live."); inventory.RemoveAll(resourceItems[i]); Require(counts[i].text == "0", "Resource count does not update on sale.");
+            }
+            inventory.AddItem(resourceItems[3]); Capture(resources.GetComponentInParent<Canvas>(), "Resources-owned"); inventory.RemoveAll(resourceItems[3]);
+            tabs.SwitchToTab(3); var stats = entries[3].panel.GetComponent<StatsMenuPanelUI>();
+            var avatars = Field<Button[]>(stats, "avatarButtons");
+            for (int i = 0; i < characters.Length; i++)
+            {
+                stats.SelectCharacter((i + 1) % characters.Length); avatars[i].onClick.Invoke();
+                Require(Field<TMP_Text>(stats, "characterName").text == characters[i].characterData.displayName, "Stats avatar selects the wrong character.");
+                Require(Field<TMP_Text>(stats, "attack").text == characters[i].GetTotalAttack().ToString(), "Stats attack is wrong.");
+            }
+            stats.SelectCharacter(0); characters[0].SetCurrentHP(100); characters[0].GainExperience(37);
+            Require(Field<TMP_Text>(stats, "hpText").text.StartsWith("100/") && Field<TMP_Text>(stats, "expText").text == "37/100", "Stats does not respond to HP/EXP events.");
+            var gear = AssetDatabase.LoadAssetAtPath<Equipment>(AssetDatabase.GUIDToAssetPath(AssetDatabase.FindAssets("t:Equipment").First()));
+            characters[0].Equip(gear, 0); Require(Field<TMP_Text[]>(stats, "equipment")[0].text == gear.ItemName, "Stats equipment is wrong.");
+            Capture(stats.GetComponentInParent<Canvas>(), "Stats-changed");
+            tabs.SwitchToTab(4); var settings = entries[4].panel.GetComponent<GameAudioMenuUI>();
+            Field<Slider>(settings, "musicSlider").value = .25f; Field<Slider>(settings, "sfxSlider").value = .4f;
+            var mixer = Resources.Load<AudioMixer>("Audio/GameAudio");
+            Require(Field<TMP_Text>(settings, "musicPercent").text == "25%" && Field<TMP_Text>(settings, "sfxPercent").text == "40%", "Slider labels are wrong.");
+            Require(mixer.GetFloat("MusicVolume", out float musicDB) && Mathf.Abs(musicDB - Mathf.Log10(.25f) * 20) < .01f, "Music mixer level does not change.");
+            Require(mixer.GetFloat("SFXVolume", out float sfxDB) && Mathf.Abs(sfxDB - Mathf.Log10(.4f) * 20) < .01f, "SFX mixer level does not change independently.");
+            tabs.SwitchToTab(2); tabs.SwitchToTab(4); Require(Mathf.Approximately(Field<Slider>(settings, "musicSlider").value, .25f), "Music slider does not persist on reopening.");
+            Capture(settings.GetComponentInParent<Canvas>(), "Settings-changed");
+            settings.SetMusic(0); Require(mixer.GetFloat("MusicVolume", out musicDB) && musicDB == -80, "Music mute does not work.");
+            tabs.SwitchToTab(5); var quit = entries[5].panel.GetComponent<QuitMenuUI>(); Field<Button>(quit, "keepPlaying").onClick.Invoke(); Require(!menu.activeSelf, "Keep Playing does not close the menu.");
+            PlayerInventory.Instance.SetGold(321); inventory.AddItem(resourceItems[0]);
+            var diamond = AssetDatabase.LoadAssetAtPath<Consumable>("Assets/Scripts/Inventory/Items/Consumable/Diamond.asset"); inventory.AddItem(diamond); characters[0].UnlockUltimate();
+            var player = CharacterSwitchManager.CurrentCharacterTransform; var expectedPosition = player.position;
+            Require(save.TrySave(out string error, Folder + "/test-save.sav"), error);
+            var data = GameSave.Read(Folder + "/test-save.sav");
+            Require(data.gold == 321 && data.items.Contains(diamond.ItemName) && data.party[0].equipment[0] == gear.ItemName, "Save lost coins, items or equipment.");
+            typeof(GameSave).GetField("pending", BindingFlags.Static | BindingFlags.NonPublic).SetValue(null, data);
+            SceneManager.LoadScene("GameScene"); yield return 3f;
+            DisableNPCs(); save = Object.FindAnyObjectByType<GameSave>(); characters = Field<CharacterBase[]>(save, "characters"); inventory = Field<Inventory>(save, "inventory");
+            Require(WFCWorldManager.Instance.WorldSeed == data.seed && Vector3.Distance(CharacterSwitchManager.CurrentCharacterTransform.position, expectedPosition) < 1, "Continue changed seed or player position.");
+            Require(PlayerInventory.Instance.Gold == 321 && inventory.GetItemCount(diamond) == 1 && characters[0].EquippedItems[0] == gear && characters[0].HasUltimate && characters[0].CurrentExp == 37, "Continue did not restore party, inventory or equipment.");
+            var resumed = save.Capture(); Require(resumed.party[0].hp == data.party[0].hp && resumed.party[0].sp == data.party[0].sp, "Character Awake reset saved HP/SP.");
+            // The title's saved Continue button is checked without modifying the player's save file.
+            var title = SceneManager.LoadSceneAsync("TitleScene", LoadSceneMode.Additive); while (!title.isDone) yield return .1f;
+            Require(Object.FindAnyObjectByType<ContinueSaveUI>(FindObjectsInactive.Include) != null, "Title Continue UI was not saved.");
+            yield return .1f;
+        }
+        finally
+        {
+            if (save != null) save.RestorePartyAndInventory(original);
+            GameAudio.SetMusic(music); GameAudio.SetSFX(sfx);
+        }
+    }
+    static void DisableNPCs() { foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false; }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static void CaptureError(string message, string stack, LogType type)
+    {
+        if ((type == LogType.Error || type == LogType.Exception || type == LogType.Assert) && (stack.Contains("MenuPanelUI") || stack.Contains("GameAudio") || stack.Contains("GameSave") || stack.Contains("QuitMenu") || stack.Contains("ContinueSave"))) relevantError = message + "\n" + stack;
+    }
+    static void Capture(Canvas canvas, string name)
+    {
+        var mode = canvas.renderMode; var previousCamera = canvas.worldCamera; var root = canvas.transform;
+        var transforms = root.GetComponentsInChildren<Transform>(true); var layers = transforms.Select(t => t.gameObject.layer).ToArray();
+        var cameraObject = new GameObject("MenuPreviewCamera"); var camera = cameraObject.AddComponent<Camera>(); var target = new RenderTexture(1280, 720, 24);
+        var pixels = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            camera.targetTexture = target; camera.cullingMask = 1 << 30; camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.015f, .035f, .08f);
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = 1;
+            foreach (var child in transforms) child.gameObject.layer = 30;
+            Canvas.ForceUpdateCanvases(); foreach (var label in root.GetComponentsInChildren<TMP_Text>())
+            {
+                if (label.GetComponentInParent<ResourceMenuPanelUI>() == null && label.GetComponentInParent<StatsMenuPanelUI>() == null &&
+                    label.GetComponentInParent<GameAudioMenuUI>() == null && label.GetComponentInParent<QuitMenuUI>() == null) continue;
+                label.ForceMeshUpdate(); Require(!label.isTextOverflowing, "Text overflows: " + label.name);
+            }
+            camera.Render(); RenderTexture.active = target; pixels.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); pixels.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", pixels.EncodeToPNG());
+        }
+        finally
+        {
+            canvas.renderMode = mode; canvas.worldCamera = previousCamera;
+            for (int i = 0; i < transforms.Length; i++) transforms[i].gameObject.layer = layers[i];
+            RenderTexture.active = previous; Object.DestroyImmediate(cameraObject); Object.DestroyImmediate(target); Object.DestroyImmediate(pixels);
+        }
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}

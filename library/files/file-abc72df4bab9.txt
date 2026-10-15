@@ -1,0 +1,62 @@
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "New Consumable", menuName = "Inventory/Consumable")]
+public class Consumable : Item
+{
+    [Header("Effects")]
+    [Tooltip("HP restored when used. 0 = no HP effect.")]
+    [SerializeField] private int healAmount;
+
+    [Tooltip("SP restored when used. 0 = no SP effect.")]
+    [UnityEngine.Serialization.FormerlySerializedAs("manaAmount")]
+    [SerializeField] private int spAmount;
+
+    [Tooltip("If true, revives a dead character and fully restores HP and SP (Diamond effect).")]
+    [SerializeField] private bool revivesAndFullRestore;
+
+    [Header("Shop")]
+    [Tooltip("Gold cost to purchase from a shop. 0 = not sold in shops.")]
+    [SerializeField] private int cost;
+
+    public int HealAmount        => healAmount;
+    public int SpAmount          => spAmount;
+    public int ManaAmount        => spAmount;
+    public bool RevivesAndFullRestore => revivesAndFullRestore;
+    public override int Cost     => cost;
+
+    /// <summary>Fallback Use() with no target — shows a warning.</summary>
+    public override void Use()
+    {
+        Debug.LogWarning($"[Consumable] Use() called without a character target on '{ItemName}'. Use Use(CharacterBase) instead.");
+    }
+
+    /// <summary>
+    /// Applies this consumable's effects to the given character.
+    /// Handles HP heal, SP restore, and full revive (Diamond).
+    /// </summary>
+    public void Use(CharacterBase character)
+    {
+        if (character == null) return;
+
+        if (revivesAndFullRestore)
+        {
+            // Diamond: revive + full HP and SP
+            character.Heal(character.GetMaxHP());
+            character.RestoreSP(character.GetMaxSP());
+            Debug.Log($"[Consumable] {ItemName} used on {character.name}: Revived + fully restored HP & SP.");
+            return;
+        }
+
+        if (healAmount > 0)
+        {
+            character.Heal(healAmount);
+            Debug.Log($"[Consumable] {ItemName} used on {character.name}: +{healAmount} HP.");
+        }
+
+        if (spAmount > 0)
+        {
+            character.RestoreSP(spAmount);
+            Debug.Log($"[Consumable] {ItemName} used on {character.name}: +{spAmount} SP.");
+        }
+    }
+}

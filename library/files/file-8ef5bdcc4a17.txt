@@ -1,0 +1,12 @@
+using UnityEngine;
+
+/// <summary>Toggles the saved yellow outline mesh on the gate prefab.</summary>
+public sealed class DungeonDoorHighlight : MonoBehaviour
+{
+    [SerializeField] GameObject outline;
+
+    public void SetHighlighted(bool highlighted)
+    {
+        if (outline != null && outline.activeSelf != highlighted) outline.SetActive(highlighted);
+    }
+}

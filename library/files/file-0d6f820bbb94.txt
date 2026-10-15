@@ -1,0 +1,77 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+
+[InitializeOnLoad]
+public static class MarioChartPreviewChecks
+{
+    static double nextCheck;
+    const string Folder = "Temp/RhythmAnalysis";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static MarioChartPreviewChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || !EditorApplication.isPlaying) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: separate 38-tap preview parses; full chart preserved; note speed 450; cheat console leaves existing time/audio states unchanged on open and close; preview keeps updating behind the cheat panel and stops at 10 seconds; perfect input yields 100000 without unlocking the full reward; Exit releases the challenge; Berdly timer expiry continues behind the console."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    static void Run()
+    {
+        var controller = UnityEngine.Object.FindAnyObjectByType<PinkRhythmController>();
+        var fields = new SerializedObject(controller);
+        Require(fields.FindProperty("pixelsPerSecond").floatValue == 450, "Saved Mario note speed was not increased.");
+        Require(fields.FindProperty("usePreviewChart").boolValue && fields.FindProperty("previewSeconds").floatValue == 10, "Ten-second preview is not enabled.");
+        var full = (TextAsset)fields.FindProperty("pinkBeatmap").objectReferenceValue;
+        Require(PinkBeatmap.Parse(full.text).Notes.Length == 553, "Full chart is not assigned.");
+        var druids = UnityEngine.Object.FindObjectsByType<Druid>(FindObjectsInactive.Include);
+        var unlocked = druids.Select(d => d.HasUltimate).ToArray();
+        Require(PinkRhythmController.TryOpenFromNPC(null), "Preview challenge cannot open.");
+        var console = UnityEngine.Object.FindAnyObjectByType<CheatConsole>();
+        float originalTimeScale = Time.timeScale;
+        bool originalAudioPause = AudioListener.pause;
+        try
+        {
+            Time.timeScale = .75f; AudioListener.pause = true;
+            console.Open();
+            Require(Time.timeScale == .75f && AudioListener.pause, "Console opening changes global pause state.");
+            Time.timeScale = .5f; AudioListener.pause = false;
+            console.Close();
+            Require(Time.timeScale == .5f && !AudioListener.pause, "Console closing overwrites an external pause change.");
+            Time.timeScale = originalTimeScale; AudioListener.pause = originalAudioPause;
+            console.Open();
+            var session = controller.Session;
+            Require(session.Beatmap.Notes.Length == 38 && session.Beatmap.AudioStartSeconds == 0 &&
+                session.Beatmap.Notes.All(n => !n.IsHold && n.Start >= 0 && n.End < 10), "Preview notes are invalid.");
+            foreach (var note in session.Beatmap.Notes) session.Tick(note.Start, 1 << note.Key, 1 << note.Key);
+            Require(session.Complete && session.DisplayScore == 100000, "Preview timing cannot achieve a perfect score.");
+            typeof(PinkRhythmController).GetField("dspStart", Private).SetValue(controller, UnityEngine.AudioSettings.dspTime - 10.01);
+            typeof(PinkRhythmController).GetMethod("Update", Private).Invoke(controller, null);
+            Require(!(bool)typeof(PinkRhythmController).GetField("playing", Private).GetValue(controller) && !controller.GetComponent<AudioSource>().isPlaying,
+                "The ten-second preview does not stop its song.");
+            for (int i = 0; i < druids.Length; i++) Require(druids[i].HasUltimate == unlocked[i], "Short preview unlocked the full-game reward.");
+        }
+        finally
+        {
+            console.Close(); controller.ExitChallenge();
+            Time.timeScale = originalTimeScale; AudioListener.pause = originalAudioPause;
+        }
+        Require(!PinkRhythmController.IsOpen, "Preview does not release the challenge on Exit.");
+        var battle = UnityEngine.Object.FindAnyObjectByType<BerdlyBattleController>();
+        Require(BerdlyBattleController.TryOpenFromNPC(null), "Berdly battle cannot open for its timer check.");
+        try
+        {
+            battle.ChooseAttack(); console.Open();
+            typeof(BerdlyBattleController).GetField("remainingTime", Private).SetValue(battle, 0f);
+            typeof(BerdlyBattleController).GetMethod("Update", Private).Invoke(battle, null);
+            Require(battle.Screen == BerdlyBattleController.BattleScreen.Resolving, "Cheat console prevents Berdly's expired timer from resolving.");
+        }
+        finally { console.Close(); battle.ExitBattle(); }
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}

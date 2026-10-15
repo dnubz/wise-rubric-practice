@@ -1,0 +1,205 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+// Real prefab generation, including physics interference and minimap pre-caching.
+[InitializeOnLoad]
+public static class OverworldSeedChecks
+{
+    const string Folder = "Temp/OverworldSeed";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double next;
+    static OverworldSeedChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (EditorApplication.isPlaying) EditorApplication.isPaused = false;
+        if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3 || WFCWorldManager.Instance == null) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: repeated real-prefab generation with reversed order, player/foreign colliders, Unity RNG changes, minimap pre-cache and reload; changed-seed variation, restore invalidation, seeded loot/drop scatter and 5x5 pool rings."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); Debug.LogException(e); }
+        finally { EditorApplication.isPlaying = false; }
+    }
+    static T Get<T>(object obj, string field) => (T)obj.GetType().GetField(field, Private).GetValue(obj);
+    static void Set(object obj, string field, object value) => obj.GetType().GetField(field, Private).SetValue(obj, value);
+    static void Require(bool value, string error) { if (!value) throw new Exception(error); }
+
+    static void Run()
+    {
+        var world = WFCWorldManager.Instance; world.enabled = false;
+        var coords = new[] { new Vector2Int(20, 20), new Vector2Int(21, 20), new Vector2Int(-21, -20), new Vector2Int(-20, -20) };
+        Set(world, "waterPoolChance", .5f);
+        var npc = Get<NPCSpawner>(world, "npcSpawner"); if (npc != null) Set(npc, "spawnChance", 1f);
+        var buildings = Get<BuildingSpawner>(world, "buildingSpawner");
+        if (buildings != null) { Set(buildings, "spawnChance", 1f); Set(buildings, "dungeonSpawnChance", 1f); }
+        var enemies = world.GetComponent<EnemySpawner>(); if (enemies != null) enemies.chance = 1;
+        world.RestoreSavedWorld(12345, null);
+        var first = Generate(world, coords, false);
+        var baselineRoots = Get<Dictionary<Vector2Int, GameObject>>(world, "chunks");
+        var generatedEnemies = coords.SelectMany(c => baselineRoots[c].GetComponentsInChildren<EncounterEnemy>(true)).ToArray();
+        int npcCount = coords.Sum(c => baselineRoots[c].GetComponentsInChildren<NPCBase>(true).Length);
+        int buildingCount = coords.Sum(c => baselineRoots[c].GetComponentsInChildren<DungeonEntrance>(true).Length);
+        Require(generatedEnemies.Length > 0 && npcCount > 0 && buildingCount > 0, "Test seed must exercise enemies, NPCs and buildings.");
+        Vector3 enemyHome = generatedEnemies[0].home;
+        string coverage = "Real prefab coverage: " + generatedEnemies.Length + " enemies, " + npcCount + " NPCs, " + buildingCount + " dungeon entrances.\n";
+        Clear(world, coords);
+        var blocker = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        blocker.name = "Unrelated moving object";
+        blocker.transform.position = new Vector3(21 * world.ChunkSize * world.TileSize, 2, 20.5f * world.ChunkSize * world.TileSize);
+        blocker.transform.localScale = new Vector3(world.ChunkSize * world.TileSize * 3, 10, world.ChunkSize * world.TileSize * 2);
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        Vector3 oldPosition = player != null ? player.position : Vector3.zero;
+        var controller = player != null ? player.GetComponent<CharacterController>() : null;
+        bool controllerEnabled = controller != null && controller.enabled;
+        try
+        {
+            if (controller != null) controller.enabled = false;
+            if (player != null) player.position = enemyHome;
+            UnityEngine.Random.InitState(991238);
+            Physics.SyncTransforms();
+            var reversed = Generate(world, coords.Reverse().ToArray(), true);
+            Compare(first, reversed, "Reversed order / foreign collider / player / precache");
+            Clear(world, coords);
+            UnityEngine.Random.InitState(-417);
+            var reload = Generate(world, coords, false);
+            Compare(first, reload, "Chunk reload");
+            var chests = Get<Dictionary<Vector2Int, GameObject>>(world, "chunks");
+            var poolCoord = coords.First(c => chests[c].GetComponentsInChildren<Chest>(true).Any(ch => ch.name.StartsWith("Pool Chest")));
+            var chest = chests[poolCoord].GetComponentsInChildren<Chest>(true).First(ch => ch.name.StartsWith("Pool Chest"));
+            Require(chest != null, "Pool chest missing.");
+            chest.RestoreOpenedState();
+            var pool = Get<object>(world, "poolContent");
+            pool.GetType().GetMethod("RestoreOpenedChests").Invoke(pool, new object[] { new[] { poolCoord } });
+            Clear(world, coords);
+            Generate(world, new[] { poolCoord }, false);
+            Require(Get<Dictionary<Vector2Int, GameObject>>(world, "chunks")[poolCoord].GetComponentsInChildren<Chest>(true).First(ch => ch.name.StartsWith("Pool Chest")).IsOpened, "Opened pool chest reset on reload.");
+            Clear(world, coords);
+            world.GetTerrainAt(new Vector3(coords[1].x * world.ChunkSize * world.TileSize + 5, 0, coords[1].y * world.ChunkSize * world.TileSize + 5));
+            world.RestoreSavedWorld(-98765, null);
+            Require(Get<Dictionary<Vector2Int, int[,]>>(world, "terrainByChunk").Count == 0, "Save restore reused old seed caches.");
+            var changed = Generate(world, coords, true);
+            Require(coords.Any(c => first[c] != changed[c]), "Different world seed generated identical content.");
+            CheckLootAndDrops(world);
+            File.WriteAllText(Folder + "/details.txt", coverage + string.Join("\n", coords.Select(c => c + " baseline characters/content lines: " + first[c].Split('\n').Length)));
+        }
+        finally
+        {
+            if (player != null) player.position = oldPosition;
+            if (controller != null) controller.enabled = controllerEnabled;
+            Object.DestroyImmediate(blocker);
+        }
+    }
+
+    static Dictionary<Vector2Int, string> Generate(WFCWorldManager world, Vector2Int[] coords, bool precache)
+    {
+        if (precache) foreach (var c in coords.Reverse())
+            for (int x = 0; x < world.ChunkSize; x++) for (int z = 0; z < world.ChunkSize; z++)
+                world.GetTerrainAt(new Vector3((c.x * world.ChunkSize + x + .5f) * world.TileSize, 0, (c.y * world.ChunkSize + z + .5f) * world.TileSize));
+        var result = new Dictionary<Vector2Int, string>();
+        foreach (var c in coords)
+        {
+            typeof(WFCWorldManager).GetMethod("GenerateChunk", Private).Invoke(world, new object[] { c });
+            var root = Get<Dictionary<Vector2Int, GameObject>>(world, "chunks")[c];
+            var cells = Get<Dictionary<Vector2Int, int[,]>>(world, "terrainByChunk")[c];
+            ValidatePool(cells);
+            var text = new StringBuilder();
+            foreach (int type in cells) text.Append(type);
+            foreach (Transform child in root.transform)
+            {
+                if (!child.gameObject.activeSelf) continue;
+                text.Append('\n').Append(child.name).Append(' ').Append(V(child.position)).Append(' ').Append(Q(child.rotation)).Append(' ').Append(V(child.localScale));
+                var terrain = child.GetComponent<Terrain>();
+                if (terrain != null)
+                {
+                    Require(terrain.GetComponent<TerrainCollider>() != null, "WFC tile lacks Unity Terrain collision.");
+                    uint hash = 2166136261;
+                    unchecked { foreach (float weight in terrain.terrainData.GetAlphamaps(0, 0, terrain.terrainData.alphamapWidth, terrain.terrainData.alphamapHeight)) hash = (hash ^ (uint)weight.GetHashCode()) * 16777619; }
+                    text.Append(" paint=").Append(hash);
+                }
+            }
+            foreach (var chest in root.GetComponentsInChildren<Chest>())
+            {
+                var table = Get<LootTable>(chest, "lootTable"); var rng = Get<System.Random>(chest, "lootRandom");
+                Require(rng != null, "Generated pool chest has no seeded loot stream.");
+                text.Append("\nChest ").Append(V(chest.transform.position)).Append(" loot=").Append(table != null ? table.RollEntry(rng)?.Item?.ItemName : "none");
+            }
+            result[c] = text.ToString();
+        }
+        foreach (var c in coords) Get<Dictionary<Vector2Int, GameObject>>(world, "chunks")[c].SetActive(false);
+        return result;
+    }
+    static void Clear(WFCWorldManager world, Vector2Int[] coords)
+    {
+        var roots = Get<Dictionary<Vector2Int, GameObject>>(world, "chunks");
+        var data = Get<Dictionary<Vector2Int, List<TerrainData>>>(world, "generatedTerrainData");
+        foreach (var c in coords)
+        {
+            if (roots.TryGetValue(c, out var root)) Object.DestroyImmediate(root);
+            roots.Remove(c);
+            if (data.TryGetValue(c, out var list)) foreach (var terrain in list) Object.DestroyImmediate(terrain);
+            data.Remove(c);
+            Get<Dictionary<Vector2Int, int[,]>>(world, "terrainByChunk").Remove(c);
+            Get<Dictionary<Vector2Int, Vector4>>(world, "poolBoundsByChunk").Remove(c);
+        }
+    }
+    static void Compare(Dictionary<Vector2Int, string> a, Dictionary<Vector2Int, string> b, string label)
+    {
+        foreach (var c in a.Keys) if (a[c] != b[c])
+        {
+            File.WriteAllText(Folder + "/expected.txt", a[c]); File.WriteAllText(Folder + "/actual.txt", b[c]);
+            throw new Exception(label + " changed generation in " + c);
+        }
+    }
+    static void ValidatePool(int[,] cells)
+    {
+        var water = new List<Vector2Int>();
+        for (int x = 0; x < cells.GetLength(0); x++) for (int z = 0; z < cells.GetLength(1); z++) if (cells[x, z] == 1) water.Add(new Vector2Int(x, z));
+        if (water.Count == 0) return;
+        Require(water.Count == 25, "Pool is not 5x5.");
+        int left = water.Min(c => c.x), bottom = water.Min(c => c.y);
+        for (int x = left - 2; x <= left + 6; x++) for (int z = bottom - 2; z <= bottom + 6; z++)
+        {
+            int ring = Mathf.Max(left - x, x - left - 4, bottom - z, z - bottom - 4, 0);
+            Require(ring == 0 ? cells[x, z] == 1 : ring == 1 ? cells[x, z] == 2 : cells[x, z] == 0 || cells[x, z] == 3, "Pool shoreline ordering violated, including corners.");
+        }
+    }
+    static void CheckLootAndDrops(WFCWorldManager world)
+    {
+        var table = AssetDatabase.FindAssets("t:LootTable").Select(AssetDatabase.GUIDToAssetPath).Select(AssetDatabase.LoadAssetAtPath<LootTable>).First(t => t.Entries.Count > 1);
+        var positions = new[] { new Vector3(-123.25f, 0, 456.75f), new Vector3(50.1f, 0, -87.2f) };
+        var expected = positions.Select(p => table.RollEntry(WorldRandom.AtPosition(p, 0x4C4F4F54))).ToArray();
+        UnityEngine.Random.InitState(1700);
+        for (int i = positions.Length - 1; i >= 0; i--) Require(expected[i] == table.RollEntry(WorldRandom.AtPosition(positions[i], 0x4C4F4F54)), "Loot depends on opening order or shared RNG.");
+        var tree = new GameObject("Seeded drop probe"); tree.transform.position = positions[0];
+        var cuttable = tree.AddComponent<TreeCuttable>();
+        Set(cuttable, "lootTable", new[] { new TreeCuttable.LootEntry { item = table.Entries.First(e => e != null && e.Item != null).Item, amount = 4 } });
+        var spawn = typeof(TreeCuttable).GetMethod("SpawnLoot", Private);
+        try
+        {
+            var before = new HashSet<WorldItem>(Object.FindObjectsByType<WorldItem>(FindObjectsInactive.Include));
+            spawn.Invoke(cuttable, null);
+            var drops = Object.FindObjectsByType<WorldItem>(FindObjectsInactive.Include).Where(d => !before.Contains(d)).OrderBy(d => d.transform.position.x).ToArray();
+            var signature = drops.Select(d => V(d.transform.position)).ToArray();
+            foreach (var drop in drops) Object.DestroyImmediate(drop.gameObject);
+            UnityEngine.Random.InitState(987);
+            spawn.Invoke(cuttable, null);
+            drops = Object.FindObjectsByType<WorldItem>(FindObjectsInactive.Include).Where(d => !before.Contains(d)).OrderBy(d => d.transform.position.x).ToArray();
+            Require(signature.SequenceEqual(drops.Select(d => V(d.transform.position))), "Resource scatter uses unseeded randomness.");
+            foreach (var drop in drops) Object.DestroyImmediate(drop.gameObject);
+        }
+        finally { Object.DestroyImmediate(tree); }
+    }
+    static string F(float value) => value.ToString("R", CultureInfo.InvariantCulture);
+    static string V(Vector3 p) => F(p.x) + "," + F(p.y) + "," + F(p.z);
+    static string Q(Quaternion q) => F(q.x) + "," + F(q.y) + "," + F(q.z) + "," + F(q.w);
+}

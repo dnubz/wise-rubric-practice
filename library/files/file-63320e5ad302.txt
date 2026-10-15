@@ -1,0 +1,134 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+// Keep the real party and inventories in GameScene. Only the arena is loaded additively.
+[DefaultExecutionOrder(-250)]
+public sealed class BattleSession : MonoBehaviour
+{
+    public static BattleSession Instance { get; private set; }
+    public static bool IsActive => Instance != null && Instance.active;
+    public static bool BlocksGameplayInput => IsActive;
+    public static bool MenuOpen => Instance != null && Instance.menu != null && Instance.menu.activeInHierarchy;
+    public static Vector3 ReturnPosition => Instance != null ? Instance.returnPosition : Vector3.zero;
+    public static Quaternion ReturnRotation => Instance != null ? Instance.returnRotation : Quaternion.identity;
+    public CharacterBase[] party;
+    public GameObject menu;
+    public CanvasGroup fade;
+    public CharacterSwitchManager switching;
+    public CameraController cameraRig;
+    public BattleSettings settings;
+    public GameObject[] explorationHUD;
+    public string TravelStage { get; private set; } = "Exploring";
+    bool active, loading;
+    Vector3 returnPosition;
+    Quaternion returnRotation;
+    EncounterEnemy encounter;
+    Scene origin;
+    readonly List<Behaviour> behaviours = new List<Behaviour>();
+    readonly List<Collider> colliders = new List<Collider>();
+    readonly List<GameObject> hidden = new List<GameObject>();
+    readonly List<AudioSource> music = new List<AudioSource>();
+    readonly HashSet<string> defeated = new HashSet<string>();
+    bool[] partyActive;
+    Canvas menuCanvas;
+    int menuSortingOrder;
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)] static void ResetStatics() => Instance = null;
+    void Awake() { Instance = this; if (fade != null) { fade.alpha = 0; fade.blocksRaycasts = false; } }
+    public bool IsDefeated(string id) => !string.IsNullOrEmpty(id) && defeated.Contains(id);
+    public string[] DefeatedIds { get { var values = new string[defeated.Count]; defeated.CopyTo(values); return values; } }
+    public void RestoreDefeated(string[] values) { defeated.Clear(); if (values != null) foreach (string id in values) defeated.Add(id); }
+    public bool Begin(EncounterEnemy source)
+    {
+        if (active || loading || source == null || NPCChallengePrompt.BlocksGameplayInput || source.data == null) return false;
+        if (!Application.CanStreamedLevelBeLoaded("BattleScene")) { Debug.LogError("BattleScene is missing from Build Settings."); return false; }
+        encounter = source; returnPosition = CharacterSwitchManager.CurrentCharacterTransform.position;
+        returnRotation = CharacterSwitchManager.CurrentCharacterTransform.rotation; origin = SceneManager.GetActiveScene();
+        StartCoroutine(Enter()); return true;
+    }
+    IEnumerator Fade(float to)
+    {
+        if (fade == null) yield break;
+        fade.gameObject.SetActive(true); fade.blocksRaycasts = true;
+        float from = fade.alpha, elapsed = 0;
+        while (elapsed < .45f) { elapsed += Time.unscaledDeltaTime; fade.alpha = Mathf.Lerp(from, to, elapsed / .45f); yield return null; }
+        fade.alpha = to; fade.blocksRaycasts = to > 0;
+    }
+    IEnumerator Enter()
+    {
+        active = loading = true; if (menu != null) menu.SetActive(false);
+        menuCanvas = menu != null ? menu.GetComponentInParent<Canvas>(true) : null;
+        if (menuCanvas != null) { menuSortingOrder = menuCanvas.sortingOrder; menuCanvas.sortingOrder = 200; }
+        DungeonAudio.Play(settings.enterSound, returnPosition, 1);
+        yield return Fade(1);
+        partyActive = new bool[party.Length];
+        for (int i = 0; i < party.Length; i++)
+        {
+            var character = party[i]; partyActive[i] = character.gameObject.activeSelf;
+            // Exploration skills have their own input maps; suspend them while battle owns the controls.
+            Disable(character); Disable(character.GetComponent<CharacterMovement>()); Disable(character.GetComponent<CharacterSurfaceAudio>());
+            var capsule = character.GetComponent<CharacterController>(); if (capsule != null && capsule.enabled) { colliders.Add(capsule); capsule.enabled = false; }
+            character.gameObject.SetActive(true);
+        }
+        Disable(switching);
+        if (WFCWorldManager.Instance != null) Hide(WFCWorldManager.Instance.gameObject);
+        if (DungeonSession.Generator != null) Hide(DungeonSession.Generator.gameObject);
+        if (explorationHUD != null) foreach (var hud in explorationHUD) Hide(hud);
+        foreach (var map in FindObjectsByType<OverworldMinimap>()) Hide(map.gameObject);
+        foreach (var light in FindObjectsByType<Light>()) if (light.gameObject.scene.name != "BattleScene") Hide(light.gameObject);
+        foreach (var audio in FindObjectsByType<AudioSource>()) if (audio.isPlaying && audio.loop && audio.spatialBlend < .1f) { audio.Pause(); music.Add(audio); }
+        yield return SceneManager.LoadSceneAsync("BattleScene", LoadSceneMode.Additive);
+        if (cameraRig != null) Hide(cameraRig.gameObject);
+        var battle = SceneManager.GetSceneByName("BattleScene"); SceneManager.SetActiveScene(battle);
+        var controller = FindAnyObjectByType<BattleController>();
+        controller.Setup(party, encounter.data, encounter.IsBoss);
+        loading = false; yield return Fade(0);
+    }
+    void Disable(Behaviour component) { if (component != null && component.enabled) { behaviours.Add(component); component.enabled = false; } }
+    void Hide(GameObject target) { if (target != null && target.activeSelf && !hidden.Contains(target)) { hidden.Add(target); target.SetActive(false); } }
+    public void Finish(bool victory)
+    {
+        if (loading || !active) return;
+        if (victory && encounter != null) { defeated.Add(encounter.identity); encounter.Defeat(); }
+        StartCoroutine(Leave());
+    }
+    IEnumerator Leave()
+    {
+        TravelStage = "Return fade";
+        loading = true; yield return Fade(1);
+        TravelStage = "Restore party";
+        if (menu != null) menu.SetActive(false);
+        if (menuCanvas != null) menuCanvas.sortingOrder = menuSortingOrder;
+        SceneManager.SetActiveScene(origin);
+        foreach (var character in party)
+        {
+            var unit = character.GetComponent<BattleUnit>(); if (unit != null)
+            {
+                unit.ClearEffects(); unit.Agent.enabled = false; unit.Appearance.Restore(); unit.enabled = false;
+                var hitbox = character.GetComponent<CapsuleCollider>(); if (hitbox != null) hitbox.enabled = false;
+                var animator = character.GetComponentInChildren<Animator>(); if (animator != null) animator.enabled = true;
+            }
+            var movement = character.GetComponent<CharacterMovement>();
+            if (movement != null) movement.Teleport(returnPosition, returnRotation); else character.transform.SetPositionAndRotation(returnPosition, returnRotation);
+        }
+        for (int i = 0; i < party.Length; i++) party[i].gameObject.SetActive(partyActive[i]);
+        TravelStage = "Restore world";
+        foreach (var component in behaviours) if (component != null) component.enabled = true;
+        behaviours.Clear();
+        foreach (var collider in colliders) if (collider != null) collider.enabled = true; colliders.Clear();
+        foreach (var target in hidden) if (target != null) target.SetActive(true); hidden.Clear();
+        foreach (var audio in music) if (audio != null) audio.UnPause(); music.Clear();
+        if (cameraRig != null) cameraRig.SnapToTarget();
+        TravelStage = "Unload arena";
+        yield return SceneManager.UnloadSceneAsync("BattleScene");
+        TravelStage = "Exploring";
+        Physics.SyncTransforms(); active = loading = false; yield return Fade(0);
+        if (origin.name == "GameScene" && !DungeonSession.IsInside) DungeonAreaTitle.ShowOverworld();
+    }
+    public void OpenMenu() { if (!loading && active && menu != null) menu.SetActive(!menu.activeSelf); }
+    public bool CheatWin() { if (!active || loading || BattleController.Instance == null) return false; BattleController.Instance.DefeatAllEnemies(); return true; }
+    void OnDestroy() { if (Instance == this) Instance = null; }
+}

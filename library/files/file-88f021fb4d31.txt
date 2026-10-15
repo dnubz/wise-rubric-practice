@@ -1,0 +1,26 @@
+using UnityEngine;
+
+/// <summary>A pool-centre rock summit with a grounded chest interaction area.</summary>
+public sealed class PoolGlideCliff : MonoBehaviour
+{
+    [SerializeField] BoxCollider landing;
+    public BoxCollider Landing => landing;
+    public float TopHeight => landing.bounds.max.y;
+
+    public void Place(System.Random random)
+    {
+        transform.rotation = Quaternion.Euler(0, random.Next(4) * 90f, 0);
+    }
+    public bool Supports(Transform player)
+    {
+        if (player == null) return false;
+        var movement = player.GetComponent<CharacterMovement>();
+        var controller = player.GetComponent<CharacterController>();
+        if (movement == null || controller == null || movement.IsSwimming || !movement.IsGrounded) return false;
+        Bounds area = landing.bounds;
+        Vector3 feet = controller.bounds.center - Vector3.up * controller.bounds.extents.y;
+        return feet.x >= area.min.x - .2f && feet.x <= area.max.x + .2f &&
+            feet.z >= area.min.z - .2f && feet.z <= area.max.z + .2f &&
+            feet.y >= area.max.y - .3f;
+    }
+}

@@ -1,0 +1,156 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+/// <summary>Renders the saved lighting with WFC-selected tiles and checks camera state restoration.</summary>
+[InitializeOnLoad]
+public static class DungeonLightingChecks
+{
+    const string Folder = "Temp/DungeonLighting";
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static DungeonLightingChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: all four gameplay views clear to black and enable post processing in the dungeon, then restore their original background/post settings; saved dungeon scene has warm readable lighting and active bloom/ACES; native HDR render shows bloom and black background; player spotlight is shadow-free and follows movement/teleports."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Validate Dungeon Lighting")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder); DungeonCameraChecks.Run();
+        Scene original = SceneManager.GetActiveScene();
+        Scene dungeon = EditorSceneManager.OpenScene("Assets/Scenes/DungeonScene.unity", OpenSceneMode.Additive);
+        var owned = new GameObject("LightingPreview"); SceneManager.MoveGameObjectToScene(owned, dungeon);
+        var disabled = new List<Behaviour>();
+        var savedPlayerField = typeof(CharacterSwitchManager).GetField("<CurrentCharacterTransform>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
+        object savedPlayer = savedPlayerField.GetValue(null);
+        DungeonSettings settings = null; RenderTexture target = null; Texture2D glowImage = null, plainImage = null;
+        Bloom bloom = null; float bloomIntensity = 0;
+        try
+        {
+            SceneManager.SetActiveScene(dungeon);
+            Require(RenderSettings.skybox == null && !RenderSettings.fog && RenderSettings.ambientLight.maxColorComponent > .1f,
+                "Saved dungeon environment is missing or too dark.");
+            var volume = dungeon.GetRootGameObjects().Select(r => r.GetComponent<Volume>()).First(v => v != null);
+            Require(volume.isGlobal && volume.sharedProfile.TryGet(out bloom) && bloom.intensity.value > 0,
+                "Saved bloom is missing.");
+            Require(volume.sharedProfile.TryGet<Tonemapping>(out var tone) && tone.mode.value == TonemappingMode.ACES,
+                "ACES tonemapping is missing.");
+            bloomIntensity = bloom.intensity.value;
+            foreach (Volume other in Object.FindObjectsByType<Volume>(FindObjectsSortMode.None))
+                if (other != volume && other.enabled) { other.enabled = false; disabled.Add(other); }
+            foreach (Light light in Object.FindObjectsByType<Light>(FindObjectsSortMode.None))
+                if (light.gameObject.scene != dungeon && light.enabled) { light.enabled = false; disabled.Add(light); }
+            foreach (GameObject root in dungeon.GetRootGameObjects())
+                if (root.TryGetComponent<Camera>(out var existing) && existing.enabled) { existing.enabled = false; disabled.Add(existing); }
+            settings = Object.Instantiate(Resources.Load<DungeonSettings>("Dungeon/Settings")); settings.music = null;
+            var generator = owned.AddComponent<DungeonGenerator>(); Set(generator, "settings", settings);
+            var naming = new BerdlyChemistry(0, Table("alkane"), Table("alkyl"), Table("prefix"));
+            var layout = DungeonLayout.Generate(24681, 12, 36, 42, naming);
+            Set(generator, "<Layout>k__BackingField", layout);
+            var room = new GameObject("WFC Preview Room"); room.transform.SetParent(owned.transform);
+            ((List<GameObject>)Get(generator, "roomRoots")).Add(room);
+            int[] tiles = DungeonFloorWFC.Generate(6, 6, 24681);
+            for (int z = 0; z < 6; z++) for (int x = 0; x < 6; x++)
+            {
+                var tile = Object.Instantiate(settings.floorTiles[tiles[z * 6 + x]], room.transform);
+                tile.transform.position = new Vector3((x - 2.5f) * 6, 0, (z - 2.5f) * 6);
+                tile.transform.localScale = new Vector3(3, 1, 3);
+            }
+            foreach (var position in new[] { new Vector3(-5, 0, 3), new Vector3(4, 0, -3), new Vector3(6, 0, 5) })
+            {
+                var prop = Object.Instantiate(settings.breakableDecorations[0], room.transform); prop.transform.position = position;
+                prop.transform.localScale *= 1.8f;
+            }
+            var chest = Object.Instantiate(settings.chestModel, room.transform); chest.transform.position = new Vector3(-4, 0, -4);
+            var probe = new GameObject("PlayerProbe"); probe.transform.SetParent(owned.transform);
+            savedPlayerField.SetValue(null, probe.transform);
+            generator.BeginExploration(); Invoke(generator, "MovePlayerLight");
+            var spotlight = (Light)Get(generator, "playerLight");
+            Require(spotlight.shadows == LightShadows.None && spotlight.intensity == 80 &&
+                Vector3.Distance(spotlight.transform.position, Vector3.up * 9) < .01f, "Player light is not configured correctly.");
+            probe.transform.position = new Vector3(2, 0, 3); Invoke(generator, "MovePlayerLight");
+            Require(Vector3.Distance(spotlight.transform.position, probe.transform.position + Vector3.up * 9) < .01f,
+                "Light does not follow the player.");
+            probe.transform.position = Vector3.zero; Invoke(generator, "MovePlayerLight");
+            var gold = (Material)Invoke(generator, "CreateGoldMaterial");
+            foreach (Vector3 position in new[] { new Vector3(3, 1, 1), new Vector3(-2, 1, 2), new Vector3(5, 1, -4) })
+            {
+                var coin = GameObject.CreatePrimitive(PrimitiveType.Cylinder); coin.transform.SetParent(owned.transform);
+                coin.transform.position = position; coin.transform.rotation = Quaternion.Euler(90, 0, 0);
+                coin.transform.localScale = new Vector3(1.35f, .16f, 1.35f); coin.GetComponent<Renderer>().sharedMaterial = gold;
+            }
+            var cameraObject = new GameObject("LightingCamera"); cameraObject.transform.SetParent(owned.transform);
+            var camera = cameraObject.AddComponent<Camera>(); camera.clearFlags = CameraClearFlags.SolidColor;
+            camera.backgroundColor = Color.black; camera.allowHDR = true; camera.orthographic = true; camera.orthographicSize = 23;
+            camera.transform.rotation = Quaternion.Euler(65, 45, 0); camera.transform.position = Vector3.up * 1.5f - camera.transform.forward * 42;
+            var data = camera.GetUniversalAdditionalCameraData(); data.renderPostProcessing = true; data.volumeLayerMask = 1;
+            foreach (Transform child in owned.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+            camera.cullingMask = 1 << 30; spotlight.cullingMask = 1 << 30;
+            // URP keeps its lighting/bloom buffers HDR; the final screenshot uses the same sRGB output as the display.
+            target = new RenderTexture(1100, 700, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB); camera.targetTexture = target;
+            camera.ResetWorldToCameraMatrix(); camera.ResetProjectionMatrix();
+            File.WriteAllText(Folder + "/camera-details.txt", $"Room active: {room.activeInHierarchy}; Renderers: {room.GetComponentsInChildren<Renderer>().Length}; viewport: {camera.WorldToViewportPoint(Vector3.zero)}; Camera: {camera.transform.position}; Pipeline: {GraphicsSettings.currentRenderPipeline}");
+            data.renderPostProcessing = false;
+            var baseline = Render(camera, target); File.WriteAllBytes(Folder + "/baseline.png", baseline.EncodeToPNG()); Object.DestroyImmediate(baseline);
+            data.renderPostProcessing = true;
+            glowImage = Render(camera, target); File.WriteAllBytes(Folder + "/glow.png", glowImage.EncodeToPNG());
+            bloom.intensity.value = 0;
+            plainImage = Render(camera, target);
+            var glowPixels = glowImage.GetPixels(); var plainPixels = plainImage.GetPixels();
+            int changed = 0;
+            for (int i = 0; i < glowPixels.Length; i++) if ((glowPixels[i] - plainPixels[i]).maxColorComponent > .005f) changed++;
+            Require(changed > 100, "Bloom is not visible in the HDR render.");
+            Require(glowImage.GetPixel(0, 0).maxColorComponent < .02f, "The dungeon background is not black.");
+            File.WriteAllText(Folder + "/render-details.txt", $"Bloom changed {changed} pixels; black corner={glowImage.GetPixel(0, 0)}.");
+        }
+        finally
+        {
+            if (bloom != null) bloom.intensity.value = bloomIntensity;
+            foreach (Behaviour item in disabled) if (item != null) item.enabled = true;
+            savedPlayerField.SetValue(null, savedPlayer);
+            if (target != null) { foreach (Camera camera in owned.GetComponentsInChildren<Camera>()) camera.targetTexture = null; target.Release(); Object.DestroyImmediate(target); }
+            if (glowImage != null) Object.DestroyImmediate(glowImage);
+            if (plainImage != null) Object.DestroyImmediate(plainImage);
+            var generator = owned.GetComponent<DungeonGenerator>();
+            if (generator != null)
+            {
+                var materials = (List<Material>)Get(generator, "ownedMaterials");
+                foreach (Material material in materials) Object.DestroyImmediate(material);
+                materials.Clear();
+            }
+            Object.DestroyImmediate(owned); if (settings != null) Object.DestroyImmediate(settings);
+            SceneManager.SetActiveScene(original); EditorSceneManager.CloseScene(dungeon, true);
+        }
+    }
+    static Texture2D Render(Camera camera, RenderTexture target)
+    {
+        VolumeManager.instance.Update(camera.transform, 1);
+        camera.Render();
+        RenderTexture previous = RenderTexture.active; RenderTexture.active = target;
+        var image = new Texture2D(target.width, target.height, TextureFormat.RGB24, false);
+        image.ReadPixels(new Rect(0, 0, target.width, target.height), 0, 0); image.Apply();
+        RenderTexture.active = previous; return image;
+    }
+    static string Table(string name) => Resources.Load<TextAsset>("BerdlyNaming/" + name).text;
+    static object Get(object target, string name) => target.GetType().GetField(name, Private).GetValue(target);
+    static void Set(object target, string name, object value) => target.GetType().GetField(name, Private).SetValue(target, value);
+    static object Invoke(object target, string name, params object[] args) => target.GetType().GetMethod(name, Private).Invoke(target, args);
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

@@ -1,0 +1,158 @@
+using System.Collections;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using TMPro;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
+
+/// <summary>
+/// Place this component on a Dungeon entrance or exit.
+/// Shows an interactive [F] prompt when the player is nearby,
+/// and switches scenes when F is pressed.
+/// </summary>
+public class DungeonEntrance : MonoBehaviour
+{
+    [Header("Scene Transition Settings")]
+    [Tooltip("Name of the scene to load when interacting (e.g. 'DungeonScene' or 'GameScene').")]
+    [SerializeField] private string targetSceneName = "DungeonScene";
+    public string TargetSceneName => targetSceneName;
+
+    [Header("Interaction Settings")]
+    [Tooltip("Maximum distance from this object where the player can interact.")]
+    [SerializeField] private float interactDistance = 5.0f;
+
+    [Tooltip("Text displayed on the prompt.")]
+    [SerializeField] private string promptText = "[F] Enter Dungeon";
+
+    [Tooltip("World offset for the floating prompt.")]
+    [SerializeField] private Vector3 promptOffset = new Vector3(0, 2.5f, 0);
+
+    [Header("Optional UI Elements")]
+    [Tooltip("Optional custom UI Canvas/GameObject for the prompt. If null, a clean billboard is created automatically.")]
+    [SerializeField] private GameObject promptUI;
+    [SerializeField] private TextMeshProUGUI promptTextMesh;
+
+    [Header("Optional Audio / Transition")]
+    [SerializeField] private AudioClip interactSound;
+    [SerializeField] private float fadeDuration = 0.5f;
+
+    private WorldInteractionPrompt spritePrompt;
+    private Transform playerTransform;
+    private bool isPlayerInRange = false;
+    private bool isTransitioning = false;
+
+    private void Awake()
+    {
+        SetupPromptUI();
+    }
+
+    private void Start()
+    {
+        SetPromptVisible(false);
+    }
+
+    private void OnDisable() => SetPromptVisible(false);
+
+    private void OnDestroy()
+    {
+        // The overlay lives outside the building hierarchy so walls cannot occlude it.
+        if (spritePrompt != null) Destroy(spritePrompt.gameObject);
+    }
+
+    public void SetTargetScene(string sceneName, string prompt = null)
+    {
+        if (!string.IsNullOrEmpty(sceneName)) targetSceneName = sceneName;
+        if (!string.IsNullOrEmpty(prompt))
+        {
+            promptText = prompt;
+            if (spritePrompt != null) spritePrompt.Show(isPlayerInRange, promptText);
+        }
+    }
+
+    private void Update()
+    {
+        if (isTransitioning) return;
+
+        CheckPlayerDistance();
+
+        if (isPlayerInRange && !NPCChallengePrompt.BlocksGameplayInput && IsFKeyPressed())
+        {
+            if (targetSceneName == "DungeonScene") { DungeonSession.OpenEntry(targetSceneName, transform.position); return; }
+            if (targetSceneName == "GameScene" && DungeonSession.IsInside) { DungeonSession.ReturnToSurface(); return; }
+            StartCoroutine(TransitionToScene());
+        }
+    }
+
+    private void CheckPlayerDistance()
+    {
+        playerTransform = GetPlayerTransform();
+        isPlayerInRange = playerTransform != null && !NPCChallengePrompt.BlocksGameplayInput &&
+            Vector3.Distance(transform.position, playerTransform.position) <= interactDistance;
+        SetPromptVisible(isPlayerInRange);
+    }
+
+    private Transform GetPlayerTransform()
+    {
+        if (CharacterSwitchManager.CurrentCharacterTransform != null)
+            return CharacterSwitchManager.CurrentCharacterTransform;
+
+        GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+        if (playerObj != null) return playerObj.transform;
+
+        return null;
+    }
+
+    private bool IsFKeyPressed()
+    {
+#if ENABLE_INPUT_SYSTEM
+        if (Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame)
+            return true;
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+        if (Input.GetKeyDown(KeyCode.F))
+            return true;
+#endif
+        return false;
+    }
+
+    private void SetPromptVisible(bool visible)
+    {
+        if (spritePrompt != null) spritePrompt.Show(visible, promptText);
+    }
+
+    private IEnumerator TransitionToScene()
+    {
+        isTransitioning = true;
+        SetPromptVisible(false);
+
+        if (interactSound != null)
+        {
+            GameAudio.PlaySFXAtPoint(interactSound, transform.position);
+        }
+
+        if (fadeDuration > 0)
+        {
+            yield return new WaitForSeconds(fadeDuration);
+        }
+
+        SceneManager.LoadScene(targetSceneName);
+    }
+
+    private void SetupPromptUI()
+    {
+        if (promptUI != null) promptUI.SetActive(false);
+        spritePrompt = WorldInteractionPrompt.Create(transform, true);
+        if (spritePrompt == null) return;
+        // Entrance roots mark the doorway, rather than the roof of the building.
+        spritePrompt.SetTarget(transform, null, promptOffset, false);
+        promptUI = spritePrompt.gameObject;
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawWireSphere(transform.position, interactDistance);
+        Gizmos.DrawIcon(transform.position + promptOffset, "dungeon_icon", true);
+    }
+}

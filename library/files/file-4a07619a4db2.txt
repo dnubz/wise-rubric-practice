@@ -1,0 +1,23 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 44179c446030f3446977158de66b3fdd, type: 3}
+  m_Name: Common Cloak
+  m_EditorClassIdentifier: Assembly-CSharp::Equipment
+  itemName: Common Cloak
+  icon: {fileID: 21300000, guid: e39c6f0af9ac2834e8b5e07ad28a168b, type: 3}
+  description: A simple cloak that provides basic protection and comfort.
+  hpBonus: 100
+  spBonus: 0
+  atkBonus: 15
+  defBonus: 10
+  critBonus: 5
+  cost: 20

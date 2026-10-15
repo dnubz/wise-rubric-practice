@@ -1,0 +1,341 @@
+using System.Collections;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public abstract class NPCBase : MonoBehaviour
+{
+    [Header("NPC Profile")]
+    [SerializeField] protected string npcName = "NPC";
+    [SerializeField, TextArea(2, 5)] protected string[] dialogueLines = new string[] { "Hello traveler!" };
+
+    [Header("Dialogue Timing & Detection")]
+    [SerializeField] protected float typingSpeed = 0.04f;
+    [SerializeField] protected float proximityRadius = 4.5f;
+
+    [Header("Greeting Sound")]
+    [SerializeField] private AudioClip greetingSound;
+    [SerializeField, Range(0f, 1f)] private float greetingVolume = .7f;
+    private AudioSource greetingSource;
+
+    [Header("Rotation")]
+    [SerializeField] protected bool lookAtPlayerWhenNearby = true;
+    [SerializeField] protected float rotationSpeed = 5f;
+
+    [Header("UI Reference")]
+    [SerializeField] protected NPCSpeechBubble speechBubble;
+
+    protected int currentLineIndex = 0;
+    protected bool isPlayerNearby = false;
+    protected bool isDialogueActive = false;
+    protected bool isTyping = false;
+    protected Coroutine typingCoroutine;
+    protected string currentTargetText = "";
+    protected Quaternion initialRotation;
+    private Quaternion modelRotationOffset = Quaternion.identity;
+    private Collider proximityCollider;
+    public string DisplayName => npcName;
+
+    protected virtual void Awake()
+    {
+        proximityCollider = GetComponent<Collider>();
+        if (greetingSound == null) greetingSound = Resources.Load<AudioClip>("Audio/NPCHello");
+
+        if (speechBubble == null)
+        {
+            speechBubble = GetComponentInChildren<NPCSpeechBubble>(true);
+        }
+
+        if (speechBubble != null)
+        {
+            speechBubble.Initialize(transform);
+        }
+    }
+
+    protected virtual void Start()
+    {
+        initialRotation = transform.rotation;
+
+        if (speechBubble != null)
+        {
+            speechBubble.Hide();
+            speechBubble.SetInteractPromptVisible(false);
+        }
+    }
+
+    protected virtual void Update()
+    {
+        CheckPlayerProximity();
+
+        if (lookAtPlayerWhenNearby)
+        {
+            if (isPlayerNearby)
+            {
+                FaceTarget(GetPlayerTransform()?.position ?? transform.position);
+            }
+            else
+            {
+                ReturnToInitialRotation();
+            }
+        }
+
+        if ((isDialogueActive || isPlayerNearby) && !NPCChallengePrompt.BlocksGameplayInput)
+        {
+            HandleInput();
+        }
+    }
+
+    protected virtual void FaceTarget(Vector3 targetPosition)
+    {
+        Vector3 direction = (targetPosition - transform.position).normalized;
+        direction.y = 0; // Ignore vertical difference
+        if (direction.sqrMagnitude > 0.001f)
+        {
+            Quaternion targetRotation = Quaternion.LookRotation(direction) * modelRotationOffset;
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * rotationSpeed);
+        }
+    }
+
+    public void SetModelRotationOffset(Quaternion authoredRotation)
+    {
+        modelRotationOffset = authoredRotation;
+    }
+
+    protected virtual void ReturnToInitialRotation()
+    {
+        if (transform.rotation != initialRotation)
+        {
+            transform.rotation = Quaternion.Slerp(transform.rotation, initialRotation, Time.deltaTime * rotationSpeed);
+        }
+    }
+
+    protected virtual void CheckPlayerProximity()
+    {
+        Transform player = GetPlayerTransform();
+        if (player == null) return;
+
+        // Large NPC colliders can keep the player outside a radius measured from
+        // the NPC pivot even when the player is standing beside the NPC.
+        Vector3 nearestPoint = proximityCollider != null && proximityCollider.enabled
+            ? proximityCollider.ClosestPoint(player.position)
+            : transform.position;
+        float distance = Vector3.Distance(nearestPoint, player.position);
+        if (distance <= proximityRadius)
+        {
+            if (!isPlayerNearby)
+            {
+                // A challenge/menu may be open when we enter range. Start talking after it closes.
+                if (NPCChallengePrompt.BlocksGameplayInput) return;
+                isPlayerNearby = true;
+                PlayGreeting();
+                OnPlayerApproached();
+            }
+        }
+        else
+        {
+            if (isPlayerNearby)
+            {
+                isPlayerNearby = false;
+                OnPlayerExited();
+            }
+        }
+    }
+
+    protected virtual Transform GetPlayerTransform()
+    {
+        if (CharacterSwitchManager.CurrentCharacterTransform != null)
+            return CharacterSwitchManager.CurrentCharacterTransform;
+
+        GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+        return playerObj != null ? playerObj.transform : null;
+    }
+
+    // Play once on entering range, alongside dialogue and any minigame theme.
+    private void PlayGreeting()
+    {
+        if (greetingSound == null) return;
+        if (greetingSource == null)
+        {
+            greetingSource = gameObject.AddComponent<AudioSource>();
+            greetingSource.playOnAwake = false;
+            greetingSource.loop = false;
+            greetingSource.spatialBlend = 0f;
+            greetingSource.dopplerLevel = 0f;
+        }
+        GameAudio.RouteSFX(greetingSource);
+        greetingSource.PlayOneShot(greetingSound, greetingVolume);
+    }
+
+    protected virtual void HandleInput()
+    {
+        // One press either completes this sentence or advances/opens the interaction.
+        if (IsFKeyPressed()) OnFKeyPressed();
+    }
+
+    protected virtual void OnFKeyPressed()
+    {
+        if (isTyping)
+        {
+            // Skip typing and finish current sentence immediately
+            FinishTypingCurrentSentence();
+        }
+        else
+        {
+            OnFKeyPressedAfterSentence();
+        }
+    }
+
+    protected virtual void OnFKeyPressedAfterSentence()
+    {
+        // Override in child classes (e.g. advance to next line or trigger interaction)
+    }
+
+    public virtual void StartDialogue()
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput) return;
+        if (dialogueLines == null || dialogueLines.Length == 0) return;
+
+        currentLineIndex = 0;
+        isDialogueActive = true;
+        if (speechBubble != null) speechBubble.Show();
+        DisplayLine(currentLineIndex);
+    }
+
+    protected virtual void DisplayLine(int index)
+    {
+        if (index < 0 || index >= dialogueLines.Length)
+        {
+            EndDialogue();
+            return;
+        }
+
+        if (typingCoroutine != null)
+        {
+            StopCoroutine(typingCoroutine);
+        }
+
+        currentTargetText = dialogueLines[index];
+        typingCoroutine = StartCoroutine(TypewriterRoutine(currentTargetText));
+    }
+
+    public void SetDialogue(string name, params string[] lines)
+    {
+        npcName = name; dialogueLines = lines;
+    }
+
+    public void RefreshSpeechBubble()
+    {
+        if (speechBubble != null) speechBubble.Initialize(transform);
+    }
+
+    protected virtual IEnumerator TypewriterRoutine(string line)
+    {
+        isTyping = true;
+        if (speechBubble != null)
+        {
+            speechBubble.SetInteractPromptVisible(false);
+        }
+
+        int characterCount = speechBubble != null ? speechBubble.PrepareTyping(line) : line.Length;
+        for (int i = 0; i <= characterCount; i++)
+        {
+            if (speechBubble != null)
+            {
+                speechBubble.ShowCharacters(i);
+            }
+            yield return new WaitForSeconds(typingSpeed);
+        }
+
+        isTyping = false;
+        typingCoroutine = null;
+        OnSentenceFinished();
+    }
+
+    protected virtual void FinishTypingCurrentSentence()
+    {
+        if (!isTyping) return;
+
+        if (typingCoroutine != null)
+        {
+            StopCoroutine(typingCoroutine);
+            typingCoroutine = null;
+        }
+
+        isTyping = false;
+        if (speechBubble != null)
+        {
+            speechBubble.SetText(currentTargetText);
+        }
+
+        OnSentenceFinished();
+    }
+
+    protected virtual void OnSentenceFinished()
+    {
+        // Subclasses implement how to proceed
+    }
+
+    public virtual void NextSentence()
+    {
+        currentLineIndex++;
+        if (currentLineIndex < dialogueLines.Length)
+        {
+            DisplayLine(currentLineIndex);
+        }
+        else
+        {
+            EndDialogue();
+        }
+    }
+
+    public virtual void EndDialogue()
+    {
+        isDialogueActive = false;
+        isTyping = false;
+        if (typingCoroutine != null)
+        {
+            StopCoroutine(typingCoroutine);
+            typingCoroutine = null;
+        }
+        if (speechBubble != null)
+        {
+            speechBubble.SetInteractPromptVisible(false);
+            speechBubble.Hide();
+        }
+        OnDialogueCompleted();
+    }
+
+    protected virtual void OnPlayerApproached() { }
+
+    protected virtual void OnPlayerExited()
+    {
+        EndDialogue();
+    }
+
+    protected virtual void OnDisable()
+    {
+        if (greetingSource != null) greetingSource.Stop();
+        isPlayerNearby = false;
+        EndDialogue();
+    }
+
+    protected virtual void OnDialogueCompleted() { }
+
+    protected bool IsFKeyPressed()
+    {
+#if ENABLE_INPUT_SYSTEM
+        if (Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame)
+            return true;
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+        if (Input.GetKeyDown(KeyCode.F))
+            return true;
+#endif
+        return false;
+    }
+
+    protected virtual void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireSphere(transform.position, proximityRadius);
+    }
+}

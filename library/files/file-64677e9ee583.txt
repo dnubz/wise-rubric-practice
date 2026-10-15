@@ -1,0 +1,170 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+/// <summary>Creates build-safe resource references; does not rewrite or replace the open GameScene.</summary>
+[InitializeOnLoad]
+public static class DungeonSetup
+{
+    const string Folder = "Assets/Resources/Dungeon";
+    static double nextCheck;
+    static DungeonSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 2;
+        if (!File.Exists("Temp/Dungeon/setup.request")) return;
+        File.Delete("Temp/Dungeon/setup.request");
+        try
+        {
+            Build();
+            var settings = AssetDatabase.LoadAssetAtPath<DungeonSettings>(Folder + "/Settings.asset");
+            if (settings == null || settings.steelGateModel == null)
+                throw new InvalidOperationException("The steel gate prefab was not assigned.");
+            File.WriteAllText("Temp/Dungeon/setup-result.txt",
+                "PASS: Dungeon resources configured, including steel gate " + settings.steelGateModel.name + ". GameScene was not replaced.\n");
+        }
+        catch (Exception error) { File.WriteAllText("Temp/Dungeon/setup-result.txt", "FAIL: " + error); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Set Up Dungeon")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder + "/Materials"); AssetDatabase.Refresh();
+        var settings = AssetDatabase.LoadAssetAtPath<DungeonSettings>(Folder + "/Settings.asset");
+        if (settings == null) { settings = ScriptableObject.CreateInstance<DungeonSettings>(); AssetDatabase.CreateAsset(settings, Folder + "/Settings.asset"); }
+        const string models = "Assets/Imported Assets/KayKit Dungeon Pack 1.0/Models/fbx/";
+        if (settings.chestModel == null) settings.chestModel = ModelPrefab(models + "chest_common.fbx", "ChestBody");
+        if (settings.chestLidModel == null) settings.chestLidModel = ModelPrefab(models + "chestTop_common.fbx", "ChestLid");
+        if (settings.doorModel == null) settings.doorModel = ModelPrefab(models + "door.fbx", "RoomDoor");
+        if (settings.steelGateModel == null)
+            settings.steelGateModel = ModelPrefab(models + "door_gate.fbx", "RoomSteelGate");
+        settings.breakableDecorations = AssignModels(settings.breakableDecorations, models,
+            new[] { "barrel", "crate", "chair" }, new[] { "BreakableBarrel", "BreakableCrate", "BreakableChair" });
+        settings.floorDecorations = AssignModels(settings.floorDecorations, models,
+            new[] { "floorDecoration_shatteredBricks", "floorDecoration_tilesSmall", "floorDecoration_wood" },
+            new[] { "ScatteredBricks", "ScatteredTiles", "ScatteredWood" });
+        if (settings.friendlyEnemyModel == null)
+        {
+            settings.friendlyEnemyModel = ModelPrefab("Assets/Imported Assets/Minion/Minion.fbx", "FriendlyMinion");
+            var material = Material("FriendlyMinion", Color.white,
+                AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Imported Assets/Minion/Minion.fbm/Minion_BaseColor.png"));
+            foreach (Renderer renderer in settings.friendlyEnemyModel.GetComponentsInChildren<Renderer>(true))
+            {
+                var materials = renderer.sharedMaterials;
+                for (int i = 0; i < materials.Length; i++) materials[i] = material;
+                renderer.sharedMaterials = materials;
+            }
+            PrefabUtility.SavePrefabAsset(settings.friendlyEnemyModel);
+        }
+        if (settings.floorTiles == null || settings.floorTiles.Length != 4) settings.floorTiles = new GameObject[4];
+        string[] floors = { "tileBrickB_large", "tileBrickA_large", "tileBrickB_largeCrackedA", "tileBrickB_largeCrackedB" };
+        string[] names = { "FloorBrick", "FloorSlab", "FloorCracked", "FloorMoss" };
+        for (int i = 0; i < 4; i++)
+        {
+            if (settings.floorTiles[i] == null) settings.floorTiles[i] = FloorPrefab(models + floors[i] + ".fbx", names[i], i == 3);
+            else if (AssetDatabase.GetAssetPath(settings.floorTiles[i]) == Folder + "/" + names[i] + ".prefab")
+            {
+                ApplyFloorMaterials(settings.floorTiles[i], i == 3);
+                PrefabUtility.SavePrefabAsset(settings.floorTiles[i]);
+            }
+        }
+        if (settings.berdlyModel == null) settings.berdlyModel = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Berdly.prefab");
+        if (settings.music == null) settings.music = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/Music/DungeonMusic.mp3");
+        if (settings.floorMaterial == null) settings.floorMaterial = Material("Floor", new Color(.33f, .31f, .39f));
+        if (settings.wallMaterial == null) settings.wallMaterial = Material("Wall", new Color(.20f, .17f, .26f));
+        if (settings.doorMaterial == null) settings.doorMaterial = Material("Door", new Color(.46f, .25f, .14f));
+        if (settings.berdlyMaterial == null) settings.berdlyMaterial = Material("Berdly", Color.white,
+            AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Imported Assets/Berdly/Berdly.fbm/Berdly_BaseColor.jpeg"));
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssets();
+    }
+
+    static Material Material(string name, Color color, Texture texture = null)
+    {
+        string path = Folder + "/Materials/" + name + ".mat";
+        var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+        if (material == null)
+        {
+            Shader shader = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard");
+            material = new Material(shader) { name = name, color = color };
+            if (texture != null) { material.mainTexture = texture; if (material.HasProperty("_BaseMap")) material.SetTexture("_BaseMap", texture); }
+            AssetDatabase.CreateAsset(material, path);
+        }
+        return material;
+    }
+    static GameObject[] AssignModels(GameObject[] assigned, string folder, string[] sources, string[] names)
+    {
+        if (assigned == null || assigned.Length == 0) assigned = new GameObject[sources.Length];
+        for (int i = 0; i < assigned.Length; i++)
+            if (assigned[i] == null) assigned[i] = ModelPrefab(folder + sources[i % sources.Length] + ".fbx", names[i % names.Length]);
+        return assigned;
+    }
+    static GameObject ModelPrefab(string source, string name)
+    {
+        string path = Folder + "/" + name + ".prefab";
+        var existing = AssetDatabase.LoadAssetAtPath<GameObject>(path); if (existing != null) return existing;
+        var model = AssetDatabase.LoadAssetAtPath<GameObject>(source);
+        if (model == null) throw new InvalidOperationException("Missing imported dungeon model: " + source);
+        var temporary = UnityEngine.Object.Instantiate(model); temporary.name = name;
+        try
+        {
+            foreach (Renderer renderer in temporary.GetComponentsInChildren<Renderer>())
+            {
+                var materials = renderer.sharedMaterials;
+                for (int i = 0; i < materials.Length; i++)
+                {
+                    var original = materials[i]; if (original == null) continue;
+                    string materialName = "Kit_" + original.name.Replace(" ", "_");
+                    Color color = original.HasProperty("_Color") ? original.color : Color.white;
+                    Texture texture = original.HasProperty("_MainTex") ? original.mainTexture : null;
+                    materials[i] = Material(materialName, color, texture);
+                }
+                renderer.sharedMaterials = materials;
+            }
+            return PrefabUtility.SaveAsPrefabAsset(temporary, path);
+        }
+        finally { UnityEngine.Object.DestroyImmediate(temporary); }
+    }
+
+    static GameObject FloorPrefab(string source, string name, bool moss)
+    {
+        string path = Folder + "/" + name + ".prefab";
+        var existing = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+        if (existing != null) { ApplyFloorMaterials(existing, moss); PrefabUtility.SavePrefabAsset(existing); return existing; }
+        var importer = (ModelImporter)AssetImporter.GetAtPath(source);
+        if (!importer.isReadable) { importer.isReadable = true; importer.SaveAndReimport(); }
+        var root = new GameObject(name);
+        try
+        {
+            var model = UnityEngine.Object.Instantiate(ModelPrefab(source, name + "Model"), root.transform);
+            var renderers = model.GetComponentsInChildren<Renderer>();
+            Bounds bounds = renderers[0].bounds; foreach (var renderer in renderers) bounds.Encapsulate(renderer.bounds);
+            float sx = 2 / bounds.size.x, sz = 2 / bounds.size.z;
+            model.transform.localScale = Vector3.Scale(model.transform.localScale, new Vector3(sx, Mathf.Min(sx, sz), sz));
+            bounds = renderers[0].bounds; foreach (var renderer in renderers) bounds.Encapsulate(renderer.bounds);
+            model.transform.position -= new Vector3(bounds.center.x, bounds.max.y, bounds.center.z);
+            foreach (Collider collider in model.GetComponentsInChildren<Collider>()) UnityEngine.Object.DestroyImmediate(collider);
+            ApplyFloorMaterials(root, moss);
+            return PrefabUtility.SaveAsPrefabAsset(root, path);
+        }
+        finally { UnityEngine.Object.DestroyImmediate(root); }
+    }
+    static void ApplyFloorMaterials(GameObject root, bool moss)
+    {
+        foreach (var renderer in root.GetComponentsInChildren<Renderer>())
+        {
+            var materials = renderer.sharedMaterials;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                var original = materials[i]; if (original == null) continue;
+                if (moss)
+                    materials[i] = Material(original.name.StartsWith("Moss_") ? original.name : "Moss_" + original.name,
+                        Color.Lerp(original.color, new Color(.25f, .37f, .13f), .8f), original.mainTexture);
+                else if (original.name.Contains("Stone"))
+                    materials[i] = Material("DungeonStone", new Color(.4f, .32f, .24f), original.mainTexture);
+            }
+            renderer.sharedMaterials = materials;
+        }
+    }
+}

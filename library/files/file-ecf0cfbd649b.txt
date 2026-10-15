@@ -1,0 +1,93 @@
+using System;
+using System.Collections;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+/// <summary>One persistent black cover, held through scene loading and saved-world restoration.</summary>
+public sealed class SceneTravelFade : MonoBehaviour
+{
+    public const float FadeOutSeconds = .45f, FadeInSeconds = .5f;
+    static SceneTravelFade instance;
+    DungeonRoomTransition cover;
+    bool busy;
+    public static bool IsTransitioning => instance != null && instance.busy;
+    public static float Opacity => instance != null && instance.cover != null ? instance.cover.Opacity : 0;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics() => instance = null;
+
+    static SceneTravelFade Ensure()
+    {
+        if (instance != null) return instance;
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        if (settings == null || settings.roomTransitionPrefab == null)
+            throw new InvalidOperationException("Assign the saved Dungeon Room Transition prefab in Dungeon Settings.");
+        var root = new GameObject("SceneTravelFade");
+        instance = root.AddComponent<SceneTravelFade>(); DontDestroyOnLoad(root);
+        instance.cover = Instantiate(settings.roomTransitionPrefab, root.transform);
+        var canvas = instance.cover.GetComponent<Canvas>(); canvas.sortingOrder = 32760;
+        if (canvas.GetComponent<GraphicRaycaster>() == null) canvas.gameObject.AddComponent<GraphicRaycaster>();
+        instance.cover.Clear();
+        return instance;
+    }
+
+    public static void CoverArrival()
+    {
+        var fade = Ensure(); fade.busy = true;
+        var instant = fade.cover.FadeTo(1, 0); instant.MoveNext();
+    }
+
+    public static IEnumerator FadeOut()
+    {
+        var fade = Ensure(); fade.busy = true;
+        yield return fade.cover.FadeTo(1, fade.cover.Opacity >= 1 ? 0 : FadeOutSeconds);
+    }
+
+    public static IEnumerator FadeIn()
+    {
+        if (instance == null) yield break;
+        var fade = instance; fade.busy = true;
+        yield return fade.cover.FadeTo(0, FadeInSeconds);
+        fade.cover.Clear(); fade.busy = false;
+    }
+
+    public static bool LoadGameScene(Action prepare, out string error, Action<string> failed = null)
+    {
+        if (IsTransitioning) { error = "A scene transition is already in progress."; return false; }
+        if (!Application.CanStreamedLevelBeLoaded("GameScene")) { error = "GameScene is missing from Build Settings."; return false; }
+        try
+        {
+            var fade = Ensure(); fade.busy = true;
+            fade.StartCoroutine(fade.Load(prepare, failed)); error = null; return true;
+        }
+        catch (Exception e) { error = "Could not begin loading: " + e.Message; return false; }
+    }
+
+    IEnumerator Load(Action prepare, Action<string> failed)
+    {
+        yield return FadeOut();
+        AsyncOperation operation = null; string error = null;
+        try
+        {
+            prepare?.Invoke();
+            Time.timeScale = 1;
+            operation = SceneManager.LoadSceneAsync("GameScene");
+            if (operation == null) error = "Could not load GameScene.";
+        }
+        catch (Exception e) { error = "Could not load game: " + e.Message; }
+        if (error != null)
+        {
+            yield return FadeIn(); failed?.Invoke(error); yield break;
+        }
+        yield return operation;
+        // GameSave.Start or dungeon resume reveals the destination after initialization.
+    }
+
+    void OnDisable()
+    {
+        StopAllCoroutines(); busy = false;
+        if (cover != null) cover.Clear();
+    }
+    void OnDestroy() { if (instance == this) instance = null; }
+}

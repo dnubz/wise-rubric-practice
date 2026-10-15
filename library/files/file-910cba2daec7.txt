@@ -1,0 +1,107 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+/// <summary>Isolated fixtures: no scene travel or modifications to the live party or real saves.</summary>
+[InitializeOnLoad]
+public static class DungeonVariationChecks
+{
+    const string Folder = "Temp/DungeonRandomChecks";
+    const BindingFlags Private = BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic;
+    static DungeonVariationChecks() { EditorApplication.update += Poll; }
+    static void Poll()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: 256 distinct reproducible layouts spanning every room count from 14 to 24; MST/BFS ties, nested branches in larger layouts, key solvability and floor WFC; per-entrance snapshot selection/revisits, saved room counts, v2 adoption once and v3 multi-dungeon save roundtrip; actual Berdly speech bubble fits long names. Live party and real saves untouched."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); }
+    }
+    [MenuItem("WiSe/Validate Dungeon Variation and Saves")]
+    public static void Run()
+    {
+        DungeonGenerationChecks.Run();
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings != null && settings.minimumRooms == 14 && settings.maximumRooms == 24 && !settings.useFixedSeed, "Variable room-count defaults missing.");
+        var naming = new BerdlyChemistry(0, Resources.Load<TextAsset>("BerdlyNaming/alkane").text,
+            Resources.Load<TextAsset>("BerdlyNaming/alkyl").text, Resources.Load<TextAsset>("BerdlyNaming/prefix").text);
+        var entranceA = DungeonIdentity.At(new Vector3(10, 5, 30));
+        var entranceB = DungeonIdentity.At(new Vector3(110, 8, 30));
+        Require(entranceA == DungeonIdentity.At(new Vector3(10.01f, 20, 30.01f)), "Entrance float drift changes identity.");
+        int seedA = DungeonIdentity.Seed(321, entranceA), seedB = DungeonIdentity.Seed(321, entranceB);
+        Require(seedA != seedB && seedA != DungeonIdentity.Seed(322, entranceA), "Entrance/playthrough seed ignored.");
+        var a = Snapshot(DungeonLayout.Generate(seedA, DungeonLayout.ChooseRoomCount(seedA, settings.minimumRooms, settings.maximumRooms), 36, 42, naming), entranceA);
+        var b = Snapshot(DungeonLayout.Generate(seedB, DungeonLayout.ChooseRoomCount(seedB, settings.minimumRooms, settings.maximumRooms), 36, 42, naming), entranceB);
+        Require(a.name != b.name, "Entrance names repeat.");
+        a.openedChests = new[] { 1, 3 }; a.originalKeys = 2;
+        b.unlockedDoors = new[] { 2 }; b.bossKeys = 1;
+        var data = new GameSave.SaveData { party = Enumerable.Range(0, 3).Select(i => new GameSave.PartyState {
+            name = "Fixture" + i, level = 1, hp = 100, sp = 100, equipment = new string[2], cooldowns = new int[4] }).ToArray(),
+            items = Array.Empty<string>(), settings = new SaveGameSettings(), rotation = Quaternion.identity,
+            dungeon = b, dungeons = new[] { a, b }, inDungeon = true };
+        Directory.CreateDirectory(Folder);
+        string path = Folder + "/editor-roundtrip.sav";
+        BinarySaveFile.Write(path, data); var loaded = BinarySaveFile.Read(path);
+        Require(loaded.version == 3 && loaded.dungeons.Length == 2 && loaded.dungeon.entrance == entranceB, "Dungeon collection did not roundtrip.");
+        Require(loaded.dungeons[0].openedChests.SequenceEqual(a.openedChests) && loaded.dungeons[0].originalKeys == 2 &&
+            loaded.dungeons[1].unlockedDoors.SequenceEqual(b.unlockedDoors) && loaded.dungeons[1].bossKeys == 1, "Progress crossed between entrances.");
+        Require(loaded.dungeons[0].name == a.name && loaded.dungeons[1].name == b.name && loaded.dungeons[0].rooms.Length == a.rooms.Length && loaded.dungeons[1].rooms.Length == b.rooms.Length, "Saved graph/name/count changed.");
+        // Write the exact previous primitive schema to exercise backward compatibility.
+        using (var payload = new MemoryStream())
+        {
+            using (var writer = new BinaryWriter(payload, Encoding.UTF8, true))
+                typeof(BinarySaveFile).GetMethod("WriteData", Private).Invoke(null, new object[] { writer, data, 2 });
+            byte[] bytes = payload.ToArray();
+            using (var file = new BinaryWriter(File.Create(Folder + "/version2.sav")))
+            using (var sha = SHA256.Create())
+            { file.Write(0x45534957); file.Write(2); file.Write(bytes.Length); file.Write(sha.ComputeHash(bytes)); file.Write(bytes); }
+        }
+        var legacy = BinarySaveFile.Read(Folder + "/version2.sav");
+        Require(legacy.version == 2 && legacy.dungeon.name == b.name && !legacy.dungeon.hasEntrance && legacy.dungeons.Length == 0, "Version 2 progress was lost.");
+        var fixture = new GameObject("DungeonSaveFixture"); fixture.hideFlags = HideFlags.HideAndDontSave; fixture.SetActive(false);
+        var instanceField = typeof(DungeonSession).GetField("instance", Private);
+        var original = instanceField.GetValue(null);
+        try
+        {
+            var session = fixture.AddComponent<DungeonSession>(); instanceField.SetValue(null, session);
+            DungeonSession.RestoreSavedDungeon(loaded.dungeon, loaded.dungeons);
+            var savedAt = typeof(DungeonSession).GetMethod("SavedAt", Private);
+            Require(ReferenceEquals(savedAt.Invoke(session, new object[] { entranceA }), loaded.dungeons[0]) &&
+                ((SavedDungeon)savedAt.Invoke(session, new object[] { entranceB })).bossKeys == 1, "Revisit selected the wrong dungeon.");
+            Require(savedAt.Invoke(session, new object[] { new Vector2Int(999, 999) }) == null, "New entrance reused the last dungeon.");
+            Require(DungeonSession.CaptureSavedDungeons().Length == 2, "Capturing lost previous entrances.");
+            DungeonSession.RestoreSavedDungeon(legacy.dungeon);
+            Require(ReferenceEquals(savedAt.Invoke(session, new object[] { entranceA }), legacy.dungeon), "Legacy layout was not adopted.");
+            Require(savedAt.Invoke(session, new object[] { entranceB }) == null, "Legacy layout copied to multiple entrances.");
+        }
+        finally { instanceField.SetValue(null, original); Object.DestroyImmediate(fixture); }
+        var guide = Object.Instantiate(settings.dungeonGuideNPC); guide.hideFlags = HideFlags.HideAndDontSave;
+        try
+        {
+            guide.SetActive(false);
+            var bubble = guide.GetComponentInChildren<NPCSpeechBubble>(true);
+            Require(bubble != null, "Berdly speech bubble missing.");
+            var text = bubble.GetComponentInChildren<TextMeshProUGUI>(true);
+            for (int seed = 0; seed < 256; seed++)
+            {
+                string name = DungeonLayout.Generate(seed, DungeonLayout.ChooseRoomCount(seed, settings.minimumRooms, settings.maximumRooms), 36, 42, naming).Name;
+                bubble.SetText("Rooms as carbons, doors as bonds.\n(<color=#5C8EAF>" + name + "</color>).");
+                text.ForceMeshUpdate(true);
+                Require(!text.isTextOverflowing, "Berdly name overflows: " + name);
+            }
+        }
+        finally { Object.DestroyImmediate(guide); }
+    }
+    static SavedDungeon Snapshot(DungeonLayout l, Vector2Int entrance) => new SavedDungeon {
+        hasEntrance = true, entrance = entrance, seed = l.Seed, spawn = l.SpawnRoom, boss = l.BossRoom, berdly = l.BerdlyRoom,
+        maximumDegree = l.MaximumDegree, name = l.Name, spacing = 500, floorTileSize = 6, rooms = l.Rooms.ToArray(),
+        doors = l.Doors.ToArray(), chains = l.Chains.Select(c => c.ToArray()).ToArray(),
+        remainingCoins = l.Rooms.Select(r => new[] { new Vector3(r.Index, 0, 1) }).ToArray() };
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

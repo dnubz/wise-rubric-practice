@@ -1,0 +1,183 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>Editor-only setup: saves normal UI prefabs and a scene instance for Inspector editing.</summary>
+[InitializeOnLoad]
+public static class DungeonInteractionUIBuilder
+{
+    const string Folder = "Assets/UI/DungeonInteractions";
+    const string Request = "Temp/DungeonInteractions/build.request";
+    static double nextCheck;
+    static Sprite rounded;
+
+    static DungeonInteractionUIBuilder() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Request)) return;
+        File.Delete(Request);
+        try { Build(); File.WriteAllText("Temp/DungeonInteractions/build-result.txt", "PASS: saved lock and exclamation UI prefabs, assigned settings, added DungeonInteractionUI to DungeonScene."); }
+        catch (Exception error) { File.WriteAllText("Temp/DungeonInteractions/build-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/UI/Set Up Dungeon Interaction UI")]
+    public static void Build()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) throw new InvalidOperationException("Exit Play mode first.");
+        Directory.CreateDirectory(Folder);
+        AssetDatabase.Refresh();
+        rounded = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Rounded.png");
+        if (rounded == null) throw new InvalidOperationException("The existing rounded UI sprite is missing.");
+        string lockPath = Folder + "/DungeonDoorLockUI.prefab";
+        string promptPath = Folder + "/DungeonInteractionUI.prefab";
+        if (!File.Exists(lockPath))
+        {
+            GameObject root = Canvas("DungeonDoorLockUI", new Vector2(120, 150));
+            try
+            {
+                var controller = root.AddComponent<DungeonDoorUI>();
+                RectTransform icon = Rect("LockIcon", root.transform, Vector2.zero, new Vector2(120, 150));
+                // Ordinary layered Images, so each shape and colour can be edited in the Inspector.
+                Shape("ShackleBorder", icon, new Vector2(0, 36), new Vector2(70, 80), Color.white);
+                Shape("ShackleOutline", icon, new Vector2(0, 36), new Vector2(64, 74), Color.black);
+                Image shackle = Shape("ShackleYellow", icon, new Vector2(0, 36), new Vector2(56, 66), DungeonKeyHud.KeyColour(DungeonKeyKind.Original));
+                Shape("ShackleHole", icon, new Vector2(0, 36), new Vector2(40, 50), new Color(.08f, .09f, .1f));
+                Shape("BodyBorder", icon, new Vector2(0, -15), new Vector2(108, 94), Color.white);
+                Shape("BodyOutline", icon, new Vector2(0, -15), new Vector2(102, 88), Color.black);
+                Image body = Shape("BodyYellow", icon, new Vector2(0, -15), new Vector2(94, 80), DungeonKeyHud.KeyColour(DungeonKeyKind.Original));
+                Shape("KeyholeHead", icon, new Vector2(0, -7), new Vector2(18, 22), Color.black);
+                Shape("KeyholeStem", icon, new Vector2(0, -25), new Vector2(10, 28), Color.black);
+                var data = new SerializedObject(controller);
+                data.FindProperty("lockIcon").objectReferenceValue = icon.gameObject;
+                var parts = data.FindProperty("colouredParts"); parts.arraySize = 2;
+                parts.GetArrayElementAtIndex(0).objectReferenceValue = shackle;
+                parts.GetArrayElementAtIndex(1).objectReferenceValue = body;
+                data.ApplyModifiedPropertiesWithoutUndo();
+                PrefabUtility.SaveAsPrefabAsset(root, lockPath);
+            }
+            finally { Object.DestroyImmediate(root); }
+        }
+        if (!File.Exists(promptPath))
+        {
+            GameObject root = Canvas("DungeonInteractionUI", new Vector2(100, 130));
+            try
+            {
+                var controller = root.AddComponent<DungeonInteractionUI>();
+                var rect = Rect("ExclamationMark", root.transform, Vector2.zero, new Vector2(100, 130));
+                var text = rect.gameObject.AddComponent<TextMeshProUGUI>();
+                text.font = TMP_Settings.defaultFontAsset; text.text = "!"; text.fontSize = 125;
+                text.fontStyle = FontStyles.Bold; text.alignment = TextAlignmentOptions.Center;
+                text.color = new Color(.96f, .02f, .22f); text.raycastTarget = false;
+                var data = new SerializedObject(controller);
+                data.FindProperty("exclamation").objectReferenceValue = rect.gameObject;
+                data.ApplyModifiedPropertiesWithoutUndo();
+                PrefabUtility.SaveAsPrefabAsset(root, promptPath);
+            }
+            finally { Object.DestroyImmediate(root); }
+        }
+        var settings = AssetDatabase.LoadAssetAtPath<DungeonSettings>("Assets/Resources/Dungeon/Settings.asset");
+        settings.doorLockUI = AssetDatabase.LoadAssetAtPath<DungeonDoorUI>(lockPath);
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssets();
+        AddGateHighlight(settings.steelGateModel);
+
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = SceneManager.GetSceneByPath("Assets/Scenes/DungeonScene.unity");
+        bool openedHere = !scene.IsValid() || !scene.isLoaded;
+        if (openedHere) scene = EditorSceneManager.OpenScene("Assets/Scenes/DungeonScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            foreach (GameObject existing in scene.GetRootGameObjects())
+                if (existing.GetComponent<DungeonInteractionUI>() != null) return;
+            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(promptPath);
+            var instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab, scene);
+            instance.transform.position = new Vector3(0, -497, 0);
+            EditorSceneManager.MarkSceneDirty(scene);
+            if (!EditorSceneManager.SaveScene(scene)) throw new IOException("Could not save DungeonScene UI.");
+        }
+        finally
+        {
+            SceneManager.SetActiveScene(original);
+            if (openedHere) EditorSceneManager.CloseScene(scene, true);
+        }
+    }
+
+    static GameObject Canvas(string name, Vector2 size)
+    {
+        var root = new GameObject(name, typeof(RectTransform));
+        ((RectTransform)root.transform).sizeDelta = size;
+        root.transform.localScale = Vector3.one * .01f;
+        var canvas = root.AddComponent<Canvas>(); canvas.renderMode = RenderMode.WorldSpace; canvas.sortingOrder = 100;
+        return root;
+    }
+
+    static void AddGateHighlight(GameObject prefab)
+    {
+        string path = AssetDatabase.GetAssetPath(prefab);
+        var root = PrefabUtility.LoadPrefabContents(path);
+        try
+        {
+            var material = AssetDatabase.LoadAssetAtPath<Material>(Folder + "/DoorHighlight.mat");
+            if (material == null)
+            {
+                material = new Material(Shader.Find("WiSe/DungeonDoorOutline")) { name = "DoorHighlight" };
+                material.SetColor("_OutlineColor", new Color(1, .94f, .02f));
+                material.SetFloat("_OutlineWidth", .025f);
+                AssetDatabase.CreateAsset(material, Folder + "/DoorHighlight.mat");
+            }
+            material.shader = Shader.Find("WiSe/DungeonDoorOutline");
+            material.SetFloat("_OutlineWidth", .025f);
+            EditorUtility.SetDirty(material); AssetDatabase.SaveAssets();
+            var mesh = AssetDatabase.LoadAssetAtPath<Mesh>(Folder + "/DoorOutline.asset");
+            if (mesh == null)
+            {
+                mesh = Object.Instantiate(root.GetComponent<MeshFilter>().sharedMesh); mesh.name = "DoorOutline";
+                // Smooth only the outline's normals so the border joins around the gate's sharp corners.
+                Vector3[] points = mesh.vertices, normals = mesh.normals;
+                var sums = new Dictionary<Vector3, Vector3>();
+                for (int i = 0; i < points.Length; i++)
+                    sums[points[i]] = sums.TryGetValue(points[i], out Vector3 sum) ? sum + normals[i] : normals[i];
+                for (int i = 0; i < normals.Length; i++) normals[i] = sums[points[i]].normalized;
+                mesh.normals = normals;
+                AssetDatabase.CreateAsset(mesh, Folder + "/DoorOutline.asset");
+            }
+            var controller = root.GetComponent<DungeonDoorHighlight>() ?? root.AddComponent<DungeonDoorHighlight>();
+            Transform existing = root.transform.Find("InteractionOutline");
+            var outline = existing != null ? existing.gameObject : new GameObject("InteractionOutline");
+            outline.transform.SetParent(root.transform, false);
+            var filter = outline.GetComponent<MeshFilter>() ?? outline.AddComponent<MeshFilter>(); filter.sharedMesh = mesh;
+            var renderer = outline.GetComponent<MeshRenderer>() ?? outline.AddComponent<MeshRenderer>();
+            var materials = new Material[mesh.subMeshCount];
+            for (int i = 0; i < materials.Length; i++) materials[i] = material;
+            renderer.sharedMaterials = materials;
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; renderer.receiveShadows = false;
+            outline.SetActive(false);
+            var data = new SerializedObject(controller);
+            data.FindProperty("outline").objectReferenceValue = outline;
+            data.ApplyModifiedPropertiesWithoutUndo();
+            PrefabUtility.SaveAsPrefabAsset(root, path);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(root); }
+    }
+    static RectTransform Rect(string name, Transform parent, Vector2 position, Vector2 size)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchoredPosition = position; rect.sizeDelta = size;
+        return rect;
+    }
+    static Image Shape(string name, Transform parent, Vector2 position, Vector2 size, Color colour)
+    {
+        var image = Rect(name, parent, position, size).gameObject.AddComponent<Image>();
+        image.sprite = rounded; image.color = colour; image.raycastTarget = false;
+        return image;
+    }
+}

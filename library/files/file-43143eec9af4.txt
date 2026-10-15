@@ -1,0 +1,353 @@
+using System;
+using System.IO;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>Completes the existing Pink UI without replacing its panel, score label or background art.</summary>
+[InitializeOnLoad]
+public static class PinkRhythmUIBuilder
+{
+    const string Request = "Temp/ChallengeNPC/build-pink-ui.request";
+    const string Report = "Temp/ChallengeNPC/pink-ui-build.txt";
+    const string AssetFolder = "Assets/UI/PinkRhythm";
+    static readonly Color Pink = new Color(.96f, .20f, .62f);
+    static readonly Color Dark = new Color(.12f, .065f, .19f, .94f);
+    static TMP_FontAsset font;
+    static double nextCheck;
+
+    static PinkRhythmUIBuilder()
+    {
+        EditorApplication.update += ApplyRequestedBuild;
+    }
+
+    static void ApplyRequestedBuild()
+    {
+        if (Application.isBatchMode || EditorApplication.timeSinceStartup < nextCheck) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (File.Exists("Temp/ChallengeNPC/boost-challenge-npcs.request") && !EditorApplication.isCompiling &&
+            !EditorApplication.isUpdating && !EditorApplication.isPlayingOrWillChangePlaymode &&
+            SceneManager.GetActiveScene().path == "Assets/Scenes/GameScene.unity")
+        {
+            foreach (var spawner in Object.FindObjectsByType<NPCSpawner>(FindObjectsInactive.Include))
+            {
+                Undo.RecordObject(spawner,"Boost Pink and Berdly spawns for testing");
+                var settings=new SerializedObject(spawner);
+                settings.FindProperty("boostChallengeNPCSpawns").boolValue=true;
+                settings.ApplyModifiedProperties();
+                EditorUtility.SetDirty(spawner);
+            }
+            EditorSceneManager.MarkSceneDirty(SceneManager.GetActiveScene());
+            EditorSceneManager.SaveScene(SceneManager.GetActiveScene());
+            File.Delete("Temp/ChallengeNPC/boost-challenge-npcs.request");
+            File.WriteAllText("Temp/ChallengeNPC/npc-spawn-boost.txt","SUCCESS: Temporary Pink/Berdly spawn boost enabled in the open GameScene.\n");
+        }
+        if (!File.Exists(Request) || EditorApplication.isCompiling || EditorApplication.isUpdating ||
+            EditorApplication.isPlayingOrWillChangePlaymode) return;
+        Scene scene = SceneManager.GetActiveScene();
+        if (scene.path != "Assets/Scenes/GameScene.unity") return;
+        File.Delete(Request);
+        try
+        {
+            Directory.CreateDirectory("Temp/ChallengeNPC/PinkUIOriginal");
+            File.Copy(scene.path, "Temp/ChallengeNPC/PinkUIOriginal/GameScene-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".unity", true);
+            Build();
+            EditorSceneManager.SaveScene(scene);
+            AssetDatabase.SaveAssets();
+            File.WriteAllText(Report, "SUCCESS: Completed and saved Pink's UI in the open GameScene. Existing panel, ScoreText, PinkDisplay and background reused.\n");
+        }
+        catch (Exception error)
+        {
+            File.WriteAllText(Report, "FAILED: " + error);
+            Debug.LogException(error);
+        }
+    }
+
+    [MenuItem("WiSe/Complete Pink Rhythm UI")]
+    public static void Build()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode)
+            throw new InvalidOperationException("Build the Pink UI outside Play mode.");
+        Scene scene = SceneManager.GetActiveScene();
+        RectTransform panel = null;
+        foreach (GameObject root in scene.GetRootGameObjects())
+            foreach (RectTransform rect in root.GetComponentsInChildren<RectTransform>(true))
+                if (rect.name == "PinkRhythmPanel" || rect.name == "PinkRythmPanel") { panel = rect; break; }
+        if (panel == null) throw new InvalidOperationException("The active scene needs your PinkRhythmPanel under Canvas.");
+        Undo.RegisterFullObjectHierarchyUndo(panel.gameObject, "Complete Pink rhythm UI");
+        int undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName("Complete Pink rhythm UI");
+        var canvas = panel.GetComponentInParent<Canvas>();
+        if (canvas == null) throw new InvalidOperationException("PinkRhythmPanel must be under Canvas.");
+        panel.name = "PinkRhythmPanel";
+        Stretch(panel);
+        panel.gameObject.SetActive(true);
+        var panelImage = Component<Image>(panel);
+        panelImage.color = Color.white; panelImage.raycastTarget = true;
+
+        TMP_Text originalScore = Find<TMP_Text>(panel, "ScoreText");
+        font = originalScore != null && originalScore.font != null ? originalScore.font : TMP_Settings.defaultFontAsset;
+        var background = Child(panel, "Background");
+        Stretch(background); background.SetAsFirstSibling();
+        var bg = Component<Image>(background);
+        bg.color = Color.white; bg.raycastTarget = false;
+        if (bg.sprite == null) bg.color = new Color(.26f, .14f, .34f);
+        var tint = Child(panel, "BackgroundTint"); Stretch(tint);
+        Component<Image>(tint).color = new Color(.08f, .025f, .14f, .48f);
+        tint.SetSiblingIndex(1);
+
+        BuildStamina(panel);
+        var score = originalScore != null ? originalScore : Text(panel, "ScoreText", "SCORE 000000", 48);
+        At(score.rectTransform, new Vector2(1, 1), new Vector2(1, 1), new Vector2(-80, -112), new Vector2(530, 70));
+        score.text = "SCORE 000000"; score.alignment = TextAlignmentOptions.Right;
+        score.raycastTarget = false; score.enableAutoSizing = true; score.fontSizeMin = 28; score.fontSizeMax = 49.7f;
+        score.textWrappingMode = TextWrappingModes.NoWrap;
+
+        var title = Text(panel, "TitleText", "PINK'S RHYTHM FEVER", 34);
+        At(title.rectTransform, new Vector2(0,1), new Vector2(0,1), new Vector2(85,-112), new Vector2(810,60));
+        title.alignment = TextAlignmentOptions.Left;
+
+        var display = Child(panel, "PinkDisplay");
+        At(display, new Vector2(.5f,.5f), new Vector2(.5f,.5f), new Vector2(-645,-50), new Vector2(500,800));
+        var raw = Component<RawImage>(display); raw.color = Color.white; raw.raycastTarget = false;
+        var modelName = Text(panel, "PinkNameText", "PINK", 34);
+        At(modelName.rectTransform, new Vector2(.5f,.5f), new Vector2(.5f,.5f), new Vector2(-645,-460), new Vector2(320,50));
+
+        var track = Child(panel, "Track");
+        At(track, new Vector2(.5f,.5f), new Vector2(.5f,.5f), new Vector2(335,-145), new Vector2(1050,180));
+        Component<Image>(track).color = Dark;
+        Line(track,"TopBorder",new Vector2(0,1),new Vector2(1,1),new Vector2(0,-2),new Vector2(0,4),Pink);
+        Line(track,"BottomBorder",new Vector2(0,0),new Vector2(1,0),new Vector2(0,2),new Vector2(0,4),Pink);
+        var notes = Child(track,"NotesContainer"); Stretch(notes);
+        Component<RectMask2D>(notes).padding = Vector4.zero;
+        var target = Child(track,"TargetBox");
+        At(target,new Vector2(0,.5f),new Vector2(.5f,.5f),new Vector2(110,0),new Vector2(92,92));
+        var targetImage = Component<Image>(target); targetImage.color = new Color(1,.65f,.85f,.13f);
+        targetImage.raycastTarget = false;
+        Line(target,"Top",new Vector2(0,1),new Vector2(1,1),new Vector2(0,-2),new Vector2(0,4),new Color(1,.65f,.85f));
+        Line(target,"Bottom",new Vector2(0,0),new Vector2(1,0),new Vector2(0,2),new Vector2(0,4),new Color(1,.65f,.85f));
+        Line(target,"Left",new Vector2(0,0),new Vector2(0,1),new Vector2(2,0),new Vector2(4,0),new Color(1,.65f,.85f));
+        Line(target,"Right",new Vector2(1,0),new Vector2(1,1),new Vector2(-2,0),new Vector2(4,0),new Color(1,.65f,.85f));
+
+        var note = Child(notes,"NoteTemplate");
+        At(note,new Vector2(.5f,.5f),new Vector2(.5f,.5f),Vector2.zero,new Vector2(72,72));
+        Component<Image>(note).color = Color.clear;
+        var tail = Child(note,"HoldTail");
+        At(tail,new Vector2(.5f,.5f),new Vector2(0,.5f),Vector2.zero,new Vector2(150,26));
+        Component<Image>(tail).color = Pink;
+        var face = Child(note,"NoteFace"); Stretch(face);
+        var faceImage = Component<Image>(face); faceImage.color = new Color(1,.97f,.99f);
+        faceImage.sprite = AssetDatabase.GetBuiltinExtraResource<Sprite>("UI/Skin/UISprite.psd");
+        faceImage.type = Image.Type.Sliced;
+        var key = Text(note,"KeyText","W",36); Stretch(key.rectTransform);
+        key.font = TMP_Settings.defaultFontAsset; key.color = new Color(.18f,.10f,.22f); key.fontStyle = FontStyles.Bold;
+        key.alignment = TextAlignmentOptions.Center; key.transform.SetAsLastSibling();
+        note.gameObject.SetActive(false);
+
+        var judgement = Text(track,"JudgementText","",42);
+        At(judgement.rectTransform,new Vector2(0,.5f),new Vector2(.5f,.5f),new Vector2(110,142),new Vector2(370,65));
+        var hint = Text(panel,"ControlsText","W  A  S  D   /   HOLD THE KEY FOR PINK TAILS",26);
+        At(hint.rectTransform,new Vector2(.5f,.5f),new Vector2(.5f,.5f),new Vector2(335,-290),new Vector2(1050,60));
+        hint.color = new Color(1,.8f,.94f);
+        Button exit = Button(panel,"ExitButton","EXIT",new Vector2(1,0),new Vector2(1,0),new Vector2(-80,65),new Vector2(175,58));
+
+        var result = Child(panel,"ResultPanel"); Stretch(result);
+        Component<Image>(result).color = new Color(.045f,.02f,.07f,.92f);
+        Component<Image>(result).raycastTarget = true;
+        var card = Child(result,"ResultCard");
+        At(card,new Vector2(.5f,.5f),new Vector2(.5f,.5f),Vector2.zero,new Vector2(950,450));
+        Component<Image>(card).color = Dark;
+        Line(card,"Accent",new Vector2(0,1),new Vector2(1,1),new Vector2(0,-3),new Vector2(0,6),Pink);
+        var resultText = Text(card,"ResultText","SCORE 000000",38);
+        At(resultText.rectTransform,new Vector2(.5f,.5f),new Vector2(.5f,.5f),new Vector2(0,65),new Vector2(840,220));
+        resultText.enableAutoSizing = true; resultText.fontSizeMin=24;resultText.fontSizeMax=38;
+        Button next = Button(card,"ContinueButton","CONTINUE",new Vector2(.5f,.5f),new Vector2(.5f,.5f),new Vector2(0,-120),new Vector2(260,66));
+        result.gameObject.SetActive(false);
+
+        var manager = Child((RectTransform)panel.parent,"PinkRhythmManager");
+        Undo.RegisterFullObjectHierarchyUndo(manager.gameObject,"Connect Pink rhythm manager");
+        manager.gameObject.SetActive(true);
+        var controller = Component<PinkRhythmController>(manager);
+        GameObject stage = BuildPreview(scene,raw);
+        var so = new SerializedObject(controller);
+        Set(so,"rhythmPanel",panel.gameObject);Set(so,"notesContainer",notes);Set(so,"targetBox",target);Set(so,"noteTemplate",note);
+        Set(so,"scoreText",score);Set(so,"judgementText",judgement);Set(so,"staminaSlider",Find<Slider>(panel,"StaminaSlider"));
+        Set(so,"exitButton",exit);Set(so,"resultPanel",result.gameObject);Set(so,"resultText",resultText);Set(so,"continueButton",next);
+        Set(so,"pinkStage",stage);Set(so,"pinkBeatmap",AssetDatabase.LoadAssetAtPath<TextAsset>("Assets/Resources/Rhythm/RainbowRoad_Full.txt"));
+        Set(so,"song",AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/Music/Wii Rainbow Road - Mario Kart 8 Deluxe Booster Course Pass Music.mp3"));
+        so.ApplyModifiedProperties();
+        var audio = controller.GetComponent<AudioSource>();audio.playOnAwake=false;audio.loop=false;audio.spatialBlend=0;
+        EditorUtility.SetDirty(controller);EditorUtility.SetDirty(audio);
+        foreach(Graphic graphic in panel.GetComponentsInChildren<Graphic>(true))
+            if(graphic.GetComponent<Button>()==null && graphic.transform!=panel && graphic.transform!=result)
+                graphic.raycastTarget=false;
+        Undo.CollapseUndoOperations(undoGroup);
+        EditorSceneManager.MarkSceneDirty(scene);
+        Debug.Log("Pink rhythm UI complete: existing ScoreText and artwork reused, references assigned, preview camera configured.");
+    }
+
+    static void BuildStamina(RectTransform panel)
+    {
+        var existing = panel.Find("StamineSlider");
+        if (panel.Find("StaminaSlider")==null && existing!=null) existing.name="StaminaSlider";
+        var rect=Child(panel,"StaminaSlider");
+        rect.anchorMin=new Vector2(0,1);rect.anchorMax=new Vector2(1,1);rect.pivot=new Vector2(.5f,1);
+        rect.offsetMin=new Vector2(85,-74);rect.offsetMax=new Vector2(-85,-48);
+        var slider=Component<Slider>(rect);
+        var bg=Child(rect,"Background");Stretch(bg);Component<Image>(bg).color=new Color(.13f,.075f,.19f);
+        var area=Child(rect,"Fill Area");Stretch(area);area.offsetMin=new Vector2(3,3);area.offsetMax=new Vector2(-3,-3);
+        var fill=Child(area,"Fill");Stretch(fill);Component<Image>(fill).color=Pink;
+        slider.handleRect=null;slider.targetGraphic=null;slider.fillRect=fill;slider.direction=Slider.Direction.LeftToRight;
+        slider.minValue=0;slider.maxValue=100;slider.wholeNumbers=false;slider.value=100;slider.interactable=false;
+        var handle=rect.Find("Handle Slide Area");if(handle!=null)handle.gameObject.SetActive(false);
+        // The original slider's Background may have been added after its fill.
+        bg.SetAsFirstSibling();area.SetAsLastSibling();
+    }
+
+    static GameObject BuildPreview(Scene scene,RawImage display)
+    {
+        EnsureFolder(AssetFolder);
+        int layer=EnsurePreviewLayer();
+        GameObject stage=null;
+        foreach(var root in scene.GetRootGameObjects()) if(root.name=="PinkStage") {stage=root;break;}
+        if(stage==null) {stage=new GameObject("PinkStage");Undo.RegisterCreatedObjectUndo(stage,"Create Pink preview");SceneManager.MoveGameObjectToScene(stage,scene);}
+        else Undo.RegisterFullObjectHierarchyUndo(stage,"Update Pink preview");
+        stage.SetActive(true);stage.transform.position=new Vector3(0,-10000,0);
+        var model=stage.transform.Find("PinkModel");
+        if(model==null)
+        {
+            var asset=AssetDatabase.LoadAssetAtPath<GameObject>(PinkMarioSetup.MarioPath);
+            if(asset==null)throw new InvalidOperationException("Run Pink Mario setup before building the rhythm preview.");
+            GameObject go=(GameObject)PrefabUtility.InstantiatePrefab(asset,stage.transform);
+            Undo.RegisterCreatedObjectUndo(go,"Create Pink model preview");go.name="PinkModel";model=go.transform;
+        }
+        model.localPosition=Vector3.zero;model.localRotation=Quaternion.identity;
+        foreach(var t in model.GetComponentsInChildren<Transform>(true)) t.gameObject.layer=layer;
+        foreach(var animator in model.GetComponentsInChildren<Animator>(true)) animator.enabled=false;
+        foreach(var collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled=false;
+        var renderers=model.GetComponentsInChildren<Renderer>(true);
+        if(renderers.Length==0)throw new InvalidOperationException("Pink model has no renderers.");
+        foreach(var renderer in renderers)
+        {
+            renderer.shadowCastingMode=ShadowCastingMode.Off;renderer.receiveShadows=false;
+        }
+        Bounds bounds=renderers[0].bounds;foreach(var renderer in renderers)bounds.Encapsulate(renderer.bounds);
+        const string rtPath=AssetFolder+"/PinkPreviewTexture.renderTexture";
+        var rt=AssetDatabase.LoadAssetAtPath<RenderTexture>(rtPath);
+        if(rt==null)
+        {
+            rt=new RenderTexture(512,820,24,RenderTextureFormat.ARGB32){name="PinkPreviewTexture",antiAliasing=2};
+            AssetDatabase.CreateAsset(rt,rtPath);
+        }
+        display.texture=rt;
+        var cameraTransform=ChildTransform(stage.transform,"PinkCamera");
+        var camera=Component<Camera>(cameraTransform);camera.enabled=true;camera.orthographic=true;
+        camera.clearFlags=CameraClearFlags.SolidColor;camera.backgroundColor=Color.clear;
+        camera.cullingMask=1<<layer;camera.targetTexture=rt;camera.nearClipPlane=.01f;camera.farClipPlane=30;
+        camera.allowHDR=false;camera.allowMSAA=true;camera.useOcclusionCulling=false;
+        camera.orthographicSize=Mathf.Max(bounds.extents.y*1.08f,bounds.extents.x/(512f/820)*1.08f);
+        camera.transform.position=bounds.center+Vector3.forward*Mathf.Max(4,bounds.size.z+3);
+        camera.transform.LookAt(bounds.center);camera.depth=50;
+        var lightTransform=ChildTransform(stage.transform,"PinkLight");
+        var light=Component<Light>(lightTransform);light.type=LightType.Directional;light.intensity=1.35f;
+        light.color=new Color(1,.89f,.95f);light.cullingMask=1<<layer;light.shadows=LightShadows.None;
+        lightTransform.localRotation=Quaternion.Euler(25,160,0);
+        foreach(Camera other in Object.FindObjectsByType<Camera>(FindObjectsInactive.Include))
+            if(other!=camera && other.gameObject.scene==scene)
+            {Undo.RecordObject(other,"Exclude Pink preview from world cameras");other.cullingMask&=~(1<<layer);}
+        rt.Create();camera.Render();
+        stage.SetActive(false);
+        EditorUtility.SetDirty(display);
+        return stage;
+    }
+
+    static Material PreviewMaterial()
+    {
+        const string path=AssetFolder+"/PinkPreview.mat";
+        var material=AssetDatabase.LoadAssetAtPath<Material>(path);
+        Shader shader=Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard");
+        if(material==null)
+        {
+            material=new Material(shader){name="PinkPreview"};AssetDatabase.CreateAsset(material,path);
+        }
+        else if(material.shader!=shader) material.shader=shader;
+        Texture texture=AssetDatabase.LoadAssetAtPath<Texture>("Assets/Imported Assets/Pink/Pink.fbm/Pink_BaseColor.jpg");
+        if(material.HasProperty("_BaseMap"))material.SetTexture("_BaseMap",texture);
+        if(material.HasProperty("_MainTex"))material.SetTexture("_MainTex",texture);
+        if(material.HasProperty("_BaseColor"))material.SetColor("_BaseColor",Color.white);
+        if(material.HasProperty("_Color"))material.SetColor("_Color",Color.white);
+        if(material.HasProperty("_Smoothness"))material.SetFloat("_Smoothness",.25f);
+        EditorUtility.SetDirty(material);return material;
+    }
+
+    static int EnsurePreviewLayer()
+    {
+        var manager=new SerializedObject(AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/TagManager.asset")[0]);
+        var layers=manager.FindProperty("layers");
+        for(int i=8;i<32;i++)if(layers.GetArrayElementAtIndex(i).stringValue=="PinkPreview")return i;
+        for(int i=31;i>=8;i--)
+            if(string.IsNullOrEmpty(layers.GetArrayElementAtIndex(i).stringValue))
+            {layers.GetArrayElementAtIndex(i).stringValue="PinkPreview";manager.ApplyModifiedProperties();return i;}
+        throw new InvalidOperationException("A free user layer is needed for the isolated Pink model preview.");
+    }
+
+    static Transform ChildTransform(Transform parent,string name)
+    {
+        var child=parent.Find(name);if(child!=null)return child;
+        var go=new GameObject(name);Undo.RegisterCreatedObjectUndo(go,"Create Pink preview object");go.transform.SetParent(parent,false);return go.transform;
+    }
+    static RectTransform Child(Transform parent,string name)
+    {
+        var child=parent.Find(name);if(child!=null)return (RectTransform)child;
+        var go=new GameObject(name,typeof(RectTransform));Undo.RegisterCreatedObjectUndo(go,"Create Pink UI object");go.transform.SetParent(parent,false);return (RectTransform)go.transform;
+    }
+    static T Component<T>(Transform target) where T:Component
+    {
+        var component=target.GetComponent<T>();if(component==null)component=Undo.AddComponent<T>(target.gameObject);return component;
+    }
+    static TMP_Text Text(Transform parent,string name,string text,float size)
+    {
+        var label=Component<TextMeshProUGUI>(Child(parent,name));label.font=font;label.text=text;label.fontSize=size;
+        label.alignment=TextAlignmentOptions.Center;label.color=Color.white;label.raycastTarget=false;
+        label.textWrappingMode=TextWrappingModes.Normal;return label;
+    }
+    static Button Button(Transform parent,string name,string title,Vector2 anchor,Vector2 pivot,Vector2 pos,Vector2 size)
+    {
+        var rect=Child(parent,name);At(rect,anchor,pivot,pos,size);
+        var image=Component<Image>(rect);image.color=Pink;image.raycastTarget=true;
+        image.sprite=AssetDatabase.GetBuiltinExtraResource<Sprite>("UI/Skin/UISprite.psd");image.type=Image.Type.Sliced;
+        var button=Component<Button>(rect);button.targetGraphic=image;
+        var colors=button.colors;colors.normalColor=Color.white;colors.highlightedColor=new Color(1,.82f,.94f);
+        colors.pressedColor=new Color(.75f,.65f,.8f);button.colors=colors;
+        var label=Text(rect,"Text (TMP)",title,28);Stretch(label.rectTransform);return button;
+    }
+    static void Stretch(RectTransform rect)
+    {
+        rect.anchorMin=Vector2.zero;rect.anchorMax=Vector2.one;rect.pivot=new Vector2(.5f,.5f);
+        rect.offsetMin=rect.offsetMax=Vector2.zero;rect.localScale=Vector3.one;
+    }
+    static void At(RectTransform rect,Vector2 anchor,Vector2 pivot,Vector2 position,Vector2 size)
+    {
+        rect.anchorMin=rect.anchorMax=anchor;rect.pivot=pivot;rect.anchoredPosition=position;rect.sizeDelta=size;rect.localScale=Vector3.one;
+    }
+    static void Line(Transform parent,string name,Vector2 min,Vector2 max,Vector2 pos,Vector2 size,Color color)
+    {
+        var rect=Child(parent,name);rect.anchorMin=min;rect.anchorMax=max;rect.pivot=new Vector2(.5f,.5f);
+        rect.sizeDelta=size;rect.anchoredPosition=pos;Component<Image>(rect).color=color;
+    }
+    static T Find<T>(Transform root,string name)where T:Component
+    {
+        foreach(var t in root.GetComponentsInChildren<Transform>(true))if(t.name==name)return t.GetComponent<T>();return null;
+    }
+    static void Set(SerializedObject so,string property,Object value)=>so.FindProperty(property).objectReferenceValue=value;
+    static void EnsureFolder(string path)
+    {
+        if(AssetDatabase.IsValidFolder(path))return;
+        string parent=Path.GetDirectoryName(path).Replace('\\','/');EnsureFolder(parent);AssetDatabase.CreateFolder(parent,Path.GetFileName(path));
+    }
+}

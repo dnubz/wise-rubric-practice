@@ -1,0 +1,19 @@
+using System.Collections;
+using UnityEngine;
+
+/// <summary>The saved full-screen cover hides room swaps and camera snapping.</summary>
+public sealed class DungeonRoomTransition : MonoBehaviour
+{
+    [SerializeField] CanvasGroup cover;
+    public float Opacity => cover.alpha;
+    public void Clear() { cover.alpha = 0; cover.blocksRaycasts = false; }
+    void OnDisable() => Clear();
+    public IEnumerator FadeTo(float opacity, float duration)
+    {
+        cover.blocksRaycasts = true;
+        float start = cover.alpha;
+        for (float elapsed = 0; elapsed < duration; elapsed += Time.unscaledDeltaTime)
+        { cover.alpha = Mathf.Lerp(start, opacity, elapsed / duration); yield return null; }
+        cover.alpha = opacity;
+    }
+}

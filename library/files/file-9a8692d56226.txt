@@ -1,0 +1,66 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Outlined pixel lettering for the challenge panel, independent of font imports.</summary>
+[RequireComponent(typeof(CanvasRenderer))]
+public sealed class ChallengePromptPixelText : MaskableGraphic
+{
+    [SerializeField] string text = "";
+    public float pixelSize = 5f;
+    public float outlineWidth = 2f;
+    public Color coreColor = new Color(0.075f, 0.085f, 0.13f, 1f);
+    public string Text
+    {
+        get => text;
+        set { text = (value ?? "").ToUpperInvariant(); SetVerticesDirty(); }
+    }
+
+    static readonly Dictionary<char, string> glyphs = new Dictionary<char, string>
+    {
+        ['A'] = "01110/10001/10001/11111/10001/10001/10001",
+        ['B'] = "11110/10001/10001/11110/10001/10001/11110",
+        ['C'] = "01111/10000/10000/10000/10000/10000/01111",
+        ['D'] = "11110/10001/10001/10001/10001/10001/11110",
+        ['E'] = "11111/10000/10000/11110/10000/10000/11111",
+        ['G'] = "01111/10000/10000/10111/10001/10001/01111",
+        ['H'] = "10001/10001/10001/11111/10001/10001/10001",
+        ['I'] = "11111/00100/00100/00100/00100/00100/11111",
+        ['K'] = "10001/10010/10100/11000/10100/10010/10001",
+        ['L'] = "10000/10000/10000/10000/10000/10000/11111",
+        ['N'] = "10001/11001/11001/10101/10011/10011/10001",
+        ['O'] = "01110/10001/10001/10001/10001/10001/01110",
+        ['P'] = "11110/10001/10001/11110/10000/10000/10000",
+        ['R'] = "11110/10001/10001/11110/10100/10010/10001",
+        ['S'] = "01111/10000/10000/01110/00001/00001/11110",
+        ['T'] = "11111/00100/00100/00100/00100/00100/00100",
+        ['Y'] = "10001/10001/01010/00100/00100/00100/00100",
+        ['?'] = "01110/10001/00001/00010/00100/00000/00100"
+    };
+
+    protected override void OnPopulateMesh(VertexHelper mesh)
+    {
+        mesh.Clear();
+        if (string.IsNullOrEmpty(text)) return;
+        Rect rect = GetPixelAdjustedRect();
+        float size = Mathf.Min(pixelSize, (rect.width - outlineWidth * 2f) / (text.Length * 6f - 1f),
+            (rect.height - outlineWidth * 2f) / 7f);
+        if (size <= 0f) return;
+        Vector2 origin = rect.center + new Vector2(-(text.Length * 6f - 1f) * size * 0.5f, 3.5f * size);
+        // Draw the white outline first, then the dark letter cores, like the reference.
+        for (int pass = 0; pass < 2; pass++)
+            for (int character = 0; character < text.Length; character++)
+            {
+                if (!glyphs.TryGetValue(text[character], out string glyph)) continue;
+                for (int y = 0; y < 7; y++)
+                    for (int x = 0; x < 5; x++)
+                    {
+                        if (glyph[y * 6 + x] != '1') continue;
+                        float pad = pass == 0 ? outlineWidth : 0f;
+                        Rect pixel = new Rect(origin.x + (character * 6 + x) * size - pad,
+                            origin.y - (y + 1) * size - pad, size + pad * 2f, size + pad * 2f);
+                        ChallengePromptGraphic.AddQuad(mesh, pixel, pass == 0 ? color : coreColor);
+                    }
+            }
+    }
+}

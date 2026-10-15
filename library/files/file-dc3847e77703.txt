@@ -1,0 +1,18 @@
+using UnityEngine;
+
+public sealed class BattleStatusVisual : MonoBehaviour
+{
+    public GameObject shield, portal, buff, dodge;
+    BattleUnit unit;
+    LineRenderer[] shieldRings;
+    public void Bind(BattleUnit target) { unit = target; shieldRings = shield.GetComponentsInChildren<LineRenderer>(true); }
+    void LateUpdate()
+    {
+        if (unit == null) return;
+        shield.SetActive(unit.Alive && unit.shields > 0);
+        for (int i = 0; i < shieldRings.Length; i++) shieldRings[i].enabled = i < unit.shields;
+        portal.SetActive(unit.Alive && unit.portal);
+        buff.SetActive(unit.Alive && unit.magicBuffTurns > 0);
+        if (dodge != null) dodge.SetActive(unit.Alive && unit.dodgeTurns > 0);
+    }
+}

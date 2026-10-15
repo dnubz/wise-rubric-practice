@@ -1,0 +1,201 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using Unity.AI.Navigation;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.Rendering;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class EnemyRequirementsChecks
+{
+    const string Folder = "Temp/EnemyCriteria";
+    static IEnumerator routine;
+    static readonly Stack<IEnumerator> steps = new Stack<IEnumerator>();
+    static int frame = -1;
+    static string error;
+    static double deadline;
+    static GameObject fixture;
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static EnemyRequirementsChecks() => EditorApplication.update += Check;
+    [MenuItem("WiSe/Enemies/Check Enemy Criteria")]
+    public static void Request() { Directory.CreateDirectory(Folder); File.WriteAllText(Folder + "/check.request", ""); }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || File.Exists(Folder + "/setup.request")) return;
+        if (routine != null && !EditorApplication.isPlaying) { Finish("FAIL: Play mode ended before validation completed."); return; }
+        if (routine == null)
+        {
+            if (!File.Exists(Folder + "/check.request")) return;
+            EditorApplication.isPaused = false;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 4) return;
+            File.Delete(Folder + "/check.request"); Application.runInBackground = true; error = null;
+            Application.logMessageReceived += Log; deadline = EditorApplication.timeSinceStartup + 90; routine = Run(); steps.Push(routine);
+        }
+        try
+        {
+            Require(EditorApplication.timeSinceStartup < deadline, "Enemy checks timed out.");
+            Require(!EditorApplication.isPaused, "Editor paused: " + error);
+            Require(error == null, error);
+            if (frame == Time.frameCount) return;
+            frame = Time.frameCount;
+            while (steps.Count > 0)
+            {
+                var current = steps.Peek();
+                if (!current.MoveNext()) { (steps.Pop() as IDisposable)?.Dispose(); continue; }
+                if (current.Current is IEnumerator child) { steps.Push(child); continue; }
+                return;
+            }
+            Finish("PASS: real Idle/Patrol/Chase/Attack/OutOfSight transitions, connected random patrol points, stopped confusion, animated sword and red outlines; actual melee encounter; skeleton variant damage at 100%/50%/25%, minion variant exactly two shots; solid and destructible obstacles absorb shots; distinct variant appearance, per-hit animation and attack SFX. WFC terrain untouched.");
+        }
+        catch (Exception e) { Finish("FAIL: " + e); }
+    }
+    static void Finish(string result)
+    {
+        while (steps.Count > 0) (steps.Pop() as IDisposable)?.Dispose();
+        routine = null; Application.logMessageReceived -= Log;
+        File.WriteAllText(Folder + "/result.txt", result);
+        if (fixture != null) Object.DestroyImmediate(fixture);
+        EditorApplication.isPlaying = false;
+    }
+    static void Log(string message, string stack, LogType type)
+    { if (type == LogType.Error || type == LogType.Exception || type == LogType.Assert) error = message + "\n" + stack; }
+    static void Require(bool value, string message) { if (!value) throw new Exception(message); }
+    static float Flat(Vector3 a, Vector3 b) => Vector3.ProjectOnPlane(a - b, Vector3.up).magnitude;
+    static void Warp(BattleUnit unit, Vector3 point) { unit.Agent.Warp(point); unit.ResetMovement(); }
+    static IEnumerator Frames(float seconds)
+    { float until = Time.time + seconds; while (Time.time < until) yield return null; }
+    static IEnumerator Run()
+    {
+        var session = BattleSession.Instance;
+        Require(session != null, "Open GameScene before running enemy checks.");
+        if (session.menu != null) session.menu.SetActive(false);
+        Time.timeScale = 1; Time.maximumDeltaTime = .1f;
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var e in Object.FindObjectsByType<EncounterEnemy>()) e.enabled = false;
+        var world = WFCWorldManager.Instance; if (world != null) world.enabled = false;
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = player.GetComponent<CharacterMovement>(); movement.enabled = false;
+        var settings = session.settings;
+        var skeleton = settings.enemies.First(e => e.kind == BattleEnemyKind.Skeleton);
+        var minion = settings.enemies.First(e => e.kind == BattleEnemyKind.Minion);
+        Require(settings.attackSound != null && settings.laserSound != null, "Missing attack SFX.");
+        fixture = new GameObject("Enemy Criteria Isolated Navigation"); fixture.transform.position = new Vector3(10000, 300, 10000);
+        var floor = GameObject.CreatePrimitive(PrimitiveType.Cube); floor.transform.SetParent(fixture.transform, false);
+        floor.transform.localPosition = Vector3.down * .5f; floor.transform.localScale = new Vector3(60, 1, 60);
+        var surface = fixture.AddComponent<NavMeshSurface>(); surface.collectObjects = CollectObjects.Children;
+        surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders; surface.BuildNavMesh();
+        Vector3 centre = fixture.transform.position;
+        movement.Teleport(centre + Vector3.right * 25, Quaternion.identity);
+        var enemy = Object.Instantiate(skeleton.prefab, centre, Quaternion.identity).GetComponent<EncounterEnemy>();
+        enemy.Configure(skeleton, "test:enemy-criteria"); enemy.detectionRange = 10;
+        var motion = enemy.GetComponent<BattleEnemyMotion>();
+        Require(motion.weaponArm != null && motion.weaponArm.GetComponentsInChildren<Renderer>().Length > 0, "Skeleton has no sword.");
+        yield return null;
+        var outlines = enemy.GetComponentsInChildren<Renderer>().Where(r => r.name.StartsWith("[Outline]")).ToArray();
+        Require(outlines.Length > 0 && outlines.All(r => r.sharedMaterial.GetColor("_OutlineColor").r > .8f && r.sharedMaterial.GetColor("_OutlineColor").g < .2f), "Enemy does not have red outlines.");
+        Require(enemy.CurrentState == EncounterEnemy.State.Idle, "Enemy failed Idle.");
+        typeof(EncounterEnemy).GetField("timer", Private).SetValue(enemy, 3.1f);
+        yield return null; yield return null;
+        Require(enemy.CurrentState == EncounterEnemy.State.Patrol, "Enemy failed Patrol.");
+        Vector3 destination = (Vector3)typeof(EncounterEnemy).GetField("destination", Private).GetValue(enemy);
+        var agent = enemy.GetComponent<NavMeshAgent>();
+        Require(Flat(destination, centre) <= enemy.roamRadius && agent.isOnNavMesh, "Patrol left walkable bounds.");
+        var pick = typeof(EncounterEnemy).GetMethod("TryPatrolDestination", Private);
+        var points = new List<Vector3>();
+        for (int i = 0; i < 8; i++)
+        {
+            object[] args = { Vector3.zero }; Require((bool)pick.Invoke(enemy, args), "No connected patrol destination.");
+            points.Add((Vector3)args[0]); Require(Flat(points[i], centre) <= enemy.roamRadius, "Random patrol left roam bounds.");
+        }
+        Require(points.Any(p => Flat(p, points[0]) > 1), "Patrol points are not varied.");
+        movement.Teleport(enemy.transform.position + Vector3.forward * 7, Quaternion.identity);
+        yield return Frames(.3f);
+        Require(enemy.CurrentState == EncounterEnemy.State.Chase && !agent.isStopped, "Enemy failed Chase.");
+        movement.Teleport(centre + Vector3.right * 27, Quaternion.identity);
+        yield return null; yield return null;
+        Require(enemy.CurrentState == EncounterEnemy.State.OutOfSight && agent.isStopped, "Enemy failed OutOfSight: state=" + enemy.CurrentState + ", stopped=" + agent.isStopped + ", distance=" + Flat(player.position, enemy.transform.position) + ", player=" + player.position + ", enemy=" + enemy.transform.position);
+        Quaternion facing = enemy.transform.rotation; Vector3 stopped = enemy.transform.position;
+        yield return Frames(.3f);
+        Require(Quaternion.Angle(facing, enemy.transform.rotation) > 5 && Flat(stopped, enemy.transform.position) < .05f, "Confusion lacks stopped searching motion.");
+        yield return Frames(1.4f);
+        Require(enemy.CurrentState == EncounterEnemy.State.Idle, "Confusion did not return to Idle.");
+        Quaternion swordRest = motion.weaponArm.localRotation;
+        movement.Teleport(enemy.transform.position + Vector3.forward * 2, Quaternion.identity);
+        yield return Frames(.1f);
+        Require(enemy.CurrentState == EncounterEnemy.State.Attack && !BattleSession.IsActive, "Attack did not wind up before impact.");
+        Require(Quaternion.Angle(swordRest, motion.weaponArm.localRotation) > 10, "Sword did not visibly swing.");
+        Require(Object.FindObjectsByType<AudioSource>().Any(a => a.isPlaying && a.clip == settings.attackSound), "Overworld sword swing SFX did not play.");
+        float until = Time.time + 10;
+        while ((BattleController.Instance == null || !BattleController.Instance.Ready) && Time.time < until) yield return null;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Actual skeleton swing did not start battle.");
+        Object.Destroy(enemy.gameObject); Object.Destroy(fixture); fixture = null;
+        foreach (var p in battle.Party) { p.character.SetCurrentHP(p.MaxHP); p.Refresh(); }
+        foreach (var e in battle.Enemies) e.gameObject.SetActive(false);
+        Vector3 origin = battle.Layout.transform.position;
+        foreach (var p in battle.Party) Warp(p, origin + new Vector3(18 + p.characterIndex * 3, 0, 18));
+        foreach (var cover in battle.Layout.cover) cover.gameObject.SetActive(false);
+        var target = battle.Party[0]; target.shields = 0;
+        var veteran = battle.SpawnEnemy(skeleton, origin, true);
+        Warp(target, origin + Vector3.forward * 2);
+        int before = target.CurrentHP; var observed = new List<int>(); int previous = before;
+        bool complete = false;
+        battle.StartCoroutine(Complete(battle.EnemyAttack(veteran, target), () => complete = true));
+        until = Time.time + 5;
+        while (!complete && Time.time < until)
+        {
+            if (target.CurrentHP != previous) { observed.Add(previous - target.CurrentHP); previous = target.CurrentHP; }
+            yield return null;
+        }
+        Require(complete && observed.Count == 3, "Skeleton variant did not produce three separate hits.");
+        for (int i = 0; i < 3; i++) Require(observed[i] == Mathf.Max(1, Mathf.RoundToInt((veteran.Attack - target.Defense) * Mathf.Pow(.5f, i))), "Incorrect skeleton damage falloff.");
+        var body = veteran.GetComponentsInChildren<Renderer>().First(r => !r.name.StartsWith("[Outline]") && r.sharedMaterial.HasProperty("_BaseColor"));
+        Require(body.sharedMaterial.GetColor("_BaseColor").b > body.sharedMaterial.GetColor("_BaseColor").g, "Variant has no distinct tint.");
+        Capture(battle, veteran);
+        veteran.gameObject.SetActive(false);
+        var shooter = battle.SpawnEnemy(minion, origin, true);
+        Warp(target, origin + Vector3.forward * 7); target.character.SetCurrentHP(target.MaxHP); target.Refresh();
+        observed.Clear(); previous = target.CurrentHP; complete = false;
+        battle.StartCoroutine(Complete(battle.EnemyAttack(shooter, target), () => complete = true));
+        until = Time.time + 5;
+        while (!complete && Time.time < until)
+        {
+            if (target.CurrentHP != previous) { observed.Add(previous - target.CurrentHP); previous = target.CurrentHP; }
+            yield return null;
+        }
+        Require(complete && observed.Count == 2 && observed.All(v => v == Mathf.Max(1, shooter.Attack - target.Defense)), "Minion variant did not land exactly two projectiles.");
+        var obstacle = GameObject.CreatePrimitive(PrimitiveType.Cube); obstacle.transform.position = origin + new Vector3(0, 2, 3.5f);
+        obstacle.transform.localScale = new Vector3(3, 4, 1); Physics.SyncTransforms();
+        before = target.CurrentHP; complete = false;
+        battle.StartCoroutine(Complete(battle.Shoot(shooter, target, shooter.Attack), () => complete = true));
+        yield return Frames(.8f);
+        Require(complete && target.CurrentHP == before, "Solid obstacle did not absorb projectile.");
+        Object.Destroy(obstacle);
+        var wall = battle.Layout.cover[0]; wall.gameObject.SetActive(true); wall.transform.position = origin + Vector3.forward * 3.5f;
+        Physics.SyncTransforms(); complete = false;
+        battle.StartCoroutine(Complete(battle.Shoot(shooter, target, shooter.Attack), () => complete = true));
+        yield return Frames(.8f);
+        Require(complete && target.CurrentHP == before && wall.HP == 100 - shooter.Attack, "Destructible obstacle did not absorb damage.");
+    }
+    static IEnumerator Complete(IEnumerator action, Action complete) { yield return action; complete(); }
+    static void Capture(BattleController battle, BattleUnit enemy)
+    {
+        var camera = battle.cameraRig.view; Vector3 oldPosition = camera.transform.position; Quaternion oldRotation = camera.transform.rotation;
+        camera.transform.position = enemy.transform.position + new Vector3(8, 6, 9);
+        camera.transform.LookAt(enemy.transform.position + Vector3.up * 2.5f);
+        var target = new RenderTexture(900, 900, 24); var texture = new Texture2D(900, 900, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            RenderPipeline.SubmitRenderRequest(camera, new RenderPipeline.StandardRequest { destination = target });
+            RenderTexture.active = target; texture.ReadPixels(new Rect(0, 0, 900, 900), 0, 0); texture.Apply();
+            File.WriteAllBytes(Folder + "/skeleton-preview.png", texture.EncodeToPNG());
+        }
+        finally { camera.transform.SetPositionAndRotation(oldPosition, oldRotation); RenderTexture.active = previous; Object.Destroy(target); Object.Destroy(texture); }
+    }
+}

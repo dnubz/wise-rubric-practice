@@ -1,0 +1,121 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DungeonTravelFeedbackChecks
+{
+    const string Folder = "Temp/DungeonTravelFeedback";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static DungeonTravelFeedbackChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying) return;
+            // Editor updates can run several times per game frame, especially
+            // while timeScale is zero; advance physics/timing checks once per frame.
+            if (lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: real gate travel fades out before the room/camera swap and fades back in; repeated F/movement blocked, unscaled fade completes while timeScale=0; coin audio starts at pickup with <10ms leading silence and gold granted once; new wooden impact plays at the real animation contact, not during windup."); }
+            catch (Exception error) { Finish("FAIL: " + error); Debug.LogException(error); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        EditorApplication.isPaused = false; Application.runInBackground = true;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result)
+    { Time.timeScale = 1; File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static T Get<T>(object obj, string field) => (T)obj.GetType().GetField(field, Private).GetValue(obj);
+    static void Set(object obj, string field, object value) => obj.GetType().GetField(field, Private).SetValue(obj, value);
+    static IEnumerator Run()
+    {
+        Time.timeScale = 1;
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = Object.FindAnyObjectByType<DungeonSession>();
+        session.StartCoroutine((IEnumerator)typeof(DungeonSession).GetMethod("Enter", Private).Invoke(session, new object[] { "DungeonScene" }));
+        float elapsed = 0;
+        while (!DungeonSession.IsInside && elapsed < 40) { elapsed += Time.unscaledDeltaTime; yield return null; }
+        Require(DungeonSession.IsInside, "Dungeon entry failed.");
+        int frame = Time.frameCount; while (Time.frameCount == frame) yield return null;
+        var dungeon = DungeonSession.Generator;
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings.roomTransitionPrefab != null && settings.breakingImpactSound.name == "Wooden Box Break Impact", "Saved transition/wood impact missing.");
+        Require(AudibleDelay(settings.coinPickupSound) < .01f && AudibleDelay(settings.breakingImpactSound) < .01f, "Effects still have leading silence.");
+        foreach (var npc in dungeon.GetComponentsInChildren<NPCBase>(true)) npc.enabled = false;
+        foreach (var enemy in dungeon.GetComponentsInChildren<EncounterEnemy>(true)) enemy.enabled = false;
+        var roots = Get<List<GameObject>>(dungeon, "roomRoots");
+        int source = dungeon.CurrentRoom, destination = dungeon.Layout.Graph.Bonds[source][0];
+        var door = roots[source].transform.Find("Exit_ToRoom_" + destination).GetComponent<DungeonRoomExit>();
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = player.GetComponent<CharacterMovement>(); movement.enabled = false;
+        movement.Teleport(door.transform.position - Vector3.up * 1.5f, player.rotation);
+        Set(dungeon, "<OriginalKeys>k__BackingField", 2); Set(dungeon, "<BossKeys>k__BackingField", 1);
+        dungeon.TryUnlockExit(source, destination); Set(dungeon, "transitionReadyAt", 0f);
+        var gate = door.GetComponent<DungeonGateLift>();
+        typeof(DungeonGateLift).GetMethod("MoveGate", Private).Invoke(gate, new object[] { 2f });
+        Require(gate.IsFullyRaised && door.Interact(), "Actual F doorway path failed.");
+        Require(dungeon.IsRoomTransitioning && dungeon.CurrentRoom == source && NPCChallengePrompt.BlocksGameplayInput, "Room swapped immediately or input not blocked.");
+        Require(!door.Interact() && !dungeon.TryInteractNearest() && !dungeon.CanInteractNearby(), "Repeated F accepted during fade.");
+        var fade = Get<DungeonRoomTransition>(dungeon, "roomTransition");
+        Time.timeScale = 0; elapsed = 0;
+        while (dungeon.CurrentRoom == source && elapsed < 2) { elapsed += Time.unscaledDeltaTime; yield return null; }
+        Require(dungeon.CurrentRoom == destination && fade.Opacity >= .99f, $"Room/camera swap was not covered: room={dungeon.CurrentRoom}, destination={destination}, opacity={fade.Opacity}, elapsed={elapsed}.");
+        ScreenCapture.CaptureScreenshot(Folder + "/room-blackout.png");
+        elapsed = 0;
+        while (dungeon.IsRoomTransitioning && elapsed < 2) { elapsed += Time.unscaledDeltaTime; yield return null; }
+        Time.timeScale = 1;
+        Require(!dungeon.IsRoomTransitioning && fade.Opacity == 0 && !DungeonSession.BlocksGameplayInput, "Fade left the screen black or gameplay blocked.");
+        var cameraRig = Object.FindAnyObjectByType<CameraController>();
+        Require(cameraRig != null && Vector3.Distance(player.position, dungeon.RoomCentre(destination)) < 35, "New room landing failed.");
+        // One real proximity pickup must start its preloaded sound in the same call.
+        var coins = Get<List<List<GameObject>>>(dungeon, "roomCoins")[destination];
+        foreach (var coin in coins) if (coin != null) Object.Destroy(coin); coins.Clear();
+        dungeon.SpawnCoin(destination, player.position); int gold = PlayerInventory.Instance.Gold;
+        typeof(DungeonGenerator).GetMethod("Update", Private).Invoke(dungeon, null);
+        var coinAudio = Get<AudioSource>(dungeon, "coinPickupAudio");
+        Require(coins.Count == 0 && PlayerInventory.Instance.Gold == gold + DungeonGenerator.CoinValue && coinAudio.isPlaying, "Pickup/audio were not synchronized.");
+        typeof(DungeonGenerator).GetMethod("Update", Private).Invoke(dungeon, null);
+        Require(PlayerInventory.Instance.Gold == gold + DungeonGenerator.CoinValue, "Coin collected twice.");
+        // The impact is still driven by WiSe's real animation contact cue.
+        var switching = Object.FindAnyObjectByType<CharacterSwitchManager>(); switching.SwitchToCharacter(0);
+        player = CharacterSwitchManager.CurrentCharacterTransform; movement = player.GetComponent<CharacterMovement>(); movement.enabled = false;
+        var prop = roots[destination].GetComponentsInChildren<DungeonBreakable>().First();
+        movement.Teleport(prop.transform.position - Vector3.forward * 2, Quaternion.identity);
+        var wise = player.GetComponentInChildren<WiSe>(); var animator = Get<Animator>(movement, "animator");
+        movement.enabled = true; Set(movement, "isSwimming", false);
+        animator.enabled = true; animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+        Require(prop.TryBreak(wise), "Cannot start real decoration swing.");
+        animator.Play("Base Layer.BreakDecoration", 0, .2f); animator.Update(0);
+        typeof(CharacterMovement).GetMethod("AdvanceBreaking", Private).Invoke(movement, new object[] { .2f });
+        Require(!prop.IsBroken && !Object.FindObjectsByType<AudioSource>().Any(a => a.clip == settings.breakingImpactSound && a.isPlaying), "Wood impact played in windup.");
+        animator.Play("Base Layer.BreakDecoration", 0, .45f); animator.Update(0);
+        typeof(CharacterMovement).GetMethod("AdvanceBreaking", Private).Invoke(movement, new object[] { .15f });
+        Require(prop.IsBroken && Object.FindObjectsByType<AudioSource>().Any(a => a.clip == settings.breakingImpactSound && a.isPlaying), "Wood impact missed animation contact.");
+    }
+    static float AudibleDelay(AudioClip clip)
+    {
+        clip.LoadAudioData(); var pcm = new float[clip.samples * clip.channels];
+        Require(clip.GetData(pcm, 0), "Audio is not decoded/preloaded.");
+        int sample = Array.FindIndex(pcm, value => Mathf.Abs(value) > .008f);
+        return sample < 0 ? float.PositiveInfinity : (float)(sample / clip.channels) / clip.frequency;
+    }
+}

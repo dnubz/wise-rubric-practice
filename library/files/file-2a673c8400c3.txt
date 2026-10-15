@@ -1,0 +1,148 @@
+using System;
+using System.IO;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>Edits normal saved Canvas/Image/TMP prefabs. Gameplay only instantiates and updates them.</summary>
+[InitializeOnLoad]
+public static class NPCDialogueSetup
+{
+    const string Folder = "Temp/NPCDialogue";
+    public const string BubblePath = "Assets/Prefabs/UI/SpeechBubbleCanvas.prefab";
+    const string FontPath = "Assets/Fonts/MedievalSharp/MedievalSharp-Regular SDF.asset";
+    const string DialogueMaterialPath = "Assets/UI/Dialogue/MedievalSharp Dialogue.mat";
+    static double nextCheck;
+    static NPCDialogueSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        string action = File.Exists(Folder + "/text-style.request") ? "text-style" : "setup";
+        if (!File.Exists(Folder + "/" + action + ".request")) return;
+        File.Delete(Folder + "/" + action + ".request");
+        try
+        {
+            if (action == "text-style") UpdateDialogueText(); else Build();
+            File.WriteAllText(Folder + "/" + action + "-result.txt", "PASS: saved NPC speech bubbles with MedievalSharp, centred wrapping text, padding and automatic sizing.");
+        }
+        catch (Exception error) { File.WriteAllText(Folder + "/" + action + "-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/UI/Fit NPC Dialogue Text and Use MedievalSharp")]
+    public static void UpdateDialogueText()
+    {
+        foreach (string path in new[] { BubblePath, "Assets/Prefabs/Berdly.prefab", "Assets/Prefabs/Pink.prefab", "Assets/Prefabs/MARI2.prefab", "Assets/Prefabs/character_rogue.prefab", "Assets/Resources/Dungeon/DungeonGuideNPC.prefab", "Assets/Resources/Dungeon/DungeonFriendlyNPC.prefab" })
+        {
+            var root = PrefabUtility.LoadPrefabContents(path);
+            try
+            {
+                foreach (var bubble in root.GetComponentsInChildren<NPCSpeechBubble>(true))
+                    StyleText(bubble.GetComponentInChildren<TextMeshProUGUI>(true));
+                PrefabUtility.SaveAsPrefabAsset(root, path);
+            }
+            finally { PrefabUtility.UnloadPrefabContents(root); }
+        }
+        AssetDatabase.SaveAssetIfDirty(AssetDatabase.LoadAssetAtPath<Material>(DialogueMaterialPath));
+    }
+    [MenuItem("WiSe/UI/Set Up NPC Dialogue Bubbles")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        const string imagePath = "Assets/UI/Dialogue/SpeechBubble.png";
+        AssetDatabase.ImportAsset(imagePath);
+        var importer = (TextureImporter)AssetImporter.GetAtPath(imagePath);
+        importer.textureType = TextureImporterType.Sprite; importer.spriteImportMode = SpriteImportMode.Single;
+        importer.alphaIsTransparency = true; importer.mipmapEnabled = false; importer.maxTextureSize = 2048;
+        importer.textureCompression = TextureImporterCompression.Uncompressed; importer.SaveAndReimport();
+        Sprite sprite = AssetDatabase.LoadAssetAtPath<Sprite>(imagePath);
+        foreach (string path in new[] { BubblePath, "Assets/Prefabs/Berdly.prefab", "Assets/Prefabs/Pink.prefab", "Assets/Prefabs/MARI2.prefab", "Assets/Prefabs/character_rogue.prefab" })
+        {
+            var root = PrefabUtility.LoadPrefabContents(path);
+            try
+            {
+                foreach (var bubble in root.GetComponentsInChildren<NPCSpeechBubble>(true)) Style(bubble, sprite);
+                PrefabUtility.SaveAsPrefabAsset(root, path);
+            }
+            finally { PrefabUtility.UnloadPrefabContents(root); }
+        }
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        settings.dungeonGuideNPC = SaveDungeonNPC("DungeonGuideNPC", settings.berdlyModel, "Berdly", "Rooms as carbons, doors as bonds.", 2.1f);
+        settings.dungeonFriendlyNPC = SaveDungeonNPC("DungeonFriendlyNPC", settings.friendlyEnemyModel, "Friendly Minion", "I'm taking a break here. You won't have to fight me!", 1.8f);
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssets();
+    }
+    static void Style(NPCSpeechBubble bubble, Sprite sprite)
+    {
+        var canvas = bubble.GetComponent<Canvas>(); canvas.renderMode = RenderMode.WorldSpace;
+        canvas.overrideSorting = true; canvas.sortingOrder = 40;
+        var rect = (RectTransform)bubble.transform; rect.sizeDelta = new Vector2(420, 300);
+        rect.localScale = Vector3.one * .016f; rect.anchoredPosition3D = Vector3.zero;
+        var image = bubble.GetComponentInChildren<Image>(true);
+        image.sprite = sprite; image.color = Color.white; image.type = Image.Type.Simple;
+        image.preserveAspect = true; image.raycastTarget = false;
+        var background = image.rectTransform; background.anchorMin = Vector2.zero; background.anchorMax = Vector2.one;
+        background.offsetMin = background.offsetMax = Vector2.zero;
+        background.localScale = Vector3.one; background.localRotation = Quaternion.identity;
+        var text = bubble.GetComponentInChildren<TextMeshProUGUI>(true);
+        StyleText(text);
+        var fields = new SerializedObject(bubble);
+        fields.FindProperty("dialogueText").objectReferenceValue = text;
+        fields.FindProperty("speechBubbleRoot").objectReferenceValue = bubble.gameObject;
+        fields.FindProperty("offsetFromNpc").vector3Value = Vector3.zero;
+        fields.FindProperty("fixedWorldScale").floatValue = .016f;
+        fields.FindProperty("clearanceAboveNpc").floatValue = .35f;
+        fields.FindProperty("faceCamera").boolValue = true;
+        fields.FindProperty("useFixedWorldScale").boolValue = true;
+        fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+    static void StyleText(TextMeshProUGUI text)
+    {
+        var font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>(FontPath);
+        if (font == null) throw new InvalidOperationException("The MedievalSharp TMP font is missing.");
+        text.font = font; text.fontStyle = FontStyles.Bold;
+        var material = AssetDatabase.LoadAssetAtPath<Material>(DialogueMaterialPath);
+        if (material == null)
+        {
+            material = new Material(font.material);
+            AssetDatabase.CreateAsset(material, DialogueMaterialPath);
+        }
+        material.SetFloat("_FaceDilate", .15f); material.SetFloat("_OutlineWidth", 0);
+        material.SetColor("_FaceColor", Color.white);
+        EditorUtility.SetDirty(material); text.fontSharedMaterial = material; text.UpdateMeshPadding();
+        text.color = new Color(.15f, .15f, .15f); text.fontSize = 26;
+        text.enableAutoSizing = true; text.fontSizeMin = 12; text.fontSizeMax = 26;
+        text.alignment = TextAlignmentOptions.Center; text.textWrappingMode = TextWrappingModes.Normal;
+        text.overflowMode = TextOverflowModes.Truncate;
+        text.richText = true; text.raycastTarget = false;
+        text.margin = new Vector4(8, 8, 8, 8); text.lineSpacing = 0;
+        var rect = text.rectTransform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f;
+        rect.sizeDelta = new Vector2(292, 154); rect.anchoredPosition = new Vector2(-4, 16);
+        rect.localScale = Vector3.one; rect.localRotation = Quaternion.identity;
+    }
+    static GameObject SaveDungeonNPC(string name, GameObject modelPrefab, string title, string line, float width)
+    {
+        var root = new GameObject(name);
+        try
+        {
+            var model = (GameObject)PrefabUtility.InstantiatePrefab(modelPrefab); model.transform.SetParent(root.transform, false);
+            foreach (MonoBehaviour behaviour in model.GetComponentsInChildren<MonoBehaviour>(true)) behaviour.enabled = false;
+            foreach (Canvas canvas in model.GetComponentsInChildren<Canvas>(true)) canvas.gameObject.SetActive(false);
+            foreach (Collider collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            var renderers = model.GetComponentsInChildren<Renderer>(true);
+            Bounds bounds = renderers[0].bounds; foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+            model.transform.localScale *= width / Mathf.Max(bounds.size.x, bounds.size.z);
+            bounds = renderers[0].bounds; foreach (Renderer renderer in renderers) bounds.Encapsulate(renderer.bounds);
+            model.transform.localPosition -= Vector3.up * bounds.min.y;
+            var bubbleObject = (GameObject)PrefabUtility.InstantiatePrefab(AssetDatabase.LoadAssetAtPath<GameObject>(BubblePath));
+            bubbleObject.transform.SetParent(root.transform, false); bubbleObject.name = "SpeechBubbleCanvas";
+            var npc = root.AddComponent<NormalNPC>(); npc.SetDialogue(title, line);
+            var fields = new SerializedObject(npc);
+            fields.FindProperty("speechBubble").objectReferenceValue = bubbleObject.GetComponent<NPCSpeechBubble>();
+            fields.FindProperty("autoAdvanceDelay").floatValue = 5;
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            return PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Dungeon/" + name + ".prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+}

@@ -1,0 +1,20 @@
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "NewCharacterData", menuName = "Character/Character Data")]
+public class CharacterData : ScriptableObject
+{
+    [Header("HUD")]
+    public string displayName;
+    public Sprite portrait;
+
+    [Header("Stats")]
+    public int maxHP;
+    public int maxSP;
+    public int level;
+    [Min(0), Tooltip("Starting EXP toward the next level. Runtime EXP is kept on the character.")]
+    public int exp;
+    public int attack;
+    public int crit;
+    public int defense;
+    public bool hasUltimate;
+}

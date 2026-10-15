@@ -1,0 +1,243 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+// Three independent binary slots. New Game keeps the world's fresh-seed/fixed-seed policy.
+[DefaultExecutionOrder(-200)]
+public sealed class GameSave : MonoBehaviour
+{
+    [Serializable] public sealed class PartyState
+    {
+        public string name;
+        public int level, exp, hp, sp;
+        public bool ultimate;
+        public string[] equipment;
+        public int[] cooldowns;
+    }
+    [Serializable] public sealed class SaveData
+    {
+        public int version = 3, gold, seed, activeCharacter;
+        public long savedUtc, lastPlayedUtc;
+        public bool inDungeon;
+        public SaveGameSettings settings;
+        public SavedWorldLayout world;
+        public SavedDungeon dungeon;
+        public SavedDungeon[] dungeons;
+        public float playSeconds;
+        public Vector3 position;
+        public Quaternion rotation;
+        public PartyState[] party;
+        public string[] items;
+        public Vector2Int[] openedPools;
+        public Vector2Int[] openedPlatformChests;
+        public string[] defeatedEnemies;
+    }
+    [SerializeField] Inventory inventory;
+    [SerializeField] CharacterBase[] characters;
+    [SerializeField] CharacterSwitchManager switchManager;
+    [SerializeField] WFCWorldManager world;
+    [SerializeField] SaveItemCatalog catalog;
+    static SaveData pending;
+    static int activeSlot;
+    static bool createInitialSave;
+    SaveData restoring;
+    float previousSeconds, startedAt;
+    public const int SlotCount = 3;
+    public static event Action SavesChanged;
+    public float PlaySeconds => previousSeconds + Time.unscaledTime - startedAt;
+    public static int ActiveSlot => activeSlot;
+    public static string SaveDirectory {
+        get {
+#if UNITY_EDITOR
+            if (!string.IsNullOrEmpty(TestSaveDirectory)) return TestSaveDirectory;
+#endif
+            return Path.Combine(Application.persistentDataPath, "Saves");
+        }
+    }
+#if UNITY_EDITOR
+    public static string TestSaveDirectory;
+#endif
+    public static string SavePath => SlotPath(activeSlot);
+    public static string SlotPath(int slot)
+    {
+        if (slot < 0 || slot >= SlotCount) throw new ArgumentOutOfRangeException(nameof(slot));
+        return Path.Combine(SaveDirectory, "slot-" + (slot + 1) + ".sav");
+    }
+    public static bool HasSave => LastPlayedSlot >= 0;
+    public static int LastPlayedSlot
+    {
+        get
+        {
+            int best = -1; long latest = -1;
+            for (int i = 0; i < SlotCount; i++)
+                if (TryReadSlot(i, out var data, out _) && data.lastPlayedUtc > latest) { best = i; latest = data.lastPlayedUtc; }
+            return best;
+        }
+    }
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics() { pending = null; activeSlot = 0; createInitialSave = false; SavesChanged = null; }
+
+    void Awake()
+    {
+        SceneTravelFade.CoverArrival();
+        startedAt = Time.unscaledTime;
+        restoring = pending; pending = null;
+        if (restoring == null) return;
+        // Configure before WFC Awake/Start so no terrain is instantiated with a fresh seed.
+        world.RestoreSavedWorld(restoring.seed, restoring.openedPools, restoring.world);
+        world.GetComponent<OverworldObstacleSpawner>()?.RestoreOpenedChests(restoring.seed, restoring.openedPlatformChests);
+        switchManager.RestorePosition(restoring.position, restoring.rotation);
+        switchManager.RestoreSelection(restoring.activeCharacter);
+        BattleSession.Instance?.RestoreDefeated(restoring.defeatedEnemies);
+    }
+    IEnumerator Start()
+    {
+        // All scene Awakes have completed; starting inventory cannot overwrite the restored bag.
+        if (restoring != null)
+        {
+            RestorePartyAndInventory(restoring);
+            DungeonSession.RestoreSavedDungeon(restoring.dungeon, restoring.dungeons);
+        }
+        yield return null;
+        if (restoring != null && restoring.inDungeon) DungeonSession.ResumeSavedDungeon();
+        else
+        {
+            yield return SceneTravelFade.FadeIn();
+            DungeonAreaTitle.ShowOverworld();
+        }
+        restoring = null;
+        if (createInitialSave)
+        {
+            createInitialSave = false;
+            if (!TrySave(out string error)) Debug.LogError(error, this);
+        }
+    }
+    public SaveData Capture()
+    {
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var data = new SaveData { settings = SaveGameSettings.Capture(), world = world.CaptureLayout(),
+            dungeon = DungeonSession.CaptureSavedDungeon(), dungeons = DungeonSession.CaptureSavedDungeons(), inDungeon = DungeonSession.IsInside, activeCharacter = switchManager.CurrentCharacterIndex,
+            savedUtc = DateTime.UtcNow.Ticks, lastPlayedUtc = DateTime.UtcNow.Ticks, gold = PlayerInventory.Instance.Gold, seed = world.WorldSeed, playSeconds = PlaySeconds,
+            position = DungeonSession.IsInside ? DungeonSession.SurfaceReturnPosition : BattleSession.IsActive ? BattleSession.ReturnPosition : player.position,
+            rotation = DungeonSession.IsInside ? DungeonSession.SurfaceReturnRotation : BattleSession.IsActive ? BattleSession.ReturnRotation : player.rotation,
+            party = new PartyState[characters.Length], openedPools = world.GetOpenedPoolChests(), defeatedEnemies = BattleSession.Instance != null ? BattleSession.Instance.DefeatedIds : null };
+        for (int i = 0; i < characters.Length; i++)
+        {
+            var c = characters[i]; var names = new string[c.EquippedItems.Length];
+            for (int s = 0; s < names.Length; s++) names[s] = c.EquippedItems[s] != null ? c.EquippedItems[s].ItemName : "";
+            data.party[i] = new PartyState { name = c.characterData.displayName, level = c.CurrentLevel, exp = c.CurrentExp,
+                hp = c.GetCurrHP(), sp = c.GetCurrSP(), ultimate = c.HasUltimate, equipment = names, cooldowns = (int[])c.BattleCooldowns.Clone() };
+        }
+        data.openedPlatformChests = world.GetComponent<OverworldObstacleSpawner>()?.GetOpenedChests();
+        var items = new List<string>(); foreach (var slot in inventory.Slots) if (slot.Item != null) items.Add(slot.Item.ItemName);
+        data.items = items.ToArray(); return data;
+    }
+    public bool TrySave(out string error, string path = null)
+    {
+        try
+        {
+            if (DungeonSession.IsTransitioning || SceneTravelFade.IsTransitioning) throw new InvalidOperationException("Wait for travel to finish before saving.");
+            BinarySaveFile.Write(path ?? SavePath, Capture());
+            if (path == null) SavesChanged?.Invoke();
+            error = null; return true;
+        }
+        catch (Exception exception) { error = "Could not save: " + exception.Message; return false; }
+    }
+    public static SaveData Read(string path = null) => BinarySaveFile.Read(path ?? SavePath);
+    public static bool TryReadSlot(int slot, out SaveData data, out string error)
+    {
+        try { data = Read(SlotPath(slot)); error = null; return true; }
+        catch (Exception exception) { data = null; error = exception.Message; return false; }
+    }
+    public static bool TryDeleteSlot(int slot, out string error)
+    {
+        try { File.Delete(SlotPath(slot)); SavesChanged?.Invoke(); error = null; return true; }
+        catch (Exception exception) { error = "Could not delete: " + exception.Message; return false; }
+    }
+    public static bool TryImportLegacySave(out string error, string legacyPath = null)
+    {
+        error = null;
+        string legacy = legacyPath ?? Path.Combine(Application.persistentDataPath, "wise-save.json");
+        string marker = Path.Combine(SaveDirectory, "legacy-imported");
+        if (File.Exists(marker) || !File.Exists(legacy)) return true;
+#if UNITY_EDITOR
+        if (!string.IsNullOrEmpty(TestSaveDirectory) && legacyPath == null) return true;
+#endif
+        try
+        {
+            Directory.CreateDirectory(SaveDirectory);
+            // Never replace an occupied slot, or re-import a deleted save on a later visit.
+            if (!File.Exists(SlotPath(0)))
+            {
+                var data = JsonUtility.FromJson<SaveData>(File.ReadAllText(legacy));
+                if (data == null || data.version != 1) throw new InvalidDataException("Unsupported legacy save.");
+                data.version = 3; data.settings = SaveGameSettings.Capture();
+                // Version 1 had no dungeon snapshots; JsonUtility can materialize an
+                // empty SavedDungeon for a serialized null, which is not a valid layout.
+                data.dungeon = null; data.dungeons = Array.Empty<SavedDungeon>(); data.inDungeon = false;
+                data.savedUtc = data.lastPlayedUtc = File.GetLastWriteTimeUtc(legacy).Ticks;
+                if (data.party != null) foreach (var state in data.party)
+                { if (state.equipment == null) state.equipment = new string[2]; if (state.cooldowns == null) state.cooldowns = new int[4]; }
+                BinarySaveFile.Write(SlotPath(0), data);
+            }
+            File.WriteAllText(marker, "Original wise-save.json preserved."); SavesChanged?.Invoke(); return true;
+        }
+        catch (Exception exception) { error = "Could not import the previous save: " + exception.Message; return false; }
+    }
+    public void RestorePartyAndInventory(SaveData data)
+    {
+        previousSeconds = data.playSeconds; startedAt = Time.unscaledTime;
+        var wallet = PlayerInventory.Instance; wallet.ClearItems();
+        var oldItems = new List<Item>(); foreach (var slot in inventory.Slots) if (slot.Item != null && !oldItems.Contains(slot.Item)) oldItems.Add(slot.Item);
+        foreach (var item in oldItems) inventory.RemoveAll(item);
+        wallet.SetGold(data.gold);
+        foreach (string name in data.items) { var item = catalog.Find(name); if (item != null) wallet.AddItem(item); }
+        foreach (var state in data.party)
+        {
+            var character = Array.Find(characters, c => c.characterData.displayName == state.name); if (character == null) continue;
+            var gear = new Equipment[2];
+            for (int i = 0; state.equipment != null && i < gear.Length && i < state.equipment.Length; i++) gear[i] = catalog.Find(state.equipment[i]) as Equipment;
+            character.RestoreSavedState(state.level, state.exp, state.ultimate, state.hp, state.sp, gear);
+            character.RestoreBattleCooldowns(state.cooldowns);
+        }
+    }
+    public static bool TryContinue(out string error, Action<string> loadFailed = null)
+    {
+        int slot = LastPlayedSlot;
+        if (slot < 0) { error = "No valid saved game is available."; return false; }
+        return TryLoadSlot(slot, out error, loadFailed);
+    }
+    public static bool TryLoadSlot(int slot, out string error, Action<string> loadFailed = null)
+    {
+        try
+        {
+            if (SceneTravelFade.IsTransitioning) { error = "A scene transition is already in progress."; return false; }
+            var data = Read(SlotPath(slot));
+            data.lastPlayedUtc = DateTime.UtcNow.Ticks;
+            BinarySaveFile.Write(SlotPath(slot), data);
+            return SceneTravelFade.LoadGameScene(() => {
+                data.settings.Apply(); pending = data; activeSlot = slot; createInitialSave = false;
+            }, out error, failure => { pending = null; loadFailed?.Invoke(failure); });
+        }
+        catch (Exception exception) { pending = null; error = "Could not load save: " + exception.Message; return false; }
+    }
+    public static bool TryStartNewGame(int slot, out string error, Action<string> loadFailed = null)
+    {
+        try
+        {
+            if (File.Exists(SlotPath(slot))) { error = "Delete this slot before starting a new game."; return false; }
+            return SceneTravelFade.LoadGameScene(() => BeginNewGame(slot), out error, loadFailed);
+        }
+        catch (Exception e) { error = "Could not start new game: " + e.Message; return false; }
+    }
+    public static void BeginNewGame(int slot = 0)
+    {
+        // Occupied slots must be explicitly deleted through the confirmation UI first.
+        if (File.Exists(SlotPath(slot))) throw new InvalidOperationException("Delete this slot before starting a new game.");
+        pending = null; activeSlot = slot; createInitialSave = true;
+        if (PlayerInventory.HasInstance) { PlayerInventory.Instance.ClearItems(); PlayerInventory.Instance.SetGold(0); }
+    }
+}

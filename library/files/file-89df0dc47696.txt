@@ -1,0 +1,88 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+using UnityEngine.SceneManagement;
+
+/// <summary>Saves editable dungeon lights and a small URP glow profile in DungeonScene.</summary>
+[InitializeOnLoad]
+public static class DungeonLightingSetup
+{
+    const string Folder = "Temp/DungeonLighting";
+    public const string ProfilePath = "Assets/Resources/Dungeon/DungeonGlowProfile.asset";
+    static double nextCheck;
+    static DungeonLightingSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved black dungeon environment, warm fill light, reduced ambient/reflections and editable URP bloom, ACES tonemapping and soft vignette profile."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Set Up Dungeon Lighting")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        var profile = AssetDatabase.LoadAssetAtPath<VolumeProfile>(ProfilePath);
+        if (profile == null) { profile = ScriptableObject.CreateInstance<VolumeProfile>(); AssetDatabase.CreateAsset(profile, ProfilePath); }
+        var bloom = Component<Bloom>(profile);
+        bloom.threshold.Override(.9f); bloom.intensity.Override(.35f); bloom.scatter.Override(.65f);
+        bloom.highQualityFiltering.Override(false); bloom.clamp.Override(8);
+        var tone = Component<Tonemapping>(profile); tone.mode.Override(TonemappingMode.ACES);
+        var colour = Component<ColorAdjustments>(profile);
+        colour.postExposure.Override(.15f); colour.contrast.Override(8); colour.saturation.Override(5);
+        var vignette = Component<Vignette>(profile); vignette.intensity.Override(.16f); vignette.smoothness.Override(.55f);
+        EditorUtility.SetDirty(profile); AssetDatabase.SaveAssets();
+
+        Scene original = SceneManager.GetActiveScene();
+        Scene dungeon = SceneManager.GetSceneByPath("Assets/Scenes/DungeonScene.unity");
+        bool opened = !dungeon.isLoaded;
+        if (opened) dungeon = EditorSceneManager.OpenScene("Assets/Scenes/DungeonScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            SceneManager.SetActiveScene(dungeon);
+            RenderSettings.skybox = null; RenderSettings.fog = false;
+            RenderSettings.ambientMode = AmbientMode.Flat; RenderSettings.ambientLight = new Color(.18f, .15f, .12f);
+            RenderSettings.reflectionIntensity = .25f;
+            Volume volume = null;
+            foreach (GameObject root in dungeon.GetRootGameObjects())
+            {
+                if (root.TryGetComponent<Light>(out var light) && light.type == LightType.Directional)
+                {
+                    light.color = new Color(1, .83f, .64f); light.intensity = .55f; light.shadowStrength = .85f;
+                }
+                if (root.TryGetComponent<Camera>(out var camera)) { camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = Color.black; }
+                if (root.name == "Dungeon Glow" && root.TryGetComponent<Volume>(out var found)) volume = found;
+            }
+            if (volume == null)
+            {
+                var obj = new GameObject("Dungeon Glow"); SceneManager.MoveGameObjectToScene(obj, dungeon);
+                volume = obj.AddComponent<Volume>();
+            }
+            volume.isGlobal = true; volume.priority = 30; volume.weight = 1; volume.sharedProfile = profile;
+            EditorSceneManager.MarkSceneDirty(dungeon); EditorSceneManager.SaveScene(dungeon);
+        }
+        finally
+        {
+            SceneManager.SetActiveScene(original);
+            if (opened) EditorSceneManager.CloseScene(dungeon, true);
+        }
+    }
+
+    static T Component<T>(VolumeProfile profile) where T : VolumeComponent
+    {
+        if (!profile.TryGet(out T component))
+        {
+            component = profile.Add<T>(true); component.name = typeof(T).Name;
+            AssetDatabase.AddObjectToAsset(component, profile);
+        }
+        component.active = true; EditorUtility.SetDirty(component); return component;
+    }
+}

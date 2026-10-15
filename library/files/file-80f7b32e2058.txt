@@ -1,0 +1,28 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+public sealed class QuitMenuUI : MonoBehaviour
+{
+    [SerializeField] GameSave save;
+    [SerializeField] GameObject menuRoot;
+    [SerializeField] Button keepPlaying, saveAndQuit;
+    [SerializeField] TMP_Text details;
+    void Awake()
+    {
+        if (keepPlaying != null) keepPlaying.onClick.AddListener(KeepPlaying);
+        if (saveAndQuit != null) saveAndQuit.onClick.AddListener(SaveAndQuit);
+    }
+    void OnEnable()
+    {
+        if (details != null) details.text = save != null ? "Slot " + (GameSave.ActiveSlot + 1) + " | Play time: " + Mathf.FloorToInt(save.PlaySeconds / 60) + "m." : "Save data is unavailable.";
+    }
+    public void KeepPlaying() { if (menuRoot != null) menuRoot.SetActive(false); }
+    public void SaveAndQuit()
+    {
+        if (save == null) return;
+        if (!save.TrySave(out string error)) { if (details != null) details.text = error; return; }
+        Time.timeScale = 1; SceneManager.LoadScene("TitleScene");
+    }
+}

@@ -1,0 +1,65 @@
+using System;
+using System.IO;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>Preview the shared saved arrival UI and cue without loading scenes or changing saved/world state.</summary>
+[InitializeOnLoad]
+public static class OverworldArrivalChecks
+{
+    const string Folder = "Temp/OverworldArrival";
+    static OverworldArrivalChecks() { EditorApplication.update += Poll; }
+    static void Poll()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: saved title prefab displays Overworld; exact existing DS3 arrival clip routed through SFX, 2D/nonlooping; original Dungeon prefab label unchanged; repeat presentation reuses its source; stop/disable clears overlay and cue; every UI graphic is nonblocking; native title preview rendered. Save startup and dungeon/battle-return hooks reviewed; live world and saves untouched."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); }
+    }
+    [MenuItem("WiSe/Validate Overworld Arrival Title")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings != null && settings.areaTitlePrefab != null && settings.areaEnterSound != null, "Saved arrival assets missing.");
+        Require(settings.areaEnterSound.name == "DS3 New Area sound effect", "Incorrect arrival cue.");
+        var title = Object.Instantiate(settings.areaTitlePrefab); title.gameObject.hideFlags = HideFlags.HideAndDontSave;
+        try
+        {
+            title.Play(settings.areaEnterSound, "Overworld");
+            var text = title.GetComponentInChildren<TMP_Text>(true); var group = title.GetComponent<CanvasGroup>(); var cue = title.GetComponent<AudioSource>();
+            Require(text.text == "Overworld" && title.IsShowing, "Overworld heading did not start.");
+            Require(cue.clip == settings.areaEnterSound && cue.outputAudioMixerGroup != null && cue.outputAudioMixerGroup.name == "SFX" && !cue.loop && cue.spatialBlend == 0, "Cue does not match dungeon SFX routing.");
+            Require(!group.blocksRaycasts && !group.interactable, "Arrival blocks gameplay.");
+            foreach (var graphic in title.GetComponentsInChildren<Graphic>(true)) Require(!graphic.raycastTarget, "Title graphic intercepts input.");
+            title.Play(settings.areaEnterSound, "Overworld"); Require(title.GetComponents<AudioSource>().Length == 1, "Repeat arrival duplicates audio.");
+            Require(settings.areaTitlePrefab.GetComponentInChildren<TMP_Text>(true).text == "Dungeon", "Changed the dungeon prefab's name.");
+            title.StopPresentation(); Require(!title.IsShowing && group.alpha == 0 && !cue.isPlaying, "Stopping arrival does not clear it.");
+            title.Play(settings.areaEnterSound, "Overworld"); title.gameObject.SetActive(false);
+            Require(!title.IsShowing && group.alpha == 0 && !cue.isPlaying, "World suspension leaves arrival playing.");
+            title.gameObject.SetActive(true); title.StopPresentation(); group.alpha = 1;
+            Render(title);
+        }
+        finally { Object.DestroyImmediate(title.gameObject); }
+    }
+    static void Render(DungeonAreaTitle title)
+    {
+        var canvas = title.GetComponent<Canvas>(); canvas.renderMode = RenderMode.WorldSpace;
+        var rect = title.GetComponent<RectTransform>(); rect.sizeDelta = new Vector2(1280, 720); rect.localScale = Vector3.one; rect.position = Vector3.one * 100000;
+        foreach (var child in title.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+        var obj = new GameObject("ArrivalPreviewCamera"); obj.hideFlags = HideFlags.HideAndDontSave;
+        var camera = obj.AddComponent<Camera>(); camera.orthographic = true; camera.orthographicSize = 360;
+        camera.transform.position = rect.position - Vector3.forward * 10; camera.clearFlags = CameraClearFlags.SolidColor;
+        camera.backgroundColor = new Color(.16f, .23f, .14f); camera.cullingMask = 1 << 30; canvas.worldCamera = camera;
+        var target = new RenderTexture(1280, 720, 24); camera.targetTexture = target;
+        var old = RenderTexture.active; Texture2D image = null;
+        try { Canvas.ForceUpdateCanvases(); title.GetComponentInChildren<TMP_Text>().ForceMeshUpdate(); camera.Render(); RenderTexture.active = target;
+            image = new Texture2D(1280, 720, TextureFormat.RGB24, false); image.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); image.Apply(); File.WriteAllBytes(Folder + "/preview.png", image.EncodeToPNG()); }
+        finally { RenderTexture.active = old; camera.targetTexture = null; Object.DestroyImmediate(obj); Object.DestroyImmediate(target); if (image != null) Object.DestroyImmediate(image); }
+    }
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

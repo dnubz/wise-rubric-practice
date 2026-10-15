@@ -1,0 +1,179 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class OverworldAtmosphereSetup
+{
+    const string Folder = "Temp/OverworldAtmosphere";
+    const string PrefabFolder = "Assets/Prefabs/OverworldDecorations";
+    const string AudioFolder = "Assets/Resources/Audio";
+    static double nextCheck;
+    static OverworldAtmosphereSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: surface sounds, swimming splashes and seeded grass/sand prefab decoration assigned in GameScene."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Set Up Overworld Sounds and Decoration")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder); Directory.CreateDirectory(AudioFolder);
+        Directory.CreateDirectory(PrefabFolder + "/Materials"); AssetDatabase.Refresh();
+        const string plants = "Assets/EmaceArt - raft on the desert/Prefabs/Env/Plants/";
+        var grass = new[] {
+            Decoration("GrassClump", "Assets/Polytope Studio/Lowpoly_Environments/Prefabs/Plants/PT_Grass_02.prefab", .75f, 1.3f, true),
+            Decoration("GrassTuft", plants + "EA04_Env_Plants_Grass_01a_PRE.prefab", .65f, 1.2f, true),
+            Decoration("GrassTuftWide", plants + "EA04_Env_Plants_Grass_01b_PRE.prefab", .7f, 1.3f, true)
+        };
+        var sand = new[] {
+            Decoration("DryGrass", plants + "EA04_Env_Plants_Grass_Dry_01a_PRE.prefab", .65f, 1.1f, true),
+            Decoration("DesertShrub", "Assets/Polytope Studio/Lowpoly_Environments/Prefabs/Shrubs/PT_Generic_Shrub_01_dead.prefab", .8f, 1.3f, true),
+            Decoration("SandRock", "Assets/EmaceArt - raft on the desert/Prefabs/Env/Rocks/EA04_Env_Rocks_Sand_01c_PRE.prefab", .45f, 1.3f, false)
+        };
+        const string settingsPath = AudioFolder + "/SurfaceAudio.asset";
+        var settings = AssetDatabase.LoadAssetAtPath<SurfaceAudioSettings>(settingsPath);
+        if (settings == null) { settings = ScriptableObject.CreateInstance<SurfaceAudioSettings>(); AssetDatabase.CreateAsset(settings, settingsPath); }
+        settings.grass = Step("Grass", "Assets/Imported Assets/Audio/SFX/Overworld/GrassWalk.mp3");
+        settings.sand = Step("Sand", "Assets/Imported Assets/Audio/SFX/Overworld/SandWalk.mp3");
+        settings.rock = Step("Rock", "Assets/Imported Assets/Audio/SFX/Dungeon/RockWalk.mp3");
+        settings.swimming = Enumerable.Range(1, 3).Select(i => AssetDatabase.LoadAssetAtPath<AudioClip>(AudioFolder + "/SwimStroke_" + i + ".wav")).ToArray();
+        if (settings.swimming.Any(c => c == null)) throw new InvalidOperationException("Import the swimming splash WAVs first.");
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssets();
+
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var roots = scene.GetRootGameObjects();
+            var world = roots.SelectMany(r => r.GetComponentsInChildren<WFCWorldManager>(true)).First();
+            var spawner = world.GetComponent<OverworldDecorationSpawner>();
+            if (spawner == null) spawner = Undo.AddComponent<OverworldDecorationSpawner>(world.gameObject);
+            var fields = new SerializedObject(spawner);
+            AssignArray(fields, "grassPrefabs", grass); AssignArray(fields, "sandPrefabs", sand);
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            var worldFields = new SerializedObject(world);
+            worldFields.FindProperty("decorationSpawner").objectReferenceValue = spawner; worldFields.ApplyModifiedPropertiesWithoutUndo();
+            int count = 0;
+            foreach (var movement in roots.SelectMany(r => r.GetComponentsInChildren<CharacterMovement>(true)))
+            {
+                var audio = movement.GetComponent<CharacterSurfaceAudio>();
+                if (audio == null) audio = Undo.AddComponent<CharacterSurfaceAudio>(movement.gameObject);
+                Transform child = movement.transform.Find("SurfaceAudio");
+                if (child == null) { child = new GameObject("SurfaceAudio").transform; Undo.RegisterCreatedObjectUndo(child.gameObject, "Add walking audio"); child.SetParent(movement.transform, false); }
+                var source = child.GetComponent<AudioSource>(); if (source == null) source = Undo.AddComponent<AudioSource>(child.gameObject);
+                source.playOnAwake = false; source.loop = false; source.spatialBlend = 0; source.dopplerLevel = 0;
+                var audioFields = new SerializedObject(audio);
+                audioFields.FindProperty("settings").objectReferenceValue = settings;
+                audioFields.FindProperty("source").objectReferenceValue = source;
+                audioFields.ApplyModifiedPropertiesWithoutUndo(); count++;
+            }
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+            File.WriteAllText(Folder + "/assets.txt", $"Characters with surface audio: {count}\nGrass prefabs: {string.Join(", ", grass.Select(p => p.name))}\nSand prefabs: {string.Join(", ", sand.Select(p => p.name))}\nSounds: {settings.grass.length:F3}s / {settings.sand.length:F3}s / {settings.rock.length:F3}s; swimming: {settings.swimming[0].length:F3}s\n");
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+
+    static void AssignArray(SerializedObject fields, string name, GameObject[] prefabs)
+    {
+        var property = fields.FindProperty(name); property.arraySize = prefabs.Length;
+        for (int i = 0; i < prefabs.Length; i++) property.GetArrayElementAtIndex(i).objectReferenceValue = prefabs[i];
+    }
+    static GameObject Decoration(string name, string sourcePath, float height, float width, bool foliage)
+    {
+        var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(sourcePath);
+        if (prefab == null) throw new InvalidOperationException("Missing decoration prefab: " + sourcePath);
+        var root = new GameObject(name);
+        try
+        {
+            var model = (GameObject)PrefabUtility.InstantiatePrefab(prefab); model.transform.SetParent(root.transform, false);
+            foreach (var collider in model.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
+            foreach (var behaviour in model.GetComponentsInChildren<MonoBehaviour>(true)) behaviour.enabled = false;
+            foreach (var renderer in model.GetComponentsInChildren<Renderer>(true))
+            {
+                var materials = renderer.sharedMaterials;
+                for (int i = 0; i < materials.Length; i++)
+                {
+                    var original = materials[i]; if (original == null) continue;
+                    string path = PrefabFolder + "/Materials/" + original.name.Replace("/", "_") + "_" + (foliage ? "Plant" : "Rock") + ".mat";
+                    var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+                    if (material == null) { material = new Material(Shader.Find("Universal Render Pipeline/Lit")); AssetDatabase.CreateAsset(material, path); }
+                    Texture texture = original.HasProperty("_BaseMap") ? original.GetTexture("_BaseMap") : original.HasProperty("_BaseTexture") ? original.GetTexture("_BaseTexture") : original.mainTexture;
+                    Color color = original.HasProperty("_BaseColor") ? original.GetColor("_BaseColor") : original.HasProperty("_Color") ? original.GetColor("_Color") : Color.white;
+                    material.SetTexture("_BaseMap", texture); material.SetColor("_BaseColor", color);
+                    material.SetFloat("_Smoothness", .05f); material.SetFloat("_Cull", foliage ? 0 : 2);
+                    material.SetFloat("_AlphaClip", foliage ? 1 : 0); material.SetFloat("_Cutoff", .4f);
+                    if (foliage) material.EnableKeyword("_ALPHATEST_ON");
+                    material.enableInstancing = true; EditorUtility.SetDirty(material); materials[i] = material;
+                }
+                renderer.sharedMaterials = materials;
+                if (foliage) renderer.shadowCastingMode = ShadowCastingMode.Off;
+            }
+            if (!TryGetBounds(model, out var bounds)) throw new InvalidOperationException("Decoration has no mesh: " + sourcePath);
+            model.transform.localScale *= Mathf.Min(height / Mathf.Max(.01f, bounds.size.y), width / Mathf.Max(.01f, Mathf.Max(bounds.size.x, bounds.size.z)));
+            TryGetBounds(model, out bounds);
+            model.transform.localPosition -= new Vector3(bounds.center.x, bounds.min.y, bounds.center.z);
+            return PrefabUtility.SaveAsPrefabAsset(root, PrefabFolder + "/" + name + ".prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+
+    static bool TryGetBounds(GameObject model, out Bounds bounds)
+    {
+        bounds = default; bool found = false;
+        foreach (var renderer in model.GetComponentsInChildren<Renderer>(true))
+        {
+            if (!(renderer is MeshRenderer) && !(renderer is SkinnedMeshRenderer)) continue;
+            if (!found) { bounds = renderer.bounds; found = true; } else bounds.Encapsulate(renderer.bounds);
+        }
+        return found;
+    }
+
+    static AudioClip Step(string name, string sourcePath)
+    {
+        string path = AudioFolder + "/Footstep_" + name + ".wav";
+        if (!File.Exists(path))
+        {
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(sourcePath);
+            clip.LoadAudioData(); var samples = new float[clip.samples * clip.channels];
+            if (!clip.GetData(samples, 0)) throw new InvalidOperationException("Cannot read footstep: " + sourcePath);
+            int block = Math.Max(1, clip.frequency / 200);
+            var levels = new double[(clip.samples + block - 1) / block];
+            for (int b = 0; b < levels.Length; b++)
+            {
+                int stop = Math.Min(clip.samples, (b + 1) * block);
+                for (int i = b * block * clip.channels; i < stop * clip.channels; i++) levels[b] += samples[i] * samples[i];
+                levels[b] = Math.Sqrt(levels[b] / ((stop - b * block) * clip.channels));
+            }
+            int first = Math.Max(0, Array.FindIndex(levels, v => v > levels.Max() * .22) * block - clip.frequency / 100);
+            int frames = Math.Min(clip.samples - first, Mathf.RoundToInt(clip.frequency * .30f));
+            using (var writer = new BinaryWriter(File.Create(path)))
+            {
+                writer.Write(System.Text.Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + frames * 2);
+                writer.Write(System.Text.Encoding.ASCII.GetBytes("WAVEfmt ")); writer.Write(16); writer.Write((short)1); writer.Write((short)1);
+                writer.Write(clip.frequency); writer.Write(clip.frequency * 2); writer.Write((short)2); writer.Write((short)16);
+                writer.Write(System.Text.Encoding.ASCII.GetBytes("data")); writer.Write(frames * 2);
+                for (int frame = 0; frame < frames; frame++)
+                {
+                    float value = 0; for (int c = 0; c < clip.channels; c++) value += samples[(first + frame) * clip.channels + c];
+                    float fade = Mathf.Min(1, frame / (clip.frequency * .005f), (frames - 1 - frame) / (clip.frequency * .02f));
+                    writer.Write((short)(Mathf.Clamp(value / clip.channels * fade, -1, 1) * 32767));
+                }
+            }
+        }
+        AssetDatabase.ImportAsset(path);
+        return AssetDatabase.LoadAssetAtPath<AudioClip>(path);
+    }
+}

@@ -1,0 +1,61 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattleArenaSetup
+{
+    const string Folder = "Temp/BattlePresentation";
+    public static bool IsApplying { get; private set; }
+    static BattleArenaSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/arena.request")) return;
+        File.Delete(Folder + "/arena.request"); IsApplying = true;
+        try { Apply(); File.WriteAllText(Folder + "/arena-result.txt", "PASS: all three saved battle layouts expanded to 66x66m, with 144 original-size floor tiles, ground colliders and spread-out spawns/cover."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/arena-result.txt", error.ToString()); Debug.LogException(error); }
+        finally { IsApplying = false; }
+    }
+    [MenuItem("WiSe/Battle/Expand Arena to 66m")]
+    public static void Apply()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) throw new InvalidOperationException("Stop Play mode before changing the saved arena.");
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/BattleScene.unity");
+        bool close = !scene.IsValid() || !scene.isLoaded;
+        if (close) scene = EditorSceneManager.OpenScene("Assets/Scenes/BattleScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var battle = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<BattleController>(true)).Single();
+            foreach (var layout in battle.layouts)
+            {
+                var floor = layout.transform.Find("Floor"); var collider = floor.GetComponent<BoxCollider>();
+                if (collider.size.x >= 66) continue;
+                // Extend the existing tile grid by two rows on each side, keeping tile/model scale.
+                for (int x = -2; x < 10; x++) for (int z = -2; z < 10; z++)
+                {
+                    if (x >= 0 && x < 8 && z >= 0 && z < 8) continue;
+                    int sourceX = (x + 8) % 8, sourceZ = (z + 8) % 8;
+                    var template = floor.Find("Tile_" + sourceX + "_" + sourceZ);
+                    var tile = Object.Instantiate(template.gameObject, floor); tile.name = "Tile_" + x + "_" + z;
+                    tile.transform.localPosition = template.localPosition + new Vector3((x - sourceX) * 5.5f, 0, (z - sourceZ) * 5.5f);
+                }
+                collider.size = new Vector3(66, collider.size.y, 66);
+                foreach (var spawn in layout.partySpawns.Concat(layout.enemySpawns)) Spread(spawn);
+                foreach (var cover in layout.cover) Spread(cover.transform);
+            }
+            battle.settings.arenaHalfSize = 33; EditorUtility.SetDirty(battle.settings);
+            AssetDatabase.SaveAssets(); EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+        }
+        finally { if (close) EditorSceneManager.CloseScene(scene, true); }
+    }
+    static void Spread(Transform target)
+    {
+        Vector3 p = target.localPosition;
+        target.localPosition = new Vector3(p.x * 1.5f, p.y, p.z * 1.5f);
+    }
+}

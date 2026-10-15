@@ -1,0 +1,35 @@
+using UnityEngine;
+
+public class TitleAudio : MonoBehaviour
+{
+    public AudioSource musicSource;
+    public AudioClip titleMusicClip;
+
+    public AudioSource sfxSource;
+
+    public AudioClip normalButtonSFX;
+    public AudioClip playButtonSFX;
+
+    private void Start()
+    {
+        GameAudio.RouteMusic(musicSource); GameAudio.RouteSFX(sfxSource);
+        if (musicSource != null && titleMusicClip != null)
+        {
+            musicSource.clip = titleMusicClip;
+            musicSource.loop = true;
+            musicSource.Play();
+        }
+    }
+
+    public void PlayNormalButtonSFX()
+    {
+        if (sfxSource != null && normalButtonSFX != null)
+            sfxSource.PlayOneShot(normalButtonSFX);
+    }
+
+    public void PlayPlayButtonSFX()
+    {
+        if (sfxSource != null && playButtonSFX != null)
+            sfxSource.PlayOneShot(playButtonSFX);
+    }
+}

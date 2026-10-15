@@ -1,0 +1,53 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "New Loot Table", menuName = "WiSe/Loot Table")]
+public class LootTable : ScriptableObject
+{
+    [Header("Loot Pool")]
+    [Tooltip("List of items and their respective weights in this loot pool.")]
+    [SerializeField] private List<LootEntry> entries = new List<LootEntry>();
+
+    public IReadOnlyList<LootEntry> Entries => entries;
+
+    /// <summary>
+    /// Selects an entry randomly using weighted probabilities.
+    /// Returns null if no valid entries exist.
+    /// </summary>
+    public LootEntry RollEntry() => RollEntry(null);
+
+    public LootEntry RollEntry(System.Random random)
+    {
+        if (entries == null || entries.Count == 0)
+            return null;
+
+        int totalWeight = 0;
+        foreach (var entry in entries)
+        {
+            if (entry != null && entry.Item != null && entry.Weight > 0)
+            {
+                totalWeight += entry.Weight;
+            }
+        }
+
+        if (totalWeight <= 0)
+            return null;
+
+        int roll = random != null ? random.Next(totalWeight) : Random.Range(0, totalWeight);
+        int currentWeight = 0;
+
+        foreach (var entry in entries)
+        {
+            if (entry == null || entry.Item == null || entry.Weight <= 0)
+                continue;
+
+            currentWeight += entry.Weight;
+            if (roll < currentWeight)
+            {
+                return entry;
+            }
+        }
+
+        return entries[0];
+    }
+}

@@ -1,0 +1,84 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+/// <summary>Saves a normal Animator state and a small wood-fragment effect using existing assets.</summary>
+[InitializeOnLoad]
+public static class DungeonBreakingSetup
+{
+    const string Folder = "Temp/DungeonBreaking";
+    static double nextCheck;
+    static DungeonBreakingSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: existing one-handed melee animation assigned to BreakDecoration; saved wood-fragment effect and existing swing/impact sounds assigned in dungeon Settings."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Set Up Dungeon Breaking")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>("Assets/Animations/PlayerAnimatorController.controller");
+        var clip = AssetDatabase.LoadAllAssetsAtPath("Assets/Blink/Art/Animations/Combat/MeeleeAttack_OneHanded.fbx")
+            .OfType<AnimationClip>().First(c => c.name == "MeeleeAttack_OneHanded");
+        AnimatorStateMachine machine = controller.layers[0].stateMachine;
+        AnimatorState state = machine.states.Select(s => s.state).FirstOrDefault(s => s.name == "BreakDecoration")
+            ?? machine.AddState("BreakDecoration", new Vector3(600, 350));
+        state.motion = clip; state.speed = 1.2f; state.writeDefaultValues = true;
+        EditorUtility.SetDirty(state); EditorUtility.SetDirty(controller);
+
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        settings.breakingSwingSound = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/SFX/Combat/sword_swing_01.wav");
+        settings.breakingImpactSound = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/SFX/Combat/generic_impact_short.mp3");
+        if (settings.breakingEffect == null)
+        {
+            var wood = Resources.Load<GameObject>("Dungeon/ScatteredWood");
+            var effect = new GameObject("DungeonBreakingEffect");
+            try
+            {
+                var particles = effect.AddComponent<ParticleSystem>();
+                particles.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+                var main = particles.main;
+                main.loop = false; main.duration = .6f; main.playOnAwake = true;
+                main.startLifetime = new ParticleSystem.MinMaxCurve(.35f, .55f);
+                main.startSpeed = 0; main.startSize = new ParticleSystem.MinMaxCurve(.12f, .23f);
+                main.startRotation3D = true;
+                main.startRotationX = new ParticleSystem.MinMaxCurve(0, Mathf.PI * 2);
+                main.startRotationY = new ParticleSystem.MinMaxCurve(0, Mathf.PI * 2);
+                main.startRotationZ = new ParticleSystem.MinMaxCurve(0, Mathf.PI * 2);
+                main.gravityModifier = 1.6f; main.maxParticles = 12;
+                main.simulationSpace = ParticleSystemSimulationSpace.World;
+                var emission = particles.emission; emission.rateOverTime = 0;
+                emission.SetBursts(new[] { new ParticleSystem.Burst(0, 10) });
+                var shape = particles.shape; shape.shapeType = ParticleSystemShapeType.Sphere; shape.radius = .3f;
+                var velocity = particles.velocityOverLifetime; velocity.enabled = true;
+                velocity.space = ParticleSystemSimulationSpace.World;
+                velocity.x = new ParticleSystem.MinMaxCurve(-2, 2);
+                velocity.y = new ParticleSystem.MinMaxCurve(2, 4);
+                velocity.z = new ParticleSystem.MinMaxCurve(-2, 2);
+                var spin = particles.rotationOverLifetime; spin.enabled = true; spin.separateAxes = true;
+                spin.x = new ParticleSystem.MinMaxCurve(-8, 8); spin.y = new ParticleSystem.MinMaxCurve(-5, 5);
+                var size = particles.sizeOverLifetime; size.enabled = true;
+                size.size = new ParticleSystem.MinMaxCurve(1, AnimationCurve.EaseInOut(0, 1, 1, 0));
+                var renderer = particles.GetComponent<ParticleSystemRenderer>();
+                renderer.renderMode = ParticleSystemRenderMode.Mesh;
+                renderer.mesh = wood.GetComponentInChildren<MeshFilter>().sharedMesh;
+                renderer.sharedMaterial = wood.GetComponentInChildren<MeshRenderer>().sharedMaterial;
+                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                settings.breakingEffect = PrefabUtility.SaveAsPrefabAsset(effect, "Assets/Resources/Dungeon/DungeonBreakingEffect.prefab");
+            }
+            finally { Object.DestroyImmediate(effect); }
+        }
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssets();
+    }
+}

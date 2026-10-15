@@ -1,0 +1,29 @@
+using UnityEngine;
+
+/// <summary>Independent random streams for stable world entities.</summary>
+public static class WorldRandom
+{
+    // Use centimetres in X/Z, never height, instance IDs or string.GetHashCode.
+    public static System.Random AtPosition(Vector3 position, int salt)
+    {
+        int seed = WFCWorldManager.Instance != null ? WFCWorldManager.Instance.WorldSeed : 0;
+        return new System.Random(Seed(seed, Mathf.RoundToInt(position.x * 100f),
+            Mathf.RoundToInt(position.z * 100f), salt));
+    }
+
+    public static int Seed(int worldSeed, int x, int z, int salt)
+    {
+        unchecked
+        {
+            uint hash = 2166136261;
+            hash = (hash ^ (uint)worldSeed) * 16777619;
+            hash = (hash ^ (uint)x) * 16777619;
+            hash = (hash ^ (uint)z) * 16777619;
+            hash = (hash ^ (uint)salt) * 16777619;
+            hash ^= hash >> 16;
+            hash *= 0x85ebca6b;
+            hash ^= hash >> 13;
+            return (int)(hash ^ (hash >> 16));
+        }
+    }
+}

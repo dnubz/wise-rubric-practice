@@ -1,0 +1,53 @@
+using UnityEngine;
+using UnityEngine.Audio;
+
+// One mixer controls saved music/SFX levels without changing a source's fades or base volume.
+public static class GameAudio
+{
+    static AudioMixer mixer;
+    static AudioMixerGroup music, sfx;
+    static AudioMixer Mixer => mixer != null ? mixer : mixer = Resources.Load<AudioMixer>("Audio/GameAudio");
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    public static void ApplySavedVolumes()
+    {
+        Apply("MusicVolume", PlayerPrefs.GetFloat("MusicVolume", 1));
+        Apply("SFXVolume", PlayerPrefs.GetFloat("SFXVolume", 1));
+    }
+    public static void SetMusic(float value) => Save("MusicVolume", value);
+    public static void SetSFX(float value) => Save("SFXVolume", value);
+    static void Save(string key, float value)
+    {
+        value = Mathf.Clamp01(value); PlayerPrefs.SetFloat(key, value); PlayerPrefs.Save(); Apply(key, value);
+    }
+    static void Apply(string key, float value)
+    {
+        if (Mixer != null) Mixer.SetFloat(key, value <= 0 ? -80 : Mathf.Log10(value) * 20);
+    }
+    public static void RouteMusic(AudioSource source)
+    {
+        if (source == null || Mixer == null) return;
+        if (music == null) { var groups = Mixer.FindMatchingGroups("Music"); if (groups.Length > 0) music = groups[0]; }
+        if (music != null) source.outputAudioMixerGroup = music;
+    }
+    public static void RouteSFX(AudioSource source)
+    {
+        if (source == null || Mixer == null) return;
+        if (sfx == null) { var groups = Mixer.FindMatchingGroups("SFX"); if (groups.Length > 0) sfx = groups[0]; }
+        if (sfx != null) source.outputAudioMixerGroup = sfx;
+    }
+    // Scene and prefab AudioSources that are not explicitly music are effects by default.
+    // This gives the SFX slider coverage across scenes and for sources created at runtime.
+    public static void RouteUnassignedSources()
+    {
+        var sources = Object.FindObjectsByType<AudioSource>(FindObjectsSortMode.None);
+        foreach (var source in sources)
+            if (source != null && source.outputAudioMixerGroup == null) RouteSFX(source);
+    }
+    public static void PlaySFXAtPoint(AudioClip clip, Vector3 position, float volume = 1)
+    {
+        if (clip == null) return;
+        var sound = new GameObject(clip.name + " SFX"); sound.transform.position = position;
+        var source = sound.AddComponent<AudioSource>(); source.clip = clip; source.volume = volume; source.spatialBlend = 1;
+        RouteSFX(source); source.Play(); Object.Destroy(sound, clip.length + .1f);
+    }
+}

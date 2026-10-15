@@ -1,0 +1,21 @@
+using TMPro;
+using UnityEngine;
+
+public sealed class ResourceMenuPanelUI : MonoBehaviour
+{
+    [SerializeField] Inventory inventory;
+    [SerializeField] ResourceItem[] resources;
+    [SerializeField] TMP_Text[] quantities;
+
+    void OnEnable()
+    {
+        if (inventory != null) inventory.OnChanged += Refresh;
+        Refresh();
+    }
+    void OnDisable() { if (inventory != null) inventory.OnChanged -= Refresh; }
+    public void Refresh()
+    {
+        for (int i = 0; resources != null && quantities != null && i < resources.Length && i < quantities.Length; i++)
+            if (quantities[i] != null) quantities[i].text = inventory != null ? inventory.GetItemCount(resources[i]).ToString() : "0";
+    }
+}

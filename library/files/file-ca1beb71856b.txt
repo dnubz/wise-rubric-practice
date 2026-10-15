@@ -1,0 +1,7 @@
+using UnityEngine;
+
+// Identifies terrain decorations that a building may safely clear.
+public sealed class GeneratedResourceMarker : MonoBehaviour
+{
+    public bool IsDecoration;
+}

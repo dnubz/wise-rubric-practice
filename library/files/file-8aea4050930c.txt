@@ -1,0 +1,74 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public sealed class StatsMenuPanelUI : MonoBehaviour
+{
+    [SerializeField] CharacterBase[] characters;
+    [SerializeField] CharacterHudEventChannel hudEvents;
+    [SerializeField] Button[] avatarButtons;
+    [SerializeField] Image[] avatarHP, avatarSP;
+    [SerializeField] TMP_Text[] avatarHPText, avatarSPText;
+    [SerializeField] TMP_Text characterName, level, hpText, spText, expText, attack, defense, crit;
+    [SerializeField] Image hpFill, spFill, expFill;
+    [SerializeField] TMP_Text[] equipment;
+    int selected;
+
+    void Awake()
+    {
+        for (int i = 0; avatarButtons != null && i < avatarButtons.Length; i++)
+        {
+            int index = i;
+            if (avatarButtons[i] != null) avatarButtons[i].onClick.AddListener(() => SelectCharacter(index));
+        }
+    }
+    void OnEnable()
+    {
+        if (hudEvents != null) hudEvents.CharacterStatsChanged += OnStatsChanged;
+        CharacterSwitchManager.OnActiveCharacterChanged += OnActiveCharacterChanged;
+        OnActiveCharacterChanged(CharacterSwitchManager.CurrentCharacterTransform);
+    }
+    void Start() => OnActiveCharacterChanged(CharacterSwitchManager.CurrentCharacterTransform);
+    void OnDisable()
+    {
+        if (hudEvents != null) hudEvents.CharacterStatsChanged -= OnStatsChanged;
+        CharacterSwitchManager.OnActiveCharacterChanged -= OnActiveCharacterChanged;
+    }
+    void OnActiveCharacterChanged(Transform active)
+    {
+        var character = active != null ? active.GetComponentInChildren<CharacterBase>(true) : null;
+        int index = characters != null ? System.Array.IndexOf(characters, character) : -1;
+        if (index >= 0) selected = index;
+        Refresh();
+    }
+    void OnStatsChanged(CharacterBase character) => Refresh();
+    public void SelectCharacter(int index)
+    {
+        if (characters == null || index < 0 || index >= characters.Length || characters[index] == null) return;
+        selected = index; Refresh();
+    }
+    public void Refresh()
+    {
+        if (characters == null || selected < 0 || selected >= characters.Length || characters[selected] == null) return;
+        for (int i = 0; i < characters.Length; i++)
+        {
+            var c = characters[i]; if (c == null) continue;
+            if (avatarHP != null && i < avatarHP.Length) Fill(avatarHP[i], c.GetCurrHP(), c.GetMaxHP());
+            if (avatarSP != null && i < avatarSP.Length) Fill(avatarSP[i], c.GetCurrSP(), c.GetMaxSP());
+            if (avatarHPText != null && i < avatarHPText.Length) Text(avatarHPText[i], c.GetCurrHP() + "/" + c.GetMaxHP());
+            if (avatarSPText != null && i < avatarSPText.Length) Text(avatarSPText[i], c.GetCurrSP() + "/" + c.GetMaxSP());
+            if (avatarButtons != null && i < avatarButtons.Length && avatarButtons[i] != null)
+                avatarButtons[i].interactable = i != selected;
+        }
+        var target = characters[selected];
+        Text(characterName, target.characterData.displayName); Text(level, "LV " + target.CurrentLevel);
+        Text(hpText, target.GetCurrHP() + "/" + target.GetMaxHP()); Text(spText, target.GetCurrSP() + "/" + target.GetMaxSP());
+        Text(expText, target.CurrentExp + "/" + CharacterBase.ExperiencePerLevel);
+        Fill(hpFill, target.GetCurrHP(), target.GetMaxHP()); Fill(spFill, target.GetCurrSP(), target.GetMaxSP()); Fill(expFill, target.CurrentExp, CharacterBase.ExperiencePerLevel);
+        Text(attack, target.GetTotalAttack().ToString()); Text(defense, target.GetTotalDefense().ToString()); Text(crit, target.GetTotalCrit() + "%");
+        for (int i = 0; equipment != null && i < equipment.Length; i++)
+            Text(equipment[i], i < target.EquippedItems.Length && target.EquippedItems[i] != null ? target.EquippedItems[i].ItemName : "Empty");
+    }
+    static void Text(TMP_Text label, string value) { if (label != null) label.text = value; }
+    static void Fill(Image image, int current, int maximum) => MenuStatBar.Set(image, current, maximum);
+}

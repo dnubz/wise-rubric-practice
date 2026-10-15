@@ -1,0 +1,52 @@
+using UnityEngine;
+using TMPro;
+
+/// <summary>
+/// Displays the player's current coin/gold amount on a TextMeshProUGUI.
+/// Automatically subscribes to PlayerInventory.Instance.OnGoldChanged so it updates in real time.
+/// Can be attached directly to any coin Text GameObject in the menu, HUD, or shop.
+/// </summary>
+public class CoinUI : MonoBehaviour
+{
+    [Header("UI Reference")]
+    [Tooltip("TextMeshProUGUI component displaying coins. If unassigned, automatically looks on this GameObject.")]
+    [SerializeField] private TextMeshProUGUI coinText;
+
+    private void Awake()
+    {
+        if (coinText == null)
+        {
+            coinText = GetComponent<TextMeshProUGUI>();
+        }
+    }
+
+    private void OnEnable()
+    {
+        UpdateDisplay(PlayerInventory.Instance != null ? PlayerInventory.Instance.Gold : 0);
+
+        if (PlayerInventory.Instance != null)
+        {
+            PlayerInventory.Instance.OnGoldChanged -= UpdateDisplay;
+            PlayerInventory.Instance.OnGoldChanged += UpdateDisplay;
+        }
+    }
+
+    private void OnDisable()
+    {
+        if (PlayerInventory.HasInstance)
+        {
+            PlayerInventory.Instance.OnGoldChanged -= UpdateDisplay;
+        }
+    }
+
+    public void UpdateDisplay(int currentGold)
+    {
+        if (coinText == null)
+        {
+            coinText = GetComponent<TextMeshProUGUI>();
+            if (coinText == null) return;
+        }
+
+        coinText.text = currentGold.ToString();
+    }
+}

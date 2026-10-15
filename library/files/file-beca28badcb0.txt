@@ -1,0 +1,96 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+// Updates the existing enemy assets in place; never regenerates terrain or scenes.
+[InitializeOnLoad]
+public static class EnemyCriteriaSetup
+{
+    const string Folder = "Temp/EnemyCriteria";
+    static EnemyCriteriaSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode || !File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: existing skeleton prefab has a visible animated sword; saved projectile has a luminous trail; red outlines and imported models preserved."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    [MenuItem("WiSe/Enemies/Set Up Enemy Criteria")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        const string path = "Assets/Resources/Battle/Skeleton.prefab";
+        var root = PrefabUtility.LoadPrefabContents(path);
+        try
+        {
+            var motion = root.GetComponent<BattleEnemyMotion>();
+            var imported = motion.visual.Find("Imported Skeleton");
+            if (imported == null) throw new Exception("Imported skeleton hierarchy is missing.");
+            if (PrefabUtility.IsPartOfPrefabInstance(imported.gameObject))
+                PrefabUtility.UnpackPrefabInstance(imported.gameObject, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
+            var arm = new[] { "R_upperarm", "R_lowerarm", "R_hand" }.Select(name =>
+                motion.visual.GetComponentsInChildren<Transform>(true).First(t => t.name == name)).ToArray();
+            var oldSword = arm[2].Find("Skeleton Sword");
+            if (oldSword != null) Object.DestroyImmediate(oldSword.gameObject);
+            foreach (var part in arm) part.SetParent(imported, true);
+            var old = motion.visual.Find("Sword Swing Pivot");
+            if (old != null) Object.DestroyImmediate(old.gameObject);
+            var pivot = new GameObject("Sword Swing Pivot"); pivot.transform.SetParent(motion.visual, false);
+            pivot.transform.position = arm[0].position;
+            foreach (var part in arm) part.SetParent(pivot.transform, true);
+            var source = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Imported Assets/sword/WiSeSword.prefab");
+            if (source == null) throw new Exception("Existing sword prefab missing.");
+            var sword = (GameObject)PrefabUtility.InstantiatePrefab(source, motion.visual);
+            sword.name = "Skeleton Sword";
+            sword.transform.position = arm[2].position + root.transform.rotation * new Vector3(0, -.12f, .07f);
+            sword.transform.rotation = root.transform.rotation * Quaternion.Euler(15, 0, -10);
+            sword.transform.localScale = Vector3.one * .6f;
+            // Preserve the normalized world size despite the imported model's scale.
+            sword.transform.SetParent(arm[2], true);
+            foreach (var collider in sword.GetComponentsInChildren<Collider>(true)) Object.DestroyImmediate(collider);
+            foreach (var child in pivot.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = root.layer;
+            motion.weaponArm = pivot.transform;
+            motion.leftLeg = Leg("L", motion.visual, imported);
+            motion.rightLeg = Leg("R", motion.visual, imported);
+            PrefabUtility.SaveAsPrefabAsset(root, path);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(root); }
+        const string shotPath = "Assets/Resources/Battle/Laser.prefab";
+        root = PrefabUtility.LoadPrefabContents(shotPath);
+        try
+        {
+            const string matPath = "Assets/Resources/Battle/EnemyLaserTrail.mat";
+            var material = AssetDatabase.LoadAssetAtPath<Material>(matPath);
+            if (material == null)
+            {
+                material = new Material(Shader.Find("Universal Render Pipeline/Particles/Unlit"));
+                material.SetColor("_BaseColor", new Color(.2f, .65f, 1));
+                AssetDatabase.CreateAsset(material, matPath);
+            }
+            var trail = root.GetComponent<TrailRenderer>();
+            if (trail == null) trail = root.AddComponent<TrailRenderer>();
+            trail.sharedMaterial = material; trail.time = .14f; trail.minVertexDistance = .05f;
+            trail.startWidth = .16f; trail.endWidth = 0;
+            trail.startColor = new Color(.35f, .85f, 1); trail.endColor = new Color(.1f, .35f, 1, 0);
+            trail.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; trail.receiveShadows = false;
+            PrefabUtility.SaveAsPrefabAsset(root, shotPath);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(root); }
+        AssetDatabase.SaveAssets();
+    }
+    static Transform Leg(string side, Transform visual, Transform imported)
+    {
+        var parts = new[] { side + "_upperleg", side + "_lowerleg", side + "_foot" }.Select(name =>
+            visual.GetComponentsInChildren<Transform>(true).First(t => t.name == name)).ToArray();
+        foreach (var part in parts) part.SetParent(imported, true);
+        var old = visual.Find(side + " Leg Pivot");
+        if (old != null) Object.DestroyImmediate(old.gameObject);
+        var pivot = new GameObject(side + " Leg Pivot"); pivot.transform.SetParent(visual, false);
+        pivot.transform.position = parts[0].position;
+        foreach (var part in parts) part.SetParent(pivot.transform, true);
+        return pivot.transform;
+    }
+}

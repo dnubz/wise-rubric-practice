@@ -1,0 +1,19 @@
+using UnityEngine;
+
+/// <summary>Short dungeon effects stay audible with the high camera and survive the prop breaking.</summary>
+public static class DungeonAudio
+{
+    public static AudioSource Play(AudioClip clip, Vector3 position, float volume, float startSeconds = 0)
+    {
+        if (clip == null || !Application.isPlaying) return null;
+        var sound = new GameObject(clip.name + " SFX"); sound.transform.position = position;
+        var source = sound.AddComponent<AudioSource>();
+        GameAudio.RouteSFX(source);
+        source.playOnAwake = false; source.clip = clip; source.volume = volume;
+        source.spatialBlend = 0;
+        source.timeSamples = Mathf.Clamp(Mathf.RoundToInt(startSeconds * clip.frequency), 0, clip.samples - 1);
+        source.Play();
+        Object.Destroy(sound, Mathf.Max(.1f, clip.length - startSeconds) + .1f);
+        return source;
+    }
+}

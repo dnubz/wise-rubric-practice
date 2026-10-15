@@ -1,0 +1,76 @@
+using UnityEngine;
+
+// Distance travelled sets the rhythm, so pushing against a wall stays silent.
+public sealed class CharacterSurfaceAudio : MonoBehaviour
+{
+    [SerializeField] SurfaceAudioSettings settings;
+    [SerializeField] AudioSource source;
+    CharacterMovement movement;
+    Vector3 previousPosition;
+    float distanceSinceSound;
+    bool wasSwimming;
+    int splashIndex;
+
+    void Awake()
+    {
+        movement = GetComponent<CharacterMovement>();
+        if (settings == null) settings = Resources.Load<SurfaceAudioSettings>("Audio/SurfaceAudio");
+        if (source == null)
+        {
+            var child = new GameObject("SurfaceAudio"); child.transform.SetParent(transform, false);
+            source = child.AddComponent<AudioSource>();
+        }
+        source.playOnAwake = false; source.loop = false;
+        source.spatialBlend = 0; source.dopplerLevel = 0;
+    }
+
+    void OnEnable() { previousPosition = transform.position; distanceSinceSound = 0; wasSwimming = false; }
+    void OnDisable() { if (source != null) source.Stop(); }
+
+    void LateUpdate()
+    {
+        Vector3 delta = transform.position - previousPosition;
+        previousPosition = transform.position;
+        delta.y = 0;
+        if (settings == null || movement == null || !movement.isActiveAndEnabled ||
+            NPCChallengePrompt.BlocksGameplayInput || movement.IsBreakingDecoration || Time.timeScale <= 0)
+        { distanceSinceSound = 0; return; }
+
+        bool swimming = movement.IsSwimming;
+        if (swimming != wasSwimming)
+        {
+            source.Stop(); distanceSinceSound = 0; wasSwimming = swimming;
+            if (swimming) PlaySplash();
+        }
+        // Room transitions and character swaps must not count as footsteps.
+        float distance = delta.magnitude;
+        if (distance > 3 || (!swimming && !movement.IsGrounded))
+        { distanceSinceSound = 0; return; }
+        if (distance < .002f) { distanceSinceSound = 0; return; }
+        distanceSinceSound += distance;
+        float spacing = swimming ? settings.swimDistance : settings.stepDistance;
+        if (distanceSinceSound < spacing) return;
+        distanceSinceSound %= spacing;
+        if (swimming) PlaySplash();
+        else
+        {
+            var world = WFCWorldManager.Instance;
+            int surface = world != null && world.isActiveAndEnabled ? world.GetTerrainAt(transform.position) : 3;
+            Play(settings.WalkingClip(surface), settings.stepVolume);
+        }
+    }
+
+    void PlaySplash()
+    {
+        if (settings.swimming == null || settings.swimming.Length == 0) return;
+        Play(settings.swimming[splashIndex++ % settings.swimming.Length], settings.swimVolume);
+    }
+    void Play(AudioClip clip, float volume)
+    {
+        if (clip == null) return;
+        GameAudio.RouteSFX(source);
+        source.volume = volume;
+        source.pitch = Random.Range(.96f, 1.04f);
+        source.PlayOneShot(clip);
+    }
+}

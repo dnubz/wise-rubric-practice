@@ -1,0 +1,91 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class OverworldMusicChecks
+{
+    const string Folder = "Temp/OverworldMusic";
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static OverworldMusicChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: actual looping OverworldMusic and NPC sources; gradual Mario fade-in/out; silence before NPC clip swaps; Berdly proximity theme; accepted battle switches to Smart Race; battle exit restores proximity music; rhythm countdown/song suppress background and exit restores it; disabled NPC returns to overworld; overworld playback never restarts."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Validate Overworld NPC Music (Play Mode)")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        Require(EditorApplication.isPlaying, "Enter Play for native music-flow checks.");
+        var manager = OverworldMusicController.Instance;
+        Require(manager != null, "Missing saved OverworldMusicManager.");
+        var world = (AudioSource)Get(manager, "overworldSource");
+        var theme = (AudioSource)Get(manager, "themeSource");
+        Require(world.clip.name == "OverworldMusic" && world.loop && world.isPlaying && theme.loop, "World music is not looping at startup.");
+        var registered = (List<MinigameNPC>)Get(manager, "npcs");
+        var original = new List<MinigameNPC>(registered); registered.Clear();
+        GameObject mario = null, berdly = null;
+        float worldTime = world.time;
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        try
+        {
+            mario = Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Pink.prefab"));
+            berdly = Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Berdly.prefab"));
+            var marioNPC = mario.GetComponent<MinigameNPC>(); var berdlyNPC = berdly.GetComponent<MinigameNPC>();
+            manager.Register(marioNPC); manager.Register(berdlyNPC);
+            mario.transform.position = player.position; berdly.transform.position = player.position + Vector3.right * 100;
+            Require(marioNPC.ApproachMusic.name == Path.GetFileNameWithoutExtension(OverworldMusicSetup.MarioSong) && berdlyNPC.ApproachMusic.name == "Berdly", "NPC clips were not updated.");
+            Tick(manager, .1f); Tick(manager, .2f);
+            Require(theme.clip == marioNPC.ApproachMusic && theme.volume > 0 && theme.volume < .7f && world.volume > 0 && world.volume < .7f, "Mario music switches abruptly instead of fading.");
+            Tick(manager, 1);
+            Require(theme.volume == .7f && world.volume == 0, "Proximity theme never reaches full volume.");
+            mario.transform.position += Vector3.right * 100;
+            Tick(manager, .2f);
+            Require(theme.volume > 0 && theme.volume < .7f && world.volume > 0, "Leaving Mario does not crossfade to the world.");
+            Tick(manager, 1);
+            Require(!theme.isPlaying && theme.clip == null && world.volume == .7f, "Mario keeps playing outside proximity.");
+            berdly.transform.position = player.position;
+            Tick(manager, 1); Tick(manager, 1);
+            Require(theme.clip == berdlyNPC.ApproachMusic, "Berdly approach does not play Berdly.mp3.");
+            Require(BerdlyBattleController.TryOpenFromNPC(berdlyNPC), "Berdly UI failed to open.");
+            Tick(manager, 1); Tick(manager, 1);
+            Require(theme.clip.name == "Smart Race" && theme.volume == .7f, "Accepted battle does not play Smart Race.");
+            BerdlyBattleController.CloseForNPC(berdlyNPC);
+            Tick(manager, 1); Tick(manager, 1);
+            Require(theme.clip == berdlyNPC.ApproachMusic, "Battle exit does not restore the nearby Berdly theme.");
+            berdly.transform.position += Vector3.right * 100; mario.transform.position = player.position;
+            Tick(manager, .2f);
+            Require(theme.clip == berdlyNPC.ApproachMusic && theme.volume > 0 && theme.volume < .7f, "NPC swap cuts the outgoing song.");
+            Tick(manager, 1); Tick(manager, 1);
+            Require(theme.clip == marioNPC.ApproachMusic, "Entering Mario range does not replace Berdly music.");
+            Require(PinkRhythmController.TryOpenFromNPC(marioNPC), "Mario rhythm cannot open with the new song/chart.");
+            Tick(manager, 1);
+            Require(theme.volume == 0 && world.volume == 0, "Background overlaps the rhythm challenge.");
+            PinkRhythmController.CloseForNPC(marioNPC);
+            Tick(manager, 1); Tick(manager, 1);
+            Require(theme.clip == marioNPC.ApproachMusic && theme.volume == .7f, "Rhythm exit does not restore proximity music.");
+            mario.SetActive(false); Tick(manager, 1); Tick(manager, 1);
+            Require(theme.clip == null && world.isPlaying && world.volume == .7f, "Disabled/unloaded NPC leaves music behind.");
+            Require(world.clip.name == "OverworldMusic" && world.time + .1f >= worldTime, "World playback restarted during transitions.");
+        }
+        finally
+        {
+            if (mario != null) Object.DestroyImmediate(mario);
+            if (berdly != null) Object.DestroyImmediate(berdly);
+            registered.Clear(); registered.AddRange(original);
+        }
+    }
+    static object Get(object target, string name) => target.GetType().GetField(name, Private).GetValue(target);
+    static void Tick(OverworldMusicController target, float seconds) => typeof(OverworldMusicController).GetMethod("Tick", Private).Invoke(target, new object[] { seconds });
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}

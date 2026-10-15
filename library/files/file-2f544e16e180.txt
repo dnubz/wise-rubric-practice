@@ -1,0 +1,99 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class WiseTreeCutChecks
+{
+    const string Folder = "Temp/WiseSword";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static WiseTreeCutChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: tree and cactus interactions keep WiSe's horizontal position through windup, slash and recovery; saved imported sword animates, targets break at impact, each drops one loot batch, and repeated F does not duplicate loot."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/tree-check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/tree-check.request"); routine = Run();
+    }
+    static void Finish(string result) { File.WriteAllText(Folder + "/tree-result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static void Cut(WiSe actor) => typeof(WiSe).GetMethod("CutTree", Private).Invoke(actor, null);
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        if (BattleSession.IsActive)
+        {
+            float timeout = Time.realtimeSinceStartup + 20;
+            while ((BattleController.Instance == null || !BattleController.Instance.Ready) && Time.realtimeSinceStartup < timeout) yield return null;
+            var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Startup battle did not load.");
+            battle.DefeatAllEnemies(); battle.ReturnFromBattle();
+            while (BattleSession.IsActive && Time.realtimeSinceStartup < timeout) yield return null;
+        }
+        var switching = Object.FindAnyObjectByType<CharacterSwitchManager>(); switching.SwitchToCharacter(0);
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var wise = player.GetComponent<WiSe>(); var move = player.GetComponent<CharacterMovement>();
+        var owned = new GameObject("TreeCutTest");
+        var floor = GameObject.CreatePrimitive(PrimitiveType.Cube); floor.transform.SetParent(owned.transform);
+        floor.transform.position = new Vector3(0, 299.5f, 0); floor.transform.localScale = new Vector3(20, 1, 20);
+        move.Teleport(new Vector3(0, 300.02f, 0), Quaternion.identity);
+        foreach (string prefab in new[] { "Tree1 Variant", "Cactus Variant" })
+        {
+        var model = Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/" + prefab + ".prefab"), owned.transform);
+        model.transform.position = player.position + Vector3.forward * 2.4f;
+        var tree = model.GetComponentInChildren<TreeCuttable>(); Require(tree != null, "Assigned tree prefab has no TreeCuttable.");
+        var loot = (TreeCuttable.LootEntry[])typeof(TreeCuttable).GetField("lootTable", Private).GetValue(tree);
+        int expected = loot.Where(l => l.item != null).Sum(l => l.amount);
+        Require(expected > 0, "Tree fixture has no assigned loot.");
+        Physics.SyncTransforms(); yield return null;
+        var animator = player.GetComponentInChildren<Animator>();
+        var sword = animator.GetBoneTransform(HumanBodyBones.RightHand).Find("WiSeSword");
+        Require(sword != null && sword.gameObject.activeInHierarchy, "Saved sword is missing in Play mode.");
+        Vector3 handStart = sword.position;
+        int drops = Object.FindObjectsByType<WorldItem>().Length;
+        var inventory = player.GetComponentInParent<Inventory>();
+        int collected = inventory != null ? loot.Where(l => l.item != null).Sum(l => inventory.GetItemCount(l.item)) : 0;
+        Vector3 standingPosition = player.position;
+        Cut(wise); Require(move.IsBreakingDecoration && tree != null && Object.FindObjectsByType<WorldItem>().Length == drops, "Tree must survive until slash impact.");
+        Cut(wise); Require(Object.FindObjectsByType<WorldItem>().Length == drops, "Repeated F created early loot.");
+        float deadline = Time.realtimeSinceStartup + 5; bool handMoved = false;
+        while (tree != null && Time.realtimeSinceStartup < deadline)
+        {
+            handMoved |= Vector3.Distance(sword.position, handStart) > .03f;
+            Require(Vector3.ProjectOnPlane(player.position - standingPosition, Vector3.up).magnitude < .02f, prefab + " pulls WiSe into the target during the slash.");
+            Require(Object.FindObjectsByType<WorldItem>().Length == drops, "Loot spawned before the tree was cut.");
+            yield return null;
+        }
+        Require(tree == null && handMoved, "Actual imported slash did not cut the tree/move its sword.");
+        int gained = inventory != null ? loot.Where(l => l.item != null).Sum(l => inventory.GetItemCount(l.item)) - collected : 0;
+        Require(Object.FindObjectsByType<WorldItem>().Length - drops + gained == expected, "Tree dropped the wrong loot count.");
+        while (move.IsBreakingDecoration && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(Vector3.ProjectOnPlane(player.position - standingPosition, Vector3.up).magnitude < .02f, prefab + " moves WiSe during recovery.");
+        gained = inventory != null ? loot.Where(l => l.item != null).Sum(l => inventory.GetItemCount(l.item)) - collected : 0;
+        Require(!move.IsBreakingDecoration && Object.FindObjectsByType<WorldItem>().Length - drops + gained == expected, "Slash recovery or one-loot-batch rule failed.");
+        Cut(wise); Require(!move.IsBreakingDecoration, "Another cut started after the tree disappeared.");
+        }
+        Object.Destroy(owned);
+    }
+}

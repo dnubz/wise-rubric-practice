@@ -1,0 +1,19 @@
+using UnityEngine;
+
+[CreateAssetMenu(menuName = "WiSe/Surface Audio")]
+public sealed class SurfaceAudioSettings : ScriptableObject
+{
+    public AudioClip grass, sand, rock;
+    public AudioClip[] swimming;
+    [Range(0, 1)] public float stepVolume = .55f;
+    [Range(0, 1)] public float swimVolume = .5f;
+    [Min(.2f)] public float stepDistance = 2.8f;
+    [Min(.2f)] public float swimDistance = 4.2f;
+
+    public AudioClip WalkingClip(int terrainType)
+    {
+        if (terrainType == 0) return grass;
+        if (terrainType == 2) return sand;
+        return rock; // Dungeon floors, rocks and boat decks.
+    }
+}

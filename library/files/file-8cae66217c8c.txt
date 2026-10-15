@@ -1,0 +1,257 @@
+using System;
+using UnityEngine;
+
+public abstract class CharacterBase : MonoBehaviour
+{
+    public const int ExperiencePerLevel = 100;
+
+    public CharacterData characterData;
+
+    // Unlock progress belongs to the character instance, not the shared starting-data asset.
+    private bool ultimateUnlocked;
+    public bool HasUltimate => ultimateUnlocked || (characterData != null && characterData.hasUltimate);
+    public void UnlockUltimate()
+    {
+        ultimateUnlocked = true;
+        NotifyStatsChanged();
+    }
+
+    [SerializeField] private Equipment[] equippedItems = new Equipment[2];
+    public Equipment[] EquippedItems => equippedItems;
+    private int[] battleCooldowns = new int[4];
+    public int[] BattleCooldowns => battleCooldowns;
+    public void AdvanceBattleCooldowns() { for (int i = 0; i < battleCooldowns.Length; i++) battleCooldowns[i] = Mathf.Max(0, battleCooldowns[i] - 1); }
+    public void RestoreBattleCooldowns(int[] values) { battleCooldowns = new int[4]; if (values != null) Array.Copy(values, battleCooldowns, Math.Min(4, values.Length)); }
+    public bool SpendSP(int amount) { if (amount < 0 || currSP < amount) return false; currSP -= amount; NotifyStatsChanged(); return true; }
+
+    [SerializeField] private int currHP;
+    private bool healthInitialized;
+    private bool spInitialized;
+    [SerializeField] private int currSP;
+    private int currentLevel;
+    private int currentExp;
+    private bool progressInitialized;
+    private CharacterHudEventChannel hudEvents;
+
+    public int CurrentLevel
+    {
+        get
+        {
+            InitializeProgress();
+            return currentLevel;
+        }
+    }
+
+    public int CurrentExp
+    {
+        get
+        {
+            InitializeProgress();
+            return currentExp;
+        }
+    }
+
+    private void InitializeProgress()
+    {
+        if (progressInitialized)
+            return;
+
+        int startingLevel = characterData != null ? Mathf.Max(1, characterData.level) : 1;
+        int startingExp = characterData != null ? Mathf.Max(0, characterData.exp) : 0;
+        currentLevel = (int)Math.Min(int.MaxValue, (long)startingLevel + startingExp / ExperiencePerLevel);
+        currentExp = startingExp % ExperiencePerLevel;
+        progressInitialized = true;
+    }
+
+    public void GainExperience(int amount)
+    {
+        if (amount <= 0)
+            return;
+
+        InitializeProgress();
+        long totalExp = (long)currentExp + amount;
+        currentLevel = (int)Math.Min(int.MaxValue, (long)currentLevel + totalExp / ExperiencePerLevel);
+        currentExp = (int)(totalExp % ExperiencePerLevel);
+        NotifyStatsChanged();
+    }
+
+    public void SetHudEventChannel(CharacterHudEventChannel channel)
+    {
+        hudEvents = channel;
+    }
+
+    private void NotifyStatsChanged()
+    {
+        if (hudEvents != null)
+            hudEvents.RaiseCharacterStatsChanged(this);
+    }
+
+    // ── Currency ─────────────────────────────────────────────────────────────
+    // Gold is stored on CharacterBase and shared via PlayerInventory singleton.
+    // Use PlayerInventory.Gold / PlayerInventory.AddGold / PlayerInventory.SpendGold
+    // rather than accessing this directly from outside.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    [ContextMenu("Test: Take 100 Damage")]
+    public void TestTakeDamage()
+    {
+        TakeDamage(100);
+    }
+
+    [ContextMenu("Test: Use 25 SP")]
+    public void TestUseSP()
+    {
+        currSP = Mathf.Max(0, currSP - 25);
+        NotifyStatsChanged();
+    }
+
+    protected virtual void Awake()
+    {
+        InitializeProgress();
+        if (!healthInitialized) { currHP = GetMaxHP(); healthInitialized = true; }
+        if (!spInitialized) { currSP = GetMaxSP(); spInitialized = true; }
+    }
+
+    public void RestoreSavedState(int level, int exp, bool ultimate, int hp, int sp, Equipment[] gear)
+    {
+        currentLevel = Mathf.Max(1, level); currentExp = Mathf.Clamp(exp, 0, ExperiencePerLevel - 1);
+        progressInitialized = true; ultimateUnlocked = ultimate;
+        equippedItems = gear ?? new Equipment[2];
+        currHP = Mathf.Clamp(hp, 0, GetMaxHP()); currSP = Mathf.Clamp(sp, 0, GetMaxSP());
+        healthInitialized = spInitialized = true; NotifyStatsChanged();
+    }
+
+    public int GetCurrHP()
+    {
+        if (!healthInitialized) { currHP = GetMaxHP(); healthInitialized = true; }
+        return currHP;
+    }
+
+    public int GetCurrSP()
+    {
+        if (!spInitialized) { currSP = GetMaxSP(); spInitialized = true; }
+        return currSP;
+    }
+
+    public int GetMaxHP()
+    {
+        int total = characterData.maxHP;
+        if (equippedItems[0] != null) total += equippedItems[0].HpBonus;
+        if (equippedItems[1] != null) total += equippedItems[1].HpBonus;
+        return total;
+    }
+
+    public void SetCurrentHP(int value)
+    {
+        currHP = Mathf.Clamp(value, 0, GetMaxHP());
+        healthInitialized = true;
+        NotifyStatsChanged();
+    }
+
+    public void TakeDamage(int damage)
+    {
+        currHP -= damage;
+
+        if (currHP <= 0)
+        {
+            currHP = 0;
+            Die();
+        }
+
+        NotifyStatsChanged();
+    }
+
+    public void Heal(int amount)
+    {
+        currHP += amount;
+
+        int max = GetMaxHP();
+        if (currHP > max)
+        {
+            currHP = max;
+        }
+
+        NotifyStatsChanged();
+    }
+
+    public void RestoreSP(int amount)
+    {
+        currSP += amount;
+
+        int max = GetMaxSP();
+        if (currSP > max)
+        {
+            currSP = max;
+        }
+
+        NotifyStatsChanged();
+    }
+
+    public int GetMaxSP()
+    {
+        int total = characterData.maxSP;
+        if (equippedItems[0] != null) total += equippedItems[0].SpBonus;
+        if (equippedItems[1] != null) total += equippedItems[1].SpBonus;
+        return total;
+    }
+
+    public int GetTotalAttack()
+    {
+        int total = characterData.attack;
+        if (equippedItems[0] != null) total += equippedItems[0].AtkBonus;
+        if (equippedItems[1] != null) total += equippedItems[1].AtkBonus;
+        return total;
+    }
+
+    public int GetTotalDefense()
+    {
+        int total = characterData.defense;
+        if (equippedItems[0] != null) total += equippedItems[0].DefBonus;
+        if (equippedItems[1] != null) total += equippedItems[1].DefBonus;
+        return total;
+    }
+
+    public int GetTotalCrit()
+    {
+        int total = characterData.crit;
+        if (equippedItems[0] != null) total += equippedItems[0].CritBonus;
+        if (equippedItems[1] != null) total += equippedItems[1].CritBonus;
+        return total;
+    }
+
+    public void Equip(Equipment item, int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= 2) return;
+        equippedItems[slotIndex] = item;
+        ClampStats(); // Clamps currHP/SP down if they now exceed the new max
+        NotifyStatsChanged();
+    }
+
+    public void Unequip(int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= 2) return;
+        equippedItems[slotIndex] = null;
+        ClampStats();
+        NotifyStatsChanged();
+    }
+
+    private void ClampStats()
+    {
+        int totalMaxHP = GetMaxHP();
+        // Only clamp down if current exceeds max, to avoid infinite healing on gear swap
+        if (currHP > totalMaxHP) currHP = totalMaxHP;
+
+        int totalMaxSP = GetMaxSP();
+        if (currSP > totalMaxSP) currSP = totalMaxSP;
+    }
+
+    public bool IsDead()
+    {
+        return currHP <= 0;
+    }
+
+    protected virtual void Die()
+    {
+        Debug.Log(gameObject.name + " died!");
+    }
+}

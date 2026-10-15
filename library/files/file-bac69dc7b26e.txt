@@ -1,0 +1,153 @@
+using System;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public class CharacterSwitchManager : MonoBehaviour
+{
+    public static event Action<int> OnCharacterSwitched;
+    public static event Action<Transform> OnActiveCharacterChanged;
+    public static Transform CurrentCharacterTransform { get; private set; }
+
+    [SerializeField] private GameObject[] characterGameObjects;
+    [SerializeField] private GameObject switchEffect;
+    [SerializeField] private CharacterHudEventChannel hudEvents;
+
+    public CharacterBase CurrentCharacter { get; private set; }
+
+    private InputSystem_Actions inputActions;
+    private int currentCharacterIndex = 0;
+    private bool isInitialized = false;
+    private int initialCharacterIndex;
+    public int CurrentCharacterIndex => currentCharacterIndex;
+    public void RestoreSelection(int index) { initialCharacterIndex = index; if (isInitialized) SwitchToCharacter(index); }
+
+    private void Awake()
+    {
+        inputActions = new InputSystem_Actions();
+
+        if (characterGameObjects == null)
+            return;
+
+        foreach (GameObject characterObject in characterGameObjects)
+        {
+            if (characterObject == null)
+                continue;
+
+            CharacterBase character = characterObject.GetComponentInChildren<CharacterBase>(true);
+            if (character != null)
+                character.SetHudEventChannel(hudEvents);
+        }
+    }
+
+    private void OnEnable()
+    {
+        if (inputActions == null)
+            inputActions = new InputSystem_Actions();
+
+        inputActions.Enable();
+
+        InputAction wiseAction = inputActions.asset.FindAction("WiSe");
+        InputAction randalAction = inputActions.asset.FindAction("RandaL");
+        InputAction druidAction = inputActions.asset.FindAction("Druid");
+
+        if (wiseAction != null) wiseAction.performed += OnSelectSlot1;
+        if (randalAction != null) randalAction.performed += OnSelectSlot2;
+        if (druidAction != null) druidAction.performed += OnSelectSlot3;
+    }
+
+    private void OnDisable()
+    {
+        if (inputActions != null)
+        {
+            InputAction wiseAction = inputActions.asset.FindAction("WiSe");
+            InputAction randalAction = inputActions.asset.FindAction("RandaL");
+            InputAction druidAction = inputActions.asset.FindAction("Druid");
+
+            if (wiseAction != null) wiseAction.performed -= OnSelectSlot1;
+            if (randalAction != null) randalAction.performed -= OnSelectSlot2;
+            if (druidAction != null) druidAction.performed -= OnSelectSlot3;
+
+            inputActions.Disable();
+        }
+    }
+
+    private void Start()
+    {
+        SwitchToCharacter(initialCharacterIndex);
+        isInitialized = true;
+    }
+
+    public void RestorePosition(Vector3 position, Quaternion rotation)
+    {
+        foreach (var character in characterGameObjects)
+            if (character != null)
+            {
+                var controller = character.GetComponent<CharacterController>();
+                bool wasEnabled = controller != null && controller.enabled;
+                if (wasEnabled) controller.enabled = false;
+                character.transform.SetPositionAndRotation(position, rotation);
+                if (wasEnabled) controller.enabled = true;
+            }
+    }
+
+    private void OnSelectSlot1(InputAction.CallbackContext ctx) => SwitchToCharacter(0);
+    private void OnSelectSlot2(InputAction.CallbackContext ctx) => SwitchToCharacter(1);
+    private void OnSelectSlot3(InputAction.CallbackContext ctx) => SwitchToCharacter(2);
+
+    public void SwitchToCharacter(int targetIndex)
+    {
+        if (isInitialized && NPCChallengePrompt.BlocksGameplayInput) return;
+        if (isInitialized && CurrentCharacterTransform != null &&
+            CurrentCharacterTransform.TryGetComponent<CharacterMovement>(out var movement) && movement.IsBreakingDecoration) return;
+        if (targetIndex < 0 || targetIndex >= characterGameObjects.Length) return;
+        if (isInitialized && targetIndex == currentCharacterIndex) return;
+
+        Vector3 lastPosition = characterGameObjects[currentCharacterIndex] != null
+            ? characterGameObjects[currentCharacterIndex].transform.position
+            : Vector3.zero;
+
+        Quaternion lastRotation = characterGameObjects[currentCharacterIndex] != null
+            ? characterGameObjects[currentCharacterIndex].transform.rotation
+            : Quaternion.identity;
+
+        currentCharacterIndex = targetIndex;
+
+        for (int i = 0; i < characterGameObjects.Length; i++)
+        {
+            if (characterGameObjects[i] == null) continue;
+
+            bool isActive = (i == currentCharacterIndex);
+
+            if (isActive)
+            {
+                characterGameObjects[i].transform.position = lastPosition;
+                characterGameObjects[i].transform.rotation = lastRotation;
+            }
+
+            characterGameObjects[i].SetActive(isActive);
+        }
+
+        if (isInitialized && switchEffect != null)
+        {
+            GameObject fx = Instantiate(switchEffect, lastPosition, Quaternion.identity);
+            fx.SetActive(true);
+            Destroy(fx, 2f);
+        }
+
+        CurrentCharacterTransform = characterGameObjects[currentCharacterIndex] != null
+            ? characterGameObjects[currentCharacterIndex].transform
+            : null;
+
+        CurrentCharacter = characterGameObjects[currentCharacterIndex] != null
+            ? characterGameObjects[currentCharacterIndex].GetComponentInChildren<CharacterBase>(true)
+            : null;
+
+        OnCharacterSwitched?.Invoke(currentCharacterIndex);
+        if (hudEvents != null)
+            hudEvents.RaiseCharacterSelected(CurrentCharacter);
+        if (CurrentCharacterTransform != null)
+        {
+            OnActiveCharacterChanged?.Invoke(CurrentCharacterTransform);
+        }
+    }
+}

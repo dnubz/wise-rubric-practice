@@ -1,0 +1,34 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Build.Reporting;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class TerrainBuildCheck
+{
+    public static void Build()
+    {
+        var scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity");
+        var anchor = scene.GetRootGameObjects().Single(x => x.name.StartsWith("Terrain Build Resources"));
+        var terrain = anchor.GetComponent<Terrain>();
+        if (anchor.activeSelf || terrain == null || !terrain.drawInstanced || terrain.terrainData == null)
+            throw new Exception("The inactive terrain build resource placeholder is invalid.");
+        if (terrain.materialTemplate.shader.name != "Universal Render Pipeline/Terrain/Lit")
+            throw new Exception("Terrain placeholder must reference the runtime terrain shader.");
+
+        string output = Path.GetFullPath("Builds/TerrainCheck/WiSe.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(output));
+        var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+        {
+            scenes = EditorBuildSettings.scenes.Where(x => x.enabled).Select(x => x.path).ToArray(),
+            locationPathName = output,
+            target = BuildTarget.StandaloneWindows64,
+            options = BuildOptions.None
+        });
+        if (report.summary.result != BuildResult.Succeeded)
+            throw new Exception("Windows terrain check build failed: " + report.summary.result);
+        Debug.Log("TERRAIN_BUILD_CHECK: PASS " + output);
+    }
+}

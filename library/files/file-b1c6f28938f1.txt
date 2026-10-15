@@ -1,0 +1,14 @@
+using System;
+
+[Serializable]
+public class InventorySlot
+{
+    private Item item;
+
+    public Item Item => item;
+
+    public InventorySlot(Item item)
+    {
+        this.item = item;
+    }
+}

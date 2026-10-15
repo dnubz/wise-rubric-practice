@@ -1,0 +1,28 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Refreshes existing UI elements when the dungeon entry panel opens.</summary>
+public sealed class DungeonPartyCard : MonoBehaviour
+{
+    [SerializeField] CharacterData characterData;
+    [SerializeField] Image portrait, hpFill, spFill;
+    [SerializeField] TextMeshProUGUI characterName, level, hpText, spText;
+    public CharacterData CharacterData => characterData;
+
+    public void Refresh(CharacterBase character)
+    {
+        gameObject.SetActive(character != null);
+        if (character == null) return;
+        CharacterData data = character.characterData;
+        portrait.sprite = data.portrait;
+        portrait.enabled = portrait.sprite != null;
+        characterName.text = data.displayName;
+        level.text = "Lv. " + character.CurrentLevel;
+        int maxHP = character.GetMaxHP(), maxSP = character.GetMaxSP();
+        hpText.text = $"HP - {character.GetCurrHP()}/{maxHP}";
+        spText.text = $"SP - {character.GetCurrSP()}/{maxSP}";
+        hpFill.fillAmount = maxHP > 0 ? Mathf.Clamp01((float)character.GetCurrHP() / maxHP) : 0;
+        spFill.fillAmount = maxSP > 0 ? Mathf.Clamp01((float)character.GetCurrSP() / maxSP) : 0;
+    }
+}

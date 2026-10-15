@@ -1,0 +1,142 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+// Runs against real generated chunks and the player's controller in Play mode.
+[InitializeOnLoad]
+public static class OverworldAtmosphereChecks
+{
+    const string Folder = "Temp/OverworldAtmosphere";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static OverworldAtmosphereChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: grass/sand decoration stays on assigned WFC terrain, has no blocking colliders, respects the per-chunk limit and repeats with the same seed. Ground movement plays footsteps; idle and teleports stay silent; entering water plays swimming audio. All three characters have saved surface audio."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+        finally { EditorApplication.isPlaying = false; }
+    }
+
+    static void Run()
+    {
+        var world = WFCWorldManager.Instance;
+        Require(world != null && world.isActiveAndEnabled, "Overworld is not active.");
+        var chunks = (Dictionary<Vector2Int, GameObject>)typeof(WFCWorldManager).GetField("chunks", Private).GetValue(world);
+        var cells = (Dictionary<Vector2Int, int[,]>)typeof(WFCWorldManager).GetField("terrainByChunk", Private).GetValue(world);
+        var spawner = world.GetComponent<OverworldDecorationSpawner>();
+        Require(spawner != null && chunks.Count > 0, "Decoration spawner or generated chunks missing.");
+        var settings = Resources.Load<SurfaceAudioSettings>("Audio/SurfaceAudio");
+        Require(settings != null && settings.grass != null && settings.sand != null && settings.rock != null && settings.swimming.Length == 3,
+            "Distinct surface sound clips are missing.");
+        Require(settings.grass != settings.sand && settings.grass != settings.rock && settings.sand != settings.rock, "Walking sounds are not distinct.");
+        foreach (var character in Object.FindObjectsByType<CharacterMovement>(FindObjectsInactive.Include))
+            Require(character.GetComponent<CharacterSurfaceAudio>() != null, "Character lacks surface audio.");
+
+        var all = new List<GeneratedResourceMarker>();
+        var report = new List<string>();
+        foreach (var chunk in chunks)
+        {
+            var decorations = chunk.Value.GetComponentsInChildren<GeneratedResourceMarker>().Where(m => m.IsDecoration).ToArray();
+            Require(decorations.Length <= 48, "Decoration limit exceeded.");
+            all.AddRange(decorations);
+            foreach (var marker in decorations)
+            {
+                int expected = marker.name.StartsWith("Grass") ? 0 : 2;
+                Require(world.GetTerrainAt(marker.transform.position) == expected, "Decoration on wrong WFC terrain: " + marker.name);
+                Require(!marker.GetComponentsInChildren<Collider>().Any(c => c.enabled), "Decoration blocks the player.");
+                foreach (var renderer in marker.GetComponentsInChildren<Renderer>())
+                    Require(renderer.sharedMaterials.All(m => m != null && m.shader.name.StartsWith("Universal Render Pipeline")), "Decoration material is not URP compatible.");
+            }
+            report.Add(chunk.Key + ": " + decorations.Length + " decorations");
+        }
+        Require(all.Any(m => m.name.StartsWith("Grass")) && all.Any(m => !m.name.StartsWith("Grass")), "Grass or sand decoration did not generate.");
+        foreach (var chunk in chunks.Take(3))
+        {
+            var before = chunk.Value.GetComponentsInChildren<GeneratedResourceMarker>().Where(m => m.IsDecoration).ToArray();
+            spawner.SpawnChunk(chunk.Key, cells[chunk.Key], world.WorldSeed, world.TileSize, chunk.Value.transform);
+            var repeated = chunk.Value.GetComponentsInChildren<GeneratedResourceMarker>().Where(m => m.IsDecoration && !before.Contains(m)).ToArray();
+            try
+            {
+                Require(before.Length == repeated.Length, "Same-seed decoration count differs.");
+                for (int i = 0; i < before.Length; i++)
+                    Require(before[i].name == repeated[i].name && Vector3.Distance(before[i].transform.position, repeated[i].transform.position) < .001f &&
+                        Quaternion.Angle(before[i].transform.rotation, repeated[i].transform.rotation) < .01f &&
+                        Vector3.Distance(before[i].transform.localScale, repeated[i].transform.localScale) < .001f, "Same-seed placement differs.");
+            }
+            finally { foreach (var marker in repeated) Object.DestroyImmediate(marker.gameObject); }
+        }
+        foreach (int surface in new[] { 0, 2 })
+        {
+            var marker = all.First(m => world.GetTerrainAt(m.transform.position) == surface);
+            report.Add(marker.name + " " + marker.transform.position + " " + string.Join("; ", marker.GetComponentsInChildren<Renderer>().Select(r => r.name + " enabled=" + r.enabled + " bounds=" + r.bounds + " layer=" + r.gameObject.layer)));
+            Capture(marker.transform.position, surface == 0 ? "grass" : "sand");
+        }
+        File.WriteAllLines(Folder + "/play-details.txt", report);
+        CheckAudio(world, chunks, settings);
+        File.WriteAllLines(Folder + "/play-details.txt", report);
+    }
+
+    static void CheckAudio(WFCWorldManager world, Dictionary<Vector2Int, GameObject> chunks, SurfaceAudioSettings settings)
+    {
+        var movement = Object.FindObjectsByType<CharacterMovement>().First(m => m.isActiveAndEnabled);
+        var sound = movement.GetComponent<CharacterSurfaceAudio>();
+        var source = (AudioSource)typeof(CharacterSurfaceAudio).GetField("source", Private).GetValue(sound);
+        var tick = typeof(CharacterSurfaceAudio).GetMethod("LateUpdate", Private);
+        var reset = typeof(CharacterSurfaceAudio).GetMethod("OnEnable", Private);
+        Vector3 original = movement.transform.position; Quaternion rotation = movement.transform.rotation;
+        try
+        {
+            Require(!NPCChallengePrompt.BlocksGameplayInput, "A prompt is blocking the audio check.");
+            foreach (int type in new[] { 0, 2, 3 })
+            {
+                var tile = chunks.SelectMany(c => c.Value.GetComponentsInChildren<TerrainCollider>()).First(t =>
+                    world.GetTerrainAt(t.transform.position + new Vector3(5, 0, 5)) == type &&
+                    !Physics.OverlapSphere(t.transform.position + new Vector3(5, 1, 5), 3).Any(c => !(c is TerrainCollider)));
+                Vector3 centre = tile.transform.position + new Vector3(4, 20, 5);
+                movement.Teleport(centre, rotation); Physics.SyncTransforms();
+                var controller = movement.GetComponent<CharacterController>();
+                controller.Move(Vector3.down * 30); reset.Invoke(sound, null); source.Stop();
+                Require(movement.IsGrounded, "Footstep probe did not reach ground.");
+                tick.Invoke(sound, null); Require(!source.isPlaying, "Idle plays footsteps.");
+                Vector3 before = movement.transform.position;
+                controller.Move(new Vector3(settings.stepDistance + .1f, -1, 0)); tick.Invoke(sound, null);
+                Require(source.isPlaying, "Moving does not play a footstep on terrain " + type + "; delta=" + (movement.transform.position - before) + "; grounded=" + movement.IsGrounded + "; timescale=" + Time.timeScale + "; source=" + source.enabled + "/" + source.gameObject.activeInHierarchy + "; movement=" + movement.isActiveAndEnabled + "; audio movement=" + typeof(CharacterSurfaceAudio).GetField("movement", Private).GetValue(sound) + "; accumulated=" + typeof(CharacterSurfaceAudio).GetField("distanceSinceSound", Private).GetValue(sound));
+                source.Stop(); controller.enabled = false; movement.transform.position += Vector3.right * 5; controller.enabled = true;
+                tick.Invoke(sound, null); Require(!source.isPlaying, "Teleport plays a footstep.");
+            }
+            var water = chunks.SelectMany(c => c.Value.GetComponentsInChildren<TerrainCollider>()).First(t => world.GetTerrainAt(t.transform.position + new Vector3(5, 0, 5)) == 1);
+            movement.Teleport(water.transform.position + new Vector3(5, world.WaterSurfaceHeight, 5), rotation);
+            typeof(CharacterMovement).GetMethod("UpdateSwimmingState", Private).Invoke(movement, null);
+            Require(movement.IsSwimming, "Water did not enable swimming.");
+            reset.Invoke(sound, null); source.Stop(); tick.Invoke(sound, null);
+            Require(source.isPlaying, "Entering water does not play a splash.");
+        }
+        finally { movement.Teleport(original, rotation); reset.Invoke(sound, null); source.Stop(); }
+    }
+
+    static void Capture(Vector3 centre, string name)
+    {
+        var owned = new GameObject("DecorationPreviewCamera"); var camera = owned.AddComponent<Camera>();
+        var target = new RenderTexture(1000, 700, 24); var pixels = new Texture2D(1000, 700, TextureFormat.RGB24, false);
+        var previous = RenderTexture.active;
+        try
+        {
+            camera.transform.position = centre + new Vector3(3, 3, -3); camera.transform.LookAt(centre + Vector3.up * .2f);
+            camera.fieldOfView = 48; camera.targetTexture = target; camera.Render(); RenderTexture.active = target;
+            pixels.ReadPixels(new Rect(0, 0, 1000, 700), 0, 0); pixels.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", pixels.EncodeToPNG());
+        }
+        finally { RenderTexture.active = previous; Object.DestroyImmediate(pixels); Object.DestroyImmediate(owned); Object.DestroyImmediate(target); }
+    }
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

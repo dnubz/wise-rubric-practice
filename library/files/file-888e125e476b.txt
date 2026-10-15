@@ -1,0 +1,36 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public sealed class GameAudioMenuUI : MonoBehaviour
+{
+    [SerializeField] Slider musicSlider, sfxSlider;
+    [SerializeField] TMP_Text musicPercent, sfxPercent;
+    void Awake()
+    {
+        if (musicSlider != null) musicSlider.onValueChanged.AddListener(SetMusic);
+        if (sfxSlider != null) sfxSlider.onValueChanged.AddListener(SetSFX);
+    }
+    void OnEnable()
+    {
+        float music = PlayerPrefs.GetFloat("MusicVolume", 1), sfx = PlayerPrefs.GetFloat("SFXVolume", 1);
+        if (musicSlider != null) musicSlider.SetValueWithoutNotify(music);
+        if (sfxSlider != null) sfxSlider.SetValueWithoutNotify(sfx);
+        Labels(music, sfx);
+    }
+    public void SetMusic(float value)
+    {
+        GameAudio.SetMusic(value);
+        Labels(PlayerPrefs.GetFloat("MusicVolume", 1), PlayerPrefs.GetFloat("SFXVolume", 1));
+    }
+    public void SetSFX(float value)
+    {
+        GameAudio.SetSFX(value);
+        Labels(PlayerPrefs.GetFloat("MusicVolume", 1), PlayerPrefs.GetFloat("SFXVolume", 1));
+    }
+    void Labels(float music, float sfx)
+    {
+        if (musicPercent != null) musicPercent.text = Mathf.RoundToInt(music * 100) + "%";
+        if (sfxPercent != null) sfxPercent.text = Mathf.RoundToInt(sfx * 100) + "%";
+    }
+}

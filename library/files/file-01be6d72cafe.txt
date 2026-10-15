@@ -1,0 +1,89 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class OverworldMusicSetup
+{
+    public const string MusicFolder = "Assets/Imported Assets/Audio/Music/";
+    public const string MarioSong = "Wii Rainbow Road - Mario Kart 8 Deluxe Booster Course Pass Music.mp3";
+    const string Folder = "Temp/OverworldMusic";
+    static double nextCheck;
+    static OverworldMusicSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved OverworldMusicManager and sources; looping OverworldMusic, Mario proximity/new rhythm song, Berdly proximity and Smart Race battle assigned."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Set Up Overworld and NPC Music")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        AssetDatabase.ImportAsset(MusicFolder + MarioSong);
+        var mario = Clip(MarioSong); var world = Clip("OverworldMusic.mp3");
+        var berdly = Clip("Berdly.mp3"); var battle = Clip("Smart Race.mp3");
+        SetTheme("Assets/Prefabs/Pink.prefab", mario);
+        SetTheme("Assets/Prefabs/Berdly.prefab", berdly);
+        Scene original = SceneManager.GetActiveScene(); Scene scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        bool opened = !scene.isLoaded;
+        if (opened) scene = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var manager = scene.GetRootGameObjects().FirstOrDefault(r => r.name == "OverworldMusicManager");
+            if (manager == null) { manager = new GameObject("OverworldMusicManager"); SceneManager.MoveGameObjectToScene(manager, scene); }
+            Undo.RegisterFullObjectHierarchyUndo(manager, "Configure overworld music");
+            var controller = manager.GetComponent<OverworldMusicController>();
+            if (controller == null) controller = manager.AddComponent<OverworldMusicController>();
+            var fields = new SerializedObject(controller);
+            fields.FindProperty("overworldSource").objectReferenceValue = Source(manager, "OverworldAudio", world, .7f);
+            fields.FindProperty("themeSource").objectReferenceValue = Source(manager, "NPCThemeAudio", null, 0);
+            fields.FindProperty("overworldMusic").objectReferenceValue = world;
+            fields.FindProperty("berdlyBattleMusic").objectReferenceValue = battle;
+            fields.FindProperty("fadeSeconds").floatValue = .8f;
+            fields.FindProperty("musicVolume").floatValue = .7f;
+            fields.ApplyModifiedPropertiesWithoutUndo();
+            var rhythm = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<PinkRhythmController>(true)).First();
+            var rhythmFields = new SerializedObject(rhythm);
+            rhythmFields.FindProperty("song").objectReferenceValue = mario;
+            rhythmFields.FindProperty("pinkBeatmap").objectReferenceValue = PinkMarioSetup.FitBeatmap(mario);
+            rhythmFields.ApplyModifiedPropertiesWithoutUndo();
+            EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene); AssetDatabase.SaveAssets();
+            File.WriteAllText(Folder + "/audio.txt", $"Mario track={mario.name}; duration={mario.length:F3}s\nWorld={world.name}; Berdly={berdly.name}; Battle={battle.name}\nFade=.8 seconds; volume=.7\n" + File.ReadAllText("Temp/PinkMario/beatmap.txt"));
+        }
+        finally { SceneManager.SetActiveScene(original); if (opened) EditorSceneManager.CloseScene(scene, true); }
+    }
+    static AudioClip Clip(string name)
+    {
+        var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(MusicFolder + name);
+        if (clip == null) throw new InvalidOperationException("Music clip missing: " + name);
+        return clip;
+    }
+    static AudioSource Source(GameObject manager, string name, AudioClip clip, float volume)
+    {
+        var child = manager.transform.Find(name);
+        if (child == null) { child = new GameObject(name).transform; child.SetParent(manager.transform, false); }
+        var source = child.GetComponent<AudioSource>(); if (source == null) source = child.gameObject.AddComponent<AudioSource>();
+        source.clip = clip; source.playOnAwake = false; source.loop = true; source.spatialBlend = 0; source.volume = volume;
+        return source;
+    }
+    static void SetTheme(string path, AudioClip clip)
+    {
+        var prefab = PrefabUtility.LoadPrefabContents(path);
+        try
+        {
+            var fields = new SerializedObject(prefab.GetComponent<MinigameNPC>());
+            fields.FindProperty("exclusiveThemeMusic").objectReferenceValue = clip;
+            fields.ApplyModifiedPropertiesWithoutUndo(); PrefabUtility.SaveAsPrefabAsset(prefab, path);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(prefab); }
+    }
+}

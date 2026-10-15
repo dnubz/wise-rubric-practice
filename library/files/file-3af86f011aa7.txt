@@ -1,0 +1,409 @@
+using System;
+using System.Collections.Generic;
+using TMPro;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.UI;
+using UnityEngine.UI;
+
+/// <summary>Pink's overworld rhythm challenge, using the designer-built UI and supplied beatmap.</summary>
+[RequireComponent(typeof(AudioSource))]
+public sealed class PinkRhythmController : MonoBehaviour
+{
+    [Header("Designer UI")]
+    [SerializeField] GameObject rhythmPanel;
+    [SerializeField] RectTransform notesContainer;
+    [SerializeField] RectTransform targetBox;
+    [SerializeField] RectTransform noteTemplate;
+    [SerializeField] TMP_Text scoreText;
+    [SerializeField] TMP_Text judgementText;
+    [SerializeField] Slider staminaSlider;
+    [SerializeField] Button exitButton;
+    [SerializeField] GameObject resultPanel;
+    [SerializeField] TMP_Text resultText;
+    [SerializeField] Button continueButton;
+    [Tooltip("Optional scene object containing Pink's preview model and camera. Enabled only during the challenge.")]
+    [SerializeField] GameObject pinkStage;
+
+    [Header("Overworld Song and Beatmap")]
+    [SerializeField] TextAsset pinkBeatmap;
+    [Tooltip("The song played with the assigned beatmap, separate from the NPC's approach theme.")]
+    [SerializeField] AudioClip song;
+    [Header("Chart Preview")]
+    [SerializeField] bool usePreviewChart;
+    [SerializeField] TextAsset previewBeatmap;
+    [Min(1), SerializeField] float previewSeconds = 10;
+    [Header("Countdown")]
+    [SerializeField] AudioSource countdownSource;
+    [SerializeField] AudioClip countdownSound;
+    [Tooltip("The GO cue inside the countdown recording, measured in seconds.")]
+    [Min(0), SerializeField] float countdownGoSeconds = 3;
+    [SerializeField] Vector3 countdownNumberCueSeconds = new Vector3(0, 1, 2);
+    [Min(.5f), SerializeField] float approachSeconds = 3;
+    [Min(50), SerializeField] float pixelsPerSecond = 450;
+    [Range(1, 100), SerializeField] float initialStamina = 100;
+    [Tooltip("Positive values delay notes relative to the song, in seconds.")]
+    [SerializeField] float timingOffset;
+
+    static PinkRhythmController activeGame;
+    static int closedFrame = -1;
+    MinigameNPC challenger;
+    PinkRhythmSession session;
+    AudioSource music;
+    double dspStart;
+    bool playing, initialized;
+    int openedFrame;
+    int spawnedThrough;
+    int lastDisplayedScore = -1;
+    float lastDisplayedStamina = -1;
+    float judgementExpires;
+    readonly List<NoteVisual> activeNotes = new List<NoteVisual>(24);
+    readonly Stack<NoteVisual> pool = new Stack<NoteVisual>(24);
+    readonly List<AudioSource> pausedMusic = new List<AudioSource>();
+    [Header("Battle ultimate")]
+    [SerializeField] TextAsset healerBattleBeatmap;
+    bool battleUltimate, previousPreview;
+    TextAsset previousBeatmap;
+    Action<float> battleFinished;
+
+    public bool OpenBattleUltimate(Action<float> completed)
+    {
+        if (IsOpen || healerBattleBeatmap == null || song == null) return false;
+        Initialize(); previousBeatmap = pinkBeatmap; previousPreview = usePreviewChart;
+        // Mario performs the same song as his overworld challenge, using its shorter battle chart.
+        pinkBeatmap = healerBattleBeatmap; usePreviewChart = false;
+        battleUltimate = true; battleFinished = completed;
+        if (Open(null)) { if (pinkStage != null) pinkStage.SetActive(false); return true; }
+        RestoreBattleSong(); return false;
+    }
+    void RestoreBattleSong()
+    {
+        if (!battleUltimate) return;
+        pinkBeatmap = previousBeatmap; usePreviewChart = previousPreview;
+        battleUltimate = false; battleFinished = null;
+    }
+
+    sealed class NoteVisual
+    {
+        public int Index;
+        public RectTransform Rect, Tail;
+        public TMP_Text KeyText;
+    }
+
+    public static bool IsOpen => activeGame != null;
+    public static bool BlocksGameplayInput => IsOpen || closedFrame == Time.frameCount;
+    public PinkRhythmSession Session => session;
+
+    void Reset() => AssignMissingReferences();
+    void Awake() => Initialize();
+
+    void Initialize()
+    {
+        if (initialized) return;
+        AssignMissingReferences();
+        music = GetComponent<AudioSource>();
+        GameAudio.RouteMusic(music); GameAudio.RouteSFX(countdownSource);
+        music.playOnAwake = false; music.loop = false; music.spatialBlend = 0; music.pitch = 1;
+        if (countdownSource != null) { countdownSource.playOnAwake = false; countdownSource.loop = false; countdownSource.spatialBlend = 0; }
+        if (exitButton != null) exitButton.onClick.AddListener(ExitChallenge);
+        if (continueButton != null) continueButton.onClick.AddListener(ExitChallenge);
+        if (noteTemplate != null) noteTemplate.gameObject.SetActive(false);
+        if (rhythmPanel != null) rhythmPanel.SetActive(false);
+        if (pinkStage != null) pinkStage.SetActive(false);
+        initialized = true;
+    }
+
+    public static bool TryOpenFromNPC(MinigameNPC npc)
+    {
+        if (IsOpen || BerdlyBattleController.IsOpen) return false;
+        var game = FindAnyObjectByType<PinkRhythmController>(FindObjectsInactive.Include);
+        if (game == null)
+        { Debug.LogWarning("Add PinkRhythmController to an active PinkRhythmManager directly under Canvas.", npc); return false; }
+        return game.Open(npc);
+    }
+
+    public static void CloseForNPC(MinigameNPC npc)
+    {
+        if (activeGame != null && activeGame.challenger == npc) activeGame.ExitChallenge();
+    }
+
+    [ContextMenu("Open Pink Challenge (Play Mode)")]
+    public void OpenChallenge() { if (Application.isPlaying) Open(null); }
+
+    bool Open(MinigameNPC npc)
+    {
+        Initialize();
+        if (!isActiveAndEnabled || IsOpen || BerdlyBattleController.IsOpen) return false;
+        if (rhythmPanel == null || notesContainer == null || targetBox == null || noteTemplate == null ||
+            scoreText == null || judgementText == null || staminaSlider == null || exitButton == null ||
+            resultPanel == null || resultText == null || continueButton == null ||
+            noteTemplate.GetComponentInChildren<TMP_Text>(true) == null || noteTemplate.Find("HoldTail") == null)
+        { Debug.LogError("Complete the PinkRhythmPanel hierarchy, then use Assign Missing UI References on its manager.", this); return false; }
+        if (rhythmPanel.transform.parent == null || !rhythmPanel.transform.parent.gameObject.activeInHierarchy)
+        { Debug.LogError("Keep PinkRhythmManager and its Canvas active, outside PinkRhythmPanel.", this); return false; }
+        if (pinkBeatmap == null) pinkBeatmap = Resources.Load<TextAsset>("Rhythm/RainbowRoad_Full");
+        TextAsset selectedChart = usePreviewChart ? previewBeatmap : pinkBeatmap;
+        try { session = new PinkRhythmSession(PinkBeatmap.Parse(selectedChart != null ? selectedChart.text : null), initialStamina); }
+        catch (Exception error) { Debug.LogError("Pink beatmap: " + error.Message, this); return false; }
+        if (song == null)
+        { Debug.LogError("Assign the matching Pink rhythm song on PinkRhythmManager before playing.", this); return false; }
+        double requiredLength = session.Beatmap.AudioStartSeconds + session.Beatmap.Notes[session.Beatmap.Notes.Length - 1].End;
+        if (song.length + .5 < requiredLength)
+        { Debug.LogError("The chosen song is shorter than the assigned beatmap (" + requiredLength.ToString("0.0") + " seconds).", this); return false; }
+        if (song.loadState == AudioDataLoadState.Unloaded) song.LoadAudioData();
+        session.JudgementShown += ShowJudgement;
+        challenger = npc; activeGame = this; playing = true; openedFrame = Time.frameCount;
+        spawnedThrough = 0; judgementText.text = "READY"; judgementExpires = float.PositiveInfinity;
+        lastDisplayedScore = -1; lastDisplayedStamina = -1;
+        resultPanel.SetActive(false);
+        rhythmPanel.SetActive(true);
+        if (pinkStage != null) pinkStage.SetActive(true);
+        PrepareUI();
+        ClearNotes();
+        // A short lead-in makes the first note visible before the song starts.
+        double countdownStart = UnityEngine.AudioSettings.dspTime + .1;
+        dspStart = countdownStart + (countdownSound != null ? Math.Max(approachSeconds, countdownGoSeconds) : Math.Max(.5, approachSeconds));
+        music.clip = song;
+        music.time = (float)session.Beatmap.AudioStartSeconds;
+        PauseBackgroundMusic();
+        if (countdownSource != null && countdownSound != null)
+        {
+            countdownSource.Stop(); countdownSource.clip = countdownSound;
+            countdownSource.PlayScheduled(dspStart - countdownGoSeconds);
+        }
+        music.PlayScheduled(dspStart);
+        UpdateHUD(); RenderNotes(-approachSeconds);
+        return true;
+    }
+
+    void PrepareUI()
+    {
+        var overlay = rhythmPanel.GetComponent<Canvas>();
+        if (overlay == null) overlay = rhythmPanel.AddComponent<Canvas>();
+        overlay.overrideSorting = true; overlay.sortingOrder = 210;
+        overlay.worldCamera = overlay.rootCanvas.worldCamera;
+        if (rhythmPanel.GetComponent<GraphicRaycaster>() == null) rhythmPanel.AddComponent<GraphicRaycaster>();
+        var group = rhythmPanel.GetComponent<CanvasGroup>();
+        if (group == null) group = rhythmPanel.AddComponent<CanvasGroup>();
+        group.alpha = 1; group.interactable = group.blocksRaycasts = group.ignoreParentGroups = true;
+        if (EventSystem.current == null)
+            new GameObject("EventSystem", typeof(EventSystem)).AddComponent<InputSystemUIInputModule>().AssignDefaultActions();
+        EventSystem.current.SetSelectedGameObject(null);
+        staminaSlider.minValue = 0; staminaSlider.maxValue = 100;
+        staminaSlider.wholeNumbers = false; staminaSlider.interactable = false;
+        noteTemplate.gameObject.SetActive(false);
+        Canvas.ForceUpdateCanvases();
+        for (int i = pool.Count + activeNotes.Count; i < 16; i++) pool.Push(CreateNote());
+    }
+
+    void PauseBackgroundMusic()
+    {
+        pausedMusic.Clear();
+        OverworldMusicController.Instance?.SilenceForRhythm(this);
+        // Pause scene music, preserving its exact playback position. Leave spatial ambience and SFX alone.
+        foreach (var source in FindObjectsByType<AudioSource>())
+            if (source != music && source.isPlaying && source.spatialBlend < .01f &&
+                (OverworldMusicController.Instance == null || !OverworldMusicController.Instance.Owns(source)) &&
+                source.loop)
+            { pausedMusic.Add(source); source.Pause(); }
+    }
+
+    void ResumeBackgroundMusic()
+    {
+        OverworldMusicController.Instance?.ResumeAfterRhythm(this);
+        foreach (var source in pausedMusic)
+            if (source != null && source.isActiveAndEnabled) source.UnPause();
+        pausedMusic.Clear();
+    }
+
+    void Update()
+    {
+        if (activeGame != this) return;
+        bool typingCode = CheatConsole.BlocksGameplayInput;
+        Keyboard keys = Keyboard.current;
+        if (!typingCode && Time.frameCount > openedFrame && keys != null && keys.escapeKey.wasPressedThisFrame)
+        { ExitChallenge(); return; }
+        if (!playing) return;
+        // DSP time ties note motion to audio instead of accumulating frame-time drift.
+        double time = UnityEngine.AudioSettings.dspTime - dspStart - timingOffset;
+        int pressed = 0, held = 0;
+        if (!typingCode && keys != null && Time.frameCount > openedFrame)
+        {
+            if (keys.wKey.wasPressedThisFrame) pressed |= 1;
+            if (keys.aKey.wasPressedThisFrame) pressed |= 2;
+            if (keys.sKey.wasPressedThisFrame) pressed |= 4;
+            if (keys.dKey.wasPressedThisFrame) pressed |= 8;
+            if (keys.wKey.isPressed) held |= 1;
+            if (keys.aKey.isPressed) held |= 2;
+            if (keys.sKey.isPressed) held |= 4;
+            if (keys.dKey.isPressed) held |= 8;
+        }
+        session.Tick(time, pressed, held);
+        RenderNotes(time); UpdateHUD();
+        if (time < 0)
+        {
+            double countdownTime = time + countdownGoSeconds;
+            judgementText.text = countdownTime >= countdownNumberCueSeconds.z ? "1" :
+                countdownTime >= countdownNumberCueSeconds.y ? "2" : countdownTime >= countdownNumberCueSeconds.x ? "3" : "READY";
+        }
+        else if (float.IsPositiveInfinity(judgementExpires)) { judgementText.text = "GO!"; judgementExpires = Time.unscaledTime + .7f; }
+        if (Time.unscaledTime > judgementExpires) judgementText.text = "";
+        // Let the song's ending fade finish after the last note has been judged.
+        bool songFinished = time + timingOffset >= song.length - session.Beatmap.AudioStartSeconds;
+        if (battleUltimate ? time >= 18 || session.Failed : usePreviewChart ? time >= previewSeconds : session.Failed || (session.Complete && songFinished)) FinishChallenge();
+    }
+
+    void UpdateHUD()
+    {
+        if (lastDisplayedScore != session.DisplayScore)
+        {
+            lastDisplayedScore = session.DisplayScore;
+            scoreText.text = "SCORE " + lastDisplayedScore.ToString("D6");
+        }
+        float value = (float)session.Stamina;
+        if (lastDisplayedStamina != value)
+        {
+            lastDisplayedStamina = value;
+            staminaSlider.SetValueWithoutNotify(value);
+        }
+    }
+
+    void ShowJudgement(int index, PinkJudgement judgement, bool final)
+    {
+        judgementText.text = judgement.ToString().ToUpperInvariant();
+        judgementText.color = judgement >= PinkJudgement.Bad ? new Color(1, .25f, .4f) : new Color(1, .75f, .95f);
+        judgementExpires = Time.unscaledTime + .7f;
+    }
+
+    NoteVisual CreateNote()
+    {
+        var rect = Instantiate(noteTemplate, notesContainer);
+        rect.name = "RhythmNote";
+        rect.anchorMin = rect.anchorMax = new Vector2(.5f, .5f);
+        rect.pivot = new Vector2(.5f, .5f); rect.localScale = Vector3.one;
+        var visual = new NoteVisual { Rect = rect, Tail = (RectTransform)rect.Find("HoldTail"),
+            KeyText = rect.GetComponentInChildren<TMP_Text>(true) };
+        visual.Tail.anchorMin = visual.Tail.anchorMax = new Vector2(.5f, .5f);
+        visual.Tail.pivot = new Vector2(0, .5f);
+        visual.Tail.anchoredPosition = Vector2.zero;
+        visual.Tail.SetAsFirstSibling();
+        foreach (var graphic in rect.GetComponentsInChildren<Graphic>(true)) graphic.raycastTarget = false;
+        rect.gameObject.SetActive(false);
+        return visual;
+    }
+
+    void RenderNotes(double time)
+    {
+        // Only visible notes get UI objects. Reuse those objects throughout the song.
+        Vector3 target = notesContainer.InverseTransformPoint(targetBox.TransformPoint(targetBox.rect.center));
+        while (spawnedThrough < session.States.Length && session.Beatmap.Notes[spawnedThrough].Start <= time + approachSeconds)
+        {
+            int index = spawnedThrough++;
+            if (session.States[index].Judged) continue;
+            NoteVisual visual = pool.Count > 0 ? pool.Pop() : CreateNote();
+            visual.Index = index;
+            visual.KeyText.text = "WASD"[session.Beatmap.Notes[index].Key].ToString();
+            visual.Rect.gameObject.SetActive(true);
+            activeNotes.Add(visual);
+        }
+        for (int i = activeNotes.Count - 1; i >= 0; i--)
+        {
+            NoteVisual visual = activeNotes[i];
+            var state = session.States[visual.Index];
+            var note = session.Beatmap.Notes[visual.Index];
+            if (state.Judged)
+            {
+                visual.Rect.gameObject.SetActive(false); pool.Push(visual); activeNotes.RemoveAt(i); continue;
+            }
+            double headTime = state.Started ? time : note.Start;
+            visual.Rect.localPosition = new Vector3(target.x + (float)(headTime - time) * pixelsPerSecond, target.y, 0);
+            visual.Tail.gameObject.SetActive(note.IsHold);
+            if (note.IsHold)
+                visual.Tail.sizeDelta = new Vector2((float)Math.Max(0, note.End - headTime) * pixelsPerSecond,
+                    Math.Max(12, visual.Rect.rect.height * .4f));
+        }
+    }
+
+    void FinishChallenge()
+    {
+        if (battleUltimate)
+        {
+            var completed = battleFinished; float accuracy = session.DisplayScore / 100000f;
+            battleFinished = null; ExitChallenge(); completed?.Invoke(accuracy); return;
+        }
+        playing = false;
+        music.Stop();
+        if (countdownSource != null) countdownSource.Stop();
+        ClearNotes();
+        if (!usePreviewChart && session.UnlocksUltimate)
+        {
+            foreach (Druid druid in FindObjectsByType<Druid>(FindObjectsInactive.Include))
+                druid.UnlockUltimate();
+        }
+        resultText.text = "SCORE " + session.DisplayScore.ToString("D6") + "\n\n" +
+            (usePreviewChart ? "10-second chart preview complete." : session.Failed ? "Out of stamina! Try again." : session.UnlocksUltimate ?
+                "Druid's Ultimate Unlocked!" : "Song complete! Reach 084000 to unlock Druid's ultimate.");
+        resultPanel.SetActive(true); resultPanel.transform.SetAsLastSibling();
+        EventSystem.current?.SetSelectedGameObject(continueButton.gameObject);
+    }
+
+    void ClearNotes()
+    {
+        foreach (var visual in activeNotes) { visual.Rect.gameObject.SetActive(false); pool.Push(visual); }
+        activeNotes.Clear();
+    }
+
+    public void ExitChallenge()
+    {
+        if (activeGame != this) return;
+        playing = false;
+        if (music != null) music.Stop();
+        if (countdownSource != null) countdownSource.Stop();
+        if (session != null) session.JudgementShown -= ShowJudgement;
+        ClearNotes(); ResumeBackgroundMusic();
+        if (pinkStage != null) pinkStage.SetActive(false);
+        if (resultPanel != null) resultPanel.SetActive(false);
+        if (rhythmPanel != null) rhythmPanel.SetActive(false);
+        challenger = null; activeGame = null; closedFrame = Time.frameCount;
+        if (battleUltimate) { var cancelled = battleFinished; RestoreBattleSong(); cancelled?.Invoke(0); }
+    }
+
+    void OnDisable() => ExitChallenge();
+    void OnDestroy()
+    {
+        ExitChallenge();
+        if (exitButton != null) exitButton.onClick.RemoveListener(ExitChallenge);
+        if (continueButton != null) continueButton.onClick.RemoveListener(ExitChallenge);
+    }
+
+    [ContextMenu("Assign Missing UI References")]
+    public void AssignMissingReferences()
+    {
+        Transform root = rhythmPanel != null ? rhythmPanel.transform : null;
+        if (root == null && transform.parent != null)
+            foreach (Transform child in transform.parent.GetComponentsInChildren<Transform>(true))
+                if (child.name == "PinkRhythmPanel") { rhythmPanel = child.gameObject; root = child; break; }
+        if (root == null) return;
+        Assign(ref notesContainer, root, "NotesContainer"); Assign(ref targetBox, root, "TargetBox");
+        Assign(ref noteTemplate, root, "NoteTemplate"); Assign(ref scoreText, root, "ScoreText");
+        Assign(ref judgementText, root, "JudgementText"); Assign(ref staminaSlider, root, "StaminaSlider");
+        Assign(ref exitButton, root, "ExitButton"); Assign(ref resultText, root, "ResultText");
+        Assign(ref continueButton, root, "ContinueButton");
+        if (resultPanel == null)
+            foreach (Transform child in root.GetComponentsInChildren<Transform>(true))
+                if (child.name == "ResultPanel") { resultPanel = child.gameObject; break; }
+        if (pinkBeatmap == null) pinkBeatmap = Resources.Load<TextAsset>("Rhythm/RainbowRoad_Full");
+        #if UNITY_EDITOR
+        if (song == null) song = UnityEditor.AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/Music/Wii Rainbow Road - Mario Kart 8 Deluxe Booster Course Pass Music.mp3");
+        if (!Application.isPlaying) UnityEditor.EditorUtility.SetDirty(this);
+        #endif
+    }
+
+    static void Assign<T>(ref T field, Transform root, string name) where T : Component
+    {
+        if (field != null) return;
+        foreach (Transform child in root.GetComponentsInChildren<Transform>(true))
+            if (child.name == name) { field = child.GetComponent<T>(); return; }
+    }
+}

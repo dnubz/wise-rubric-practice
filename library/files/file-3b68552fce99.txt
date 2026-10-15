@@ -1,0 +1,559 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.InputSystem;
+
+public enum BattlePhase { Player, Enemy, Acting, Victory, GameOver }
+
+public sealed class BattleController : MonoBehaviour
+{
+    public static BattleController Instance { get; private set; }
+    public BattleSettings settings;
+    public BattleLayout[] layouts;
+    public BattleSkill[] skills;
+    public InputActionAsset controls;
+    public BattleHUD hud;
+    public BattleCamera cameraRig;
+    public LineRenderer movementCircle, aimCircle;
+    public BattleAreaIndicator movementArea, skillArea;
+    public AudioSource music;
+    public BattleBossGame bossGame;
+    public BattleUnit[] Party { get; private set; }
+    public readonly List<BattleUnit> Enemies = new List<BattleUnit>();
+    public BattlePhase Phase { get; private set; }
+    public int Selected { get; private set; }
+    public int SelectedSkill { get; private set; } = -1;
+    public int LayoutIndex { get; private set; }
+    public float SequenceSpeed { get; private set; } = 1;
+    public BattleUnit Current => Party != null && Party.Length > 0 ? Party[Selected] : null;
+    public BattleLayout Layout => layouts[LayoutIndex];
+    public BattleUnit Target { get; private set; }
+    public Vector3 AimPoint { get; private set; }
+    public bool Ready { get; private set; }
+    System.Random random;
+    int round = 1;
+    float facing, targetChangeAt;
+    bool menuWasOpen, resolving;
+    int barrageShots;
+    AudioSource chargeAudio;
+    readonly HashSet<BattleUnit> dodged = new HashSet<BattleUnit>();
+    InputActionMap input;
+    InputAction Action(string name) => input?.FindAction(name);
+    bool Pressed(string name) => Action(name) != null && Action(name).WasPressedThisFrame();
+    void Awake() { Instance = this; input = controls.FindActionMap("Battle", true); input.Enable(); }
+    void OnDestroy() { StopChargeAudio(); input?.Disable(); if (Instance == this) Instance = null; }
+    public void Setup(CharacterBase[] characters, BattleEnemyData encountered, bool boss, int fixedLayout = -1)
+    {
+        random = new System.Random(unchecked(Environment.TickCount ^ (WFCWorldManager.Instance != null ? WFCWorldManager.Instance.WorldSeed : 0)));
+        LayoutIndex = fixedLayout >= 0 ? Mathf.Clamp(fixedLayout, 0, layouts.Length - 1) : random.Next(layouts.Length);
+        for (int i = 0; i < layouts.Length; i++) layouts[i].gameObject.SetActive(i == LayoutIndex);
+        Layout.surface.BuildNavMesh();
+        Party = new BattleUnit[characters.Length];
+        for (int i = 0; i < Party.Length; i++)
+        {
+            var character = characters[i]; var unit = character.GetComponent<BattleUnit>(); unit.enabled = true;
+            unit.character = character; unit.characterIndex = i; unit.enemy = null;
+            character.transform.SetPositionAndRotation(Layout.partySpawns[i].position, Quaternion.identity);
+            unit.Begin(settings); unit.Agent.Warp(Layout.partySpawns[i].position); Party[i] = unit;
+            unit.StartTurn();
+        }
+        int count = random.Next(settings.minimumEnemies, settings.maximumEnemies + 1);
+        for (int i = 0; i < count; i++)
+        {
+            // 75% encountered species, 25% another species. Always include the encountered enemy.
+            var data = i == 0 || random.NextDouble() < .75 ? encountered : settings.enemies[random.Next(settings.enemies.Length)];
+            if (data.kind == BattleEnemyKind.Jevil) data = settings.enemies[random.Next(settings.enemies.Length)];
+            SpawnEnemy(data, Layout.enemySpawns[i % Layout.enemySpawns.Length].position, random.NextDouble() < .25);
+        }
+        if (boss) SpawnEnemy(settings.boss, Layout.enemySpawns[0].position + Vector3.right * 4, false);
+        Phase = BattlePhase.Player; Ready = true; hud.results.SetActive(false);
+        music.clip = boss ? settings.bossMusic : settings.music; GameAudio.RouteMusic(music); music.Play();
+        SelectCharacter(Array.FindIndex(Party, p => p.Alive) is int first && first >= 0 ? first : 0);
+        Physics.SyncTransforms(); RefreshHUD(); CheckEnd();
+    }
+    public BattleUnit SpawnEnemy(BattleEnemyData data, Vector3 position, bool veteran)
+    {
+        if (!NavMesh.SamplePosition(position, out var spot, 4, NavMesh.AllAreas)) throw new InvalidOperationException("Enemy spawn is outside the arena NavMesh.");
+        var model = Instantiate(data.prefab, spot.position, Quaternion.Euler(0, 180, 0));
+        var encounter = model.GetComponent<EncounterEnemy>(); if (encounter != null) encounter.enabled = false;
+        var unit = model.GetComponent<BattleUnit>(); unit.enabled = true; unit.character = null; unit.enemy = data;
+        unit.variant = veteran;
+        if (veteran) model.transform.localScale *= 1.15f;
+        unit.Begin(settings); unit.Agent.Warp(spot.position); Enemies.Add(unit); return unit;
+    }
+    void Update()
+    {
+        if (!Ready) return;
+        if (BattleSession.MenuOpen || CheatConsole.BlocksGameplayInput) { menuWasOpen = true; return; }
+        if (menuWasOpen) { menuWasOpen = false; foreach (var p in Party) p.Refresh(); RefreshHUD(); CheckEnd(); }
+        if (Pressed("FastForward")) { SequenceSpeed = SequenceSpeed > 1 ? 1 : 4; RefreshHUD(); }
+        if (Phase != BattlePhase.Player || resolving || PinkRhythmController.IsOpen) return;
+        if (Pressed("ChangeCharacter")) CycleCharacter();
+        if (Pressed("EndTurn")) { EndTurn(); return; }
+        for (int i = 0; i < 4; i++) if (Pressed("Skill" + (i + 1))) SelectSkill(i);
+        if (Current == null || !Current.Alive) { CycleCharacter(); return; }
+        Vector2 move = Action("Move").ReadValue<Vector2>();
+        if (SelectedSkill < 0)
+        {
+            Vector3 right = cameraRig.view.transform.right; Vector3 forward = cameraRig.view.transform.forward; right.y = forward.y = 0;
+            bool moved = Current.Move(Vector3.ClampMagnitude(right.normalized * move.x + forward.normalized * move.y, 1) * settings.walkSpeed, Time.deltaTime);
+            if (moved) RefreshHUD();
+        }
+        else
+        {
+            Current.Animate("Idle", 0); UpdateAim(move.x);
+            if (Pressed("Confirm")) ConfirmSkill();
+        }
+        DrawCircle(movementCircle, Current.moveOrigin, Current.moveRange, Color.white, !Current.movementLocked);
+    }
+    public void SelectCharacter(int index)
+    {
+        if (!Ready || Phase != BattlePhase.Player || index < 0 || index >= Party.Length || !Party[index].Alive) return;
+        Selected = index; SelectedSkill = -1; cameraRig.focus = Current.transform; HideAim(); Target = null;
+        hud.HideSkillInfo();
+        RefreshHUD();
+    }
+    public void CycleCharacter()
+    { for (int n = 1; n <= Party.Length; n++) { int index = (Selected + n) % Party.Length; if (Party[index].Alive) { SelectCharacter(index); return; } } }
+    public BattleSkill Skill(int character, int slot) => Array.Find(skills, s => s.character == character && s.slot == slot);
+    public bool CanUse(int slot)
+    {
+        if (Current == null || !Current.Alive || Phase != BattlePhase.Player || resolving || BattleSession.MenuOpen || CheatConsole.BlocksGameplayInput) return false;
+        var skill = Skill(Selected, slot);
+        return skill != null && Current.character.BattleCooldowns[slot] == 0 && Current.character.GetCurrSP() >= skill.sp &&
+            (slot == 0 || Current.AP > 0) && (slot != 3 || Selected == 1 || Current.character.HasUltimate);
+    }
+    public void SelectSkill(int slot)
+    {
+        if (SelectedSkill == slot) { SelectedSkill = -1; HideAim(); hud.Refresh(this); return; }
+        if (!CanUse(slot)) { hud.Message("Skill unavailable: check SP, cooldown, AP, and ultimate unlock."); return; }
+        SelectedSkill = slot; facing = Current.transform.eulerAngles.y;
+        Target = ClosestEnemy(Current.transform.position, Skill(Selected, slot).range); AimPoint = Current.transform.position;
+        RefreshHUD();
+    }
+    void UpdateAim(float horizontal)
+    {
+        var skill = Skill(Selected, SelectedSkill); Vector3 origin = Current.transform.position;
+        if (Selected == 0 && SelectedSkill == 0)
+        {
+            facing += horizontal * 100 * Time.deltaTime; Current.transform.rotation = Quaternion.Euler(0, facing, 0);
+            DrawArc(origin, skill.radius, facing); AimPoint = origin;
+        }
+        else if (Selected == 1 && SelectedSkill == 0)
+        {
+            var candidates = Enemies.Where(e => e.Alive && FlatDistance(e.transform.position, origin) <= skill.range)
+                .OrderBy(e => Mathf.Atan2(cameraRig.view.transform.InverseTransformPoint(e.transform.position).x,
+                    cameraRig.view.transform.InverseTransformPoint(e.transform.position).z)).ThenBy(e => FlatDistance(e.transform.position, origin)).ToArray();
+            if (Target == null || !Target.Alive || !candidates.Contains(Target)) Target = candidates.FirstOrDefault();
+            if (Mathf.Abs(horizontal) > .5f && Time.time >= targetChangeAt && candidates.Length > 0)
+            { int at = Array.IndexOf(candidates, Target); Target = candidates[(at + (horizontal > 0 ? 1 : candidates.Length - 1)) % candidates.Length]; targetChangeAt = Time.time + .22f; }
+            if (Target != null) { AimPoint = Target.transform.position; Current.transform.LookAt(new Vector3(AimPoint.x, origin.y, AimPoint.z)); }
+            DrawCircle(aimCircle, AimPoint, .9f, Color.red, Target != null);
+        }
+        else if (skill.range <= 0)
+        { AimPoint = origin; DrawCircle(aimCircle, origin, skill.radius, Color.cyan, skill.radius > 0); }
+        else
+        {
+            if (Mouse.current != null)
+            {
+                var plane = new Plane(Vector3.up, origin); var ray = cameraRig.view.ScreenPointToRay(Mouse.current.position.ReadValue());
+                if (plane.Raycast(ray, out float at)) { var point = ray.GetPoint(at); var offset = point - origin; AimPoint = origin + Vector3.ClampMagnitude(offset, skill.range); }
+            }
+            DrawCircle(aimCircle, AimPoint, Mathf.Max(.5f, skill.radius), Color.cyan, true);
+        }
+    }
+    public void ConfirmSkill()
+    {
+        if (SelectedSkill < 0 || !CanUse(SelectedSkill)) return;
+        int slot = SelectedSkill; var actor = Current; var skill = Skill(Selected, slot);
+        if (Selected == 1 && slot == 0 && (Target == null || !Target.Alive)) { hud.Message("No enemy in range."); return; }
+        if (Selected == 2 && slot == 2)
+        {
+            if (!NavMesh.SamplePosition(AimPoint, out var landing, .65f, NavMesh.AllAreas) ||
+                Enemies.Concat(Party).Any(u => u != actor && u.Alive && FlatDistance(u.transform.position, landing.position) < 1.2f))
+            { hud.Message("Choose clear ground for the teleport."); return; }
+            AimPoint = landing.position;
+        }
+        actor.character.SpendSP(skill.sp); if (slot > 0) actor.AP--;
+        actor.character.BattleCooldowns[slot] = skill.cooldown;
+        if (slot == 0) actor.movementLocked = true;
+        SelectedSkill = -1; HideAim(); StartCoroutine(Cast(actor, skill, AimPoint, Target));
+    }
+    IEnumerator Cast(BattleUnit actor, BattleSkill skill, Vector3 point, BattleUnit lockedTarget)
+    {
+        resolving = true; Phase = BattlePhase.Acting; actor.Animate(skill.slot == 0 ? "BattleAttack" : "BattleCast");
+        foreach (var unit in Party.Concat(Enemies)) unit.HoldPosition();
+        RefreshHUD();
+        AudioClip sound = actor.characterIndex == 0 && skill.slot == 0 ? settings.attackSound :
+            actor.characterIndex == 0 && skill.slot == 1 ? settings.shieldSound :
+            actor.characterIndex == 1 && skill.slot == 2 ? settings.portalSound :
+            actor.characterIndex == 2 && skill.slot == 2 ? settings.teleportSound :
+            actor.characterIndex == 2 && skill.slot == 1 ? settings.melodySound : settings.magicSound;
+        if (!(actor.characterIndex == 2 && skill.slot == 3)) PlaySound(sound, actor.transform.position, .45f);
+        yield return Wait(.3f);
+        bool empowered = actor.portal && skill.slot != 2;
+        int index = actor.characterIndex; int attack = actor.Attack;
+        if (index == 0)
+        {
+            if (skill.slot == 0)
+            {
+                if (settings.crescentEffect != null)
+                {
+                    var sweep = Instantiate(settings.crescentEffect, actor.transform.position + Vector3.up, actor.transform.rotation);
+                    sweep.transform.localScale = Vector3.one * skill.radius;
+                }
+                bool kill = false;
+                foreach (var enemy in Enemies.ToArray()) if (enemy.Alive && InCrescent(actor, enemy.transform.position, skill.radius))
+                { Hit(enemy, 25 + attack); kill |= !enemy.Alive; }
+                foreach (var cover in Layout.cover) if (cover != null && cover.HP > 0 && InCrescent(actor, cover.transform.position, skill.radius)) cover.Damage(25 + attack);
+                if (kill) { actor.ResetMovement(); actor.character.BattleCooldowns[0] = 0; actor.Heal(Mathf.CeilToInt(actor.MaxHP * .05f)); }
+            }
+            else if (skill.slot == 1)
+            {
+                AreaEffect(actor.transform.position, skill.radius, Color.cyan);
+                foreach (var ally in Party) if (ally.Alive && FlatDistance(ally.transform.position, actor.transform.position) <= skill.radius)
+                { ally.shields = Mathf.Min(3, ally.shields + 1); Popup(ally.transform.position, "SHIELD " + ally.shields, Color.cyan); }
+            }
+            else if (skill.slot == 2)
+            {
+                var targets = Enemies.Where(e => e.Alive && FlatDistance(e.transform.position, point) <= skill.radius).ToArray();
+                var dragon = actor.Dragon;
+                AreaEffect(point, skill.radius, new Color(1, .3f, .05f), 3);
+                int total = Magic(actor, Mathf.RoundToInt((60 + attack * 1.1f) * .7f));
+                int pending = 0;
+                // Split each enemy's listed damage across its five fireballs. Launch in round-robin
+                // order without waiting for each projectile to reach its target.
+                for (int volley = 0; volley < 5; volley++) foreach (var enemy in targets)
+                {
+                    int raw = total / 5 + (volley < total % 5 ? 1 : 0);
+                    if (!enemy.Alive) continue;
+                    dragon?.Aim(enemy.transform.position);
+                    pending++;
+                    StartCoroutine(DragonShot(actor, enemy, raw, dragon != null ? dragon.Mouth.position : actor.transform.position + Vector3.up * 5, () => pending--));
+                    yield return Wait(.12f);
+                }
+                while (pending > 0) yield return null;
+                dragon?.StopAiming();
+            }
+            else { actor.dodgeTurns = 2; dodged.Clear(); Popup(actor.transform.position, "DODGE STANCE", Color.cyan); }
+        }
+        else if (index == 1)
+        {
+            if (skill.slot == 0 && lockedTarget != null) yield return Shoot(actor, lockedTarget, Magic(actor, 10 + attack), empowered);
+            else if (skill.slot == 1)
+            {
+                AreaEffect(actor.transform.position, skill.radius, new Color(1, .8f, .1f));
+                foreach (var ally in Party) if (ally.Alive && FlatDistance(ally.transform.position, actor.transform.position) <= skill.radius)
+                { ally.Heal(Mathf.RoundToInt((5 + attack) * 1.6f * (empowered ? 1.5f : 1)), true); ally.magicBuff = empowered ? .4f : .3f; ally.magicBuffTurns = 2; }
+            }
+            else if (skill.slot == 2) { actor.portal = true; for (int i = 0; i < 4; i++) if (i != 2) actor.character.BattleCooldowns[i] = Mathf.Max(0, actor.character.BattleCooldowns[i] - 1); Popup(actor.transform.position, "PORTAL OPEN", Color.magenta); }
+            else if (skill.slot == 3) yield return ArcaneBarrage(actor, empowered);
+        }
+        else
+        {
+            if (skill.slot == 0) Burst(actor, point, skill.radius, Magic(actor, 20 + Mathf.RoundToInt(attack * .9f)), 27 + Mathf.RoundToInt(attack * 1.13f));
+            else if (skill.slot == 1)
+            {
+                var targets = Enemies.Where(e => e.Alive && FlatDistance(e.transform.position, actor.transform.position) <= skill.radius).ToArray();
+                AreaEffect(actor.transform.position, skill.radius, new Color(.6f, .3f, 1), 5);
+                float elapsed = 0;
+                while (elapsed < 5)
+                {
+                    if (BattleSession.MenuOpen) { yield return null; continue; }
+                    foreach (var enemy in targets) if (enemy.Alive && FlatDistance(enemy.transform.position, actor.transform.position) > 1.5f) enemy.PullTowards(actor.transform.position, 2 * Time.deltaTime * SequenceSpeed);
+                    elapsed += Time.deltaTime * SequenceSpeed; yield return null;
+                }
+            }
+            else if (skill.slot == 2)
+            {
+                int damage = Magic(actor, 14 + Mathf.RoundToInt(attack * .7f)), heal = 30 + Mathf.RoundToInt(attack * 1.2f);
+                Burst(actor, actor.transform.position, skill.radius, damage, heal); actor.Agent.Warp(point); actor.ResetMovement(); Burst(actor, point, skill.radius, damage, heal);
+            }
+            else yield return GrandEnsemble(actor);
+        }
+        if (empowered) actor.portal = false;
+        actor.Animate("Idle", 0); resolving = false; Phase = BattlePhase.Player; RefreshHUD(); CheckEnd();
+    }
+    void Burst(BattleUnit actor, Vector3 point, float radius, int damage, int heal)
+    {
+        Impact(point); foreach (var enemy in Enemies) if (enemy.Alive && FlatDistance(enemy.transform.position, point) <= radius) Hit(enemy, damage);
+        AreaEffect(point, radius, new Color(.3f, 1, .65f));
+        foreach (var ally in Party) if (ally.Alive && FlatDistance(ally.transform.position, point) <= radius) ally.Heal(heal);
+        PlaySound(settings.healSound, point);
+    }
+    int Magic(BattleUnit actor, int raw) => Mathf.RoundToInt(raw * (1 + actor.magicBuff));
+    void Hit(BattleUnit target, int attack, float scale = 1) { target.Damage(attack, scale); Impact(target.transform.position + Vector3.up); }
+    static bool InCrescent(BattleUnit actor, Vector3 position, float radius)
+    {
+        Vector3 offset = position - actor.transform.position; offset.y = 0;
+        Vector3 forward = actor.transform.forward; forward.y = 0;
+        return offset.sqrMagnitude <= radius * radius && Vector3.Dot(forward, offset) >= 0;
+    }
+    IEnumerator DragonShot(BattleUnit actor, BattleUnit target, int attack, Vector3 start, Action complete)
+    {
+        try { yield return FireProjectile(actor, target.transform.position + Vector3.up * 2, attack, start: start, coverDamageMultiplier: 3, intendedTarget: target); }
+        finally { complete(); }
+    }
+    public IEnumerator Shoot(BattleUnit source, BattleUnit target, int attack, bool bounce = false, Vector3? start = null, float scale = 1, float visualScale = 1)
+    { yield return FireProjectile(source, target.transform.position + Vector3.up * 2, attack, bounce, start, scale, visualScale, intendedTarget: target); }
+    public IEnumerator FireProjectile(BattleUnit source, Vector3 destination, int attack, bool bounce = false, Vector3? start = null, float scale = 1, float visualScale = 1, float coverDamageMultiplier = 1, BattleUnit intendedTarget = null)
+    {
+        bool done = false; BattleUnit struck = null;
+        var obj = Instantiate(!source.IsParty && source.enemy.kind == BattleEnemyKind.Minion ? settings.laser : settings.projectile); var shot = obj.AddComponent<BattleProjectile>(); shot.owner = source;
+        obj.transform.localScale *= visualScale;
+        PlaySound(!source.IsParty ? settings.laserSound : settings.magicSound, start ?? source.transform.position, .4f);
+        shot.attack = attack; shot.scale = scale; shot.coverDamageMultiplier = coverDamageMultiplier; shot.target = intendedTarget; shot.onHit = hit => struck = hit; shot.onComplete = () => done = true;
+        shot.radius *= visualScale; shot.Launch(start ?? source.transform.position + Vector3.up * 2, destination);
+        while (!done) yield return null;
+        if (!bounce || struck == null) yield break;
+        var seen = new HashSet<BattleUnit> { struck };
+        Vector3 position = struck.transform.position;
+        for (int i = 0; i < 2; i++)
+        {
+            var next = Enemies.Where(e => e.Alive && !seen.Contains(e) && FlatDistance(e.transform.position, position) <= 8).OrderBy(e => FlatDistance(e.transform.position, position)).FirstOrDefault();
+            if (next == null) break; seen.Add(next); yield return Shoot(source, next, attack, false, position + Vector3.up * 2); position = next.transform.position;
+        }
+    }
+    IEnumerator ArcaneBarrage(BattleUnit actor, bool empowered)
+    {
+        cameraRig.focus = actor.transform; cameraRig.SetFirstPerson(true); hud.crosshair.SetActive(true);
+        foreach (var ally in Party) ally.Appearance.Show(ally == actor ? 1 : .25f, !ally.Alive);
+        float elapsed = 0, charged = 0, nextShot = 0;
+        bool chargePlaying = false, chargePaused = false;
+        while (elapsed < 10 && Enemies.Any(e => e.Alive))
+        {
+            if (BattleSession.MenuOpen)
+            { if (!chargePaused && chargeAudio != null) chargeAudio.Pause(); chargePaused = true; yield return null; continue; }
+            if (chargePaused) { if (chargeAudio != null) chargeAudio.UnPause(); chargePaused = false; }
+            elapsed += Time.deltaTime;
+            if (!CheatConsole.BlocksGameplayInput && Action("Charge").IsPressed())
+            {
+                if (!chargePlaying) { StopChargeAudio(); chargeAudio = DungeonAudio.Play(settings.chargeSound, actor.transform.position, .3f); chargePlaying = true; }
+                charged = Mathf.Min(1.5f, charged + Time.deltaTime);
+            }
+            if (!CheatConsole.BlocksGameplayInput && Action("Charge").WasReleasedThisFrame())
+            {
+                StopChargeAudio();
+                if (elapsed >= nextShot)
+                {
+                    var ray = cameraRig.view.ViewportPointToRay(new Vector3(.5f, .5f));
+                    int raw = Magic(actor, Mathf.RoundToInt(Mathf.Lerp(3 + actor.Attack * .1f, 40 + actor.Attack * 1.5f, charged / 1.5f)));
+                    StartCoroutine(BarrageProjectile(actor, ray, raw, empowered && charged >= 1.45f, Mathf.Lerp(.8f, 2.6f, charged / 1.5f)));
+                    nextShot = elapsed + .5f;
+                }
+                charged = 0; chargePlaying = false;
+            }
+            hud.Message("Arcane Barrage  " + (10 - elapsed).ToString("0.0") + "s   Charge " + (charged / 1.5f * 100).ToString("0") + "%"); yield return null;
+        }
+        StopChargeAudio();
+        while (barrageShots > 0) yield return null;
+        hud.crosshair.SetActive(false); cameraRig.SetFirstPerson(false); foreach (var ally in Party) ally.Appearance.Show(1, !ally.Alive);
+    }
+    void StopChargeAudio()
+    {
+        if (chargeAudio != null) { chargeAudio.Stop(); Destroy(chargeAudio.gameObject); }
+        chargeAudio = null;
+    }
+    IEnumerator BarrageProjectile(BattleUnit actor, Ray ray, int attack, bool bounce, float size)
+    { barrageShots++; yield return FireProjectile(actor, ray.GetPoint(60), attack, bounce, ray.origin + ray.direction, visualScale: size); barrageShots--; }
+    IEnumerator GrandEnsemble(BattleUnit actor)
+    {
+        var pink = Instantiate(settings.pinkModel, actor.transform.position, actor.transform.rotation);
+        var renderers = actor.GetComponentsInChildren<Renderer>(); foreach (var r in renderers) r.enabled = false;
+        var previous = cameraRig.focus; float previousDistance = cameraRig.distance, previousTilt = cameraRig.tilt;
+        float previousWeight = cameraRig.focusWeight, previousYaw = cameraRig.yaw;
+        float previousFarClip = cameraRig.view.farClipPlane;
+        cameraRig.focus = pink.transform; cameraRig.focusWeight = 1; cameraRig.distance = 9; cameraRig.tilt = 25;
+        foreach (var enemy in Enemies) if (enemy.Alive) enemy.transform.LookAt(new Vector3(pink.transform.position.x, enemy.transform.position.y, pink.transform.position.z));
+        hud.Message("Grand Ensemble"); AreaEffect(actor.transform.position, 4, Color.magenta, 2.4f);
+        var introSound = DungeonAudio.Play(settings.melodySound, actor.transform.position, .3f);
+        float reveal = 0;
+        while (reveal < 1.2f) { if (!BattleSession.MenuOpen) { cameraRig.yaw += Time.deltaTime * 30; pink.transform.Rotate(0, Time.deltaTime * 45, 0); reveal += Time.deltaTime; } yield return null; }
+        if (introSound != null) { introSound.Stop(); Destroy(introSound.gameObject); }
+        var ensembleFocus = new GameObject("Grand Ensemble Camera Focus").transform;
+        ensembleFocus.SetParent(pink.transform, false);
+        cameraRig.tilt = 55;
+        cameraRig.FrameGroup(ensembleFocus, Enemies.Where(e => e.Alive).Select(e => e.transform).Concat(new[] { pink.transform }));
+        bool complete = false; float accuracy = 0;
+        var rhythm = FindAnyObjectByType<PinkRhythmController>();
+        if (rhythm != null && rhythm.OpenBattleUltimate(value => { accuracy = value; complete = true; })) while (!complete) yield return null;
+        else { hud.Message("Healer rhythm UI is unavailable."); yield return Wait(1); }
+        foreach (var enemy in Enemies) if (enemy.Alive && random.NextDouble() < accuracy) { enemy.stun = 1; Popup(enemy.transform.position, "CHARMED", Color.magenta); }
+        foreach (var r in renderers) r.enabled = true; Destroy(pink); cameraRig.focus = previous; cameraRig.distance = previousDistance; cameraRig.tilt = previousTilt;
+        cameraRig.focusWeight = previousWeight; cameraRig.yaw = previousYaw;
+        cameraRig.view.farClipPlane = previousFarClip;
+        actor.Appearance.Show(1, !actor.Alive);
+    }
+    public void EndTurn()
+    {
+        if (!Ready || Phase != BattlePhase.Player || resolving) return;
+        SelectedSkill = -1; HideAim(); movementCircle.enabled = false; movementArea?.Hide(); StartCoroutine(EnemyTurn());
+    }
+    IEnumerator EnemyTurn()
+    {
+        resolving = true; Phase = BattlePhase.Enemy; RefreshHUD();
+        foreach (var enemy in Enemies.ToArray())
+        {
+            if (!enemy.Alive) continue;
+            enemy.StartTurn();
+            if (enemy.stun > 0) { enemy.stun--; Popup(enemy.transform.position, "CHARMED", Color.magenta); continue; }
+            var target = Party.Where(p => p.Alive).OrderBy(p => FlatDistance(p.transform.position, enemy.transform.position)).FirstOrDefault();
+            if (target == null) break;
+            FocusEnemy(enemy, target); hud.Message(enemy.DisplayName + " → " + target.DisplayName);
+            if (enemy.enemy.kind == BattleEnemyKind.Jevil) { yield return BossTurn(enemy, target); CheckEnd(); if (Phase == BattlePhase.GameOver || Phase == BattlePhase.Victory) yield break; continue; }
+            enemy.Agent.isStopped = false; enemy.Agent.speed = settings.walkSpeed * SequenceSpeed;
+            enemy.Agent.SetDestination(target.transform.position);
+            float timeout = 0;
+            while (enemy.Alive && target.Alive && FlatDistance(enemy.transform.position, target.transform.position) > enemy.AttackRange && timeout < 4)
+            {
+                if (BattleSession.MenuOpen) { enemy.Agent.isStopped = true; yield return null; continue; }
+                enemy.Agent.isStopped = false; enemy.Agent.speed = settings.walkSpeed * SequenceSpeed;
+                if (FlatDistance(enemy.transform.position, enemy.moveOrigin) >= enemy.moveRange - .15f) break;
+                timeout += Time.deltaTime * SequenceSpeed; enemy.Animate("Run", 1); yield return null;
+            }
+            enemy.Agent.isStopped = true; enemy.Agent.ResetPath(); enemy.Animate("Idle", 0);
+            if (target.Alive && FlatDistance(enemy.transform.position, target.transform.position) <= enemy.AttackRange + .15f)
+            {
+                enemy.transform.LookAt(new Vector3(target.transform.position.x, enemy.transform.position.y, target.transform.position.z));
+                bool evaded = false;
+                if (target.characterIndex == 0 && target.dodgeTurns > 0 && !dodged.Contains(enemy)) yield return Dodge(enemy, target, value => evaded = value);
+                else yield return Wait(.55f);
+                if (!evaded)
+                {
+                    yield return EnemyAttack(enemy, target);
+                }
+            }
+            CheckEnd(); if (Phase == BattlePhase.GameOver || Phase == BattlePhase.Victory) yield break;
+            yield return Wait(.25f);
+        }
+        foreach (var unit in Party.Concat(Enemies)) if (unit.gameObject.activeInHierarchy) unit.Appearance.Show(1, unit.IsParty && !unit.Alive);
+        foreach (var cover in Layout.cover) if (cover != null) cover.GetComponent<BattleAppearance>().Show();
+        foreach (var ally in Party) ally.StartTurn(); round++; resolving = false; Phase = BattlePhase.Player; RefreshHUD(); CheckEnd();
+        cameraRig.focus = Current.transform; cameraRig.focusWeight = .3f; cameraRig.distance = 31; cameraRig.tilt = 55;
+    }
+    public IEnumerator EnemyAttack(BattleUnit enemy, BattleUnit target)
+    {
+        int hits = enemy.variant ? enemy.enemy.kind == BattleEnemyKind.Skeleton ? 3 : 2 : 1;
+        for (int i = 0; i < hits && enemy.Alive && target.Alive; i++)
+        {
+            enemy.Animate("BattleAttack");
+            if (enemy.enemy.kind == BattleEnemyKind.Minion) yield return Shoot(enemy, target, enemy.Attack);
+            else
+            {
+                PlaySound(settings.attackSound, enemy.transform.position, .4f);
+                yield return Wait(.22f);
+                if (target.Alive) Hit(target, enemy.Attack, Mathf.Pow(.5f, i));
+            }
+            yield return Wait(.25f);
+        }
+    }
+    IEnumerator Dodge(BattleUnit enemy, BattleUnit wise, Action<bool> result)
+    {
+        wise.transform.LookAt(new Vector3(enemy.transform.position.x, wise.transform.position.y, enemy.transform.position.z));
+        hud.dodgePrompt.SetActive(true); float elapsed = 0, pressedAt = -1;
+        // Keep the timing window in real time, even when the rest of the enemy turn is fast-forwarded.
+        while (elapsed < 1.1f)
+        {
+            if (BattleSession.MenuOpen) { yield return null; continue; }
+            elapsed += Time.deltaTime; hud.Message(elapsed < .60f ? "EARLY — wait" : elapsed <= .85f ? "PERFECT — Space to dodge" : "LATE");
+            if (!CheatConsole.BlocksGameplayInput && Pressed("Dodge")) { pressedAt = elapsed; break; } yield return null;
+        }
+        bool success = pressedAt >= 0 && pressedAt <= .95f;
+        if (success)
+        {
+            dodged.Add(enemy);
+            wise.Animate(enemy.enemy.kind == BattleEnemyKind.Skeleton ? "BattleRollBack" : "BattleRollSide");
+            Vector3 roll = enemy.enemy.kind == BattleEnemyKind.Skeleton ? -wise.transform.forward : -wise.transform.right;
+            if (NavMesh.SamplePosition(wise.transform.position + roll * 1.5f, out var retreat, .5f, NavMesh.AllAreas) && FlatDistance(retreat.position, wise.moveOrigin) <= wise.moveRange) wise.Agent.Warp(retreat.position);
+            Popup(wise.transform.position, pressedAt >= .60f && pressedAt <= .85f ? "PERFECT" : pressedAt < .60f ? "EARLY" : "LATE", Color.cyan);
+            if (pressedAt >= .60f && pressedAt <= .85f)
+            {
+                int hits = 0; elapsed = 0; hud.Message("Perfect dodge! Right-click to counter, up to 5 hits.");
+                while (elapsed < 3 && hits < 5 && enemy.Alive)
+                {
+                    if (BattleSession.MenuOpen) { yield return null; continue; }
+                    elapsed += Time.deltaTime; if (!CheatConsole.BlocksGameplayInput && Pressed("Confirm")) { hits++; Hit(enemy, 3 + wise.Attack); wise.Animate("BattleAttack"); } yield return null;
+                }
+            }
+        }
+        hud.dodgePrompt.SetActive(false); result(success);
+    }
+    IEnumerator BossTurn(BattleUnit boss, BattleUnit target)
+    {
+        int number = Enemies.Count(e => e.Alive) <= 4 ? 3 : 2;
+        for (int i = 0; i < number; i++)
+        {
+            Vector3 spawn = boss.transform.position;
+            for (int attempt = 0; attempt < 16; attempt++)
+            {
+                Vector3 position = boss.transform.position + Quaternion.Euler(0, random.Next(360), 0) * Vector3.forward * random.Next(3, 8);
+                if (NavMesh.SamplePosition(position, out var spot, 1, NavMesh.AllAreas) && FlatDistance(spot.position, boss.transform.position) <= 8) { spawn = spot.position; break; }
+            }
+            // The boss is already on valid ground, so even a crowded layout can summon every enemy.
+            SpawnEnemy(settings.enemies[random.Next(settings.enemies.Length)], spawn, false);
+        }
+        Vector3 next = boss.moveOrigin + Quaternion.Euler(0, random.Next(360), 0) * Vector3.forward * random.Next(2, 6);
+        if (NavMesh.SamplePosition(next, out var landing, 1, NavMesh.AllAreas) && FlatDistance(landing.position, boss.moveOrigin) <= boss.moveRange)
+        { boss.Agent.Warp(landing.position); if (NavMesh.SamplePosition(landing.position + Vector3.right * 2, out var prisoner, 2, NavMesh.AllAreas)) { target.Agent.Warp(prisoner.position); target.ResetMovement(); } }
+        FocusEnemy(boss, target); yield return bossGame.Play(boss, target, random.Next(5), Enemies.Count(e => e.Alive));
+    }
+    void FocusEnemy(BattleUnit actor, BattleUnit target)
+    {
+        cameraRig.focus = actor.transform; cameraRig.focusWeight = .85f; cameraRig.distance = 22; cameraRig.tilt = 45;
+        foreach (var unit in Party.Concat(Enemies)) if (unit.gameObject.activeInHierarchy) unit.Appearance.Show(unit == actor || unit == target ? 1 : .3f, unit.IsParty && !unit.Alive);
+        foreach (var cover in Layout.cover) if (cover != null) cover.GetComponent<BattleAppearance>().Show(.3f);
+    }
+    public IEnumerator Wait(float duration)
+    { float elapsed = 0; while (elapsed < duration) { if (!BattleSession.MenuOpen) elapsed += Time.deltaTime * SequenceSpeed; yield return null; } }
+    public void Popup(Vector3 at, string text, Color color)
+    { var popup = Instantiate(settings.popup, at + Vector3.up * 2.8f, Quaternion.identity); popup.text.text = text; popup.text.color = color; }
+    static void PlaySound(AudioClip clip, Vector3 at, float volume = 1) => DungeonAudio.Play(clip, at, volume);
+    public void Impact(Vector3 at)
+    { if (settings.impact != null) { var effect = Instantiate(settings.impact, at, Quaternion.identity); Destroy(effect, 1.5f); } PlaySound(settings.hitSound, at, .35f); }
+    void AreaEffect(Vector3 point, float radius, Color color, float duration = 1)
+    {
+        if (settings.areaEffect == null) return;
+        var effect = Instantiate(settings.areaEffect, point + Vector3.up * .12f, Quaternion.identity);
+        var visual = effect.GetComponent<BattleEffectVisual>(); visual.SetSize(Vector3.one * radius); visual.lifetime = duration;
+        foreach (var line in effect.GetComponentsInChildren<LineRenderer>()) line.startColor = line.endColor = color;
+    }
+    public void RefreshHUD() => hud.Refresh(this, round);
+    public void RebuildGround() { Physics.SyncTransforms(); Layout.surface.BuildNavMesh(); }
+    public void CheckEnd()
+    {
+        if (!Ready || Phase == BattlePhase.Victory || Phase == BattlePhase.GameOver) return;
+        if (Party.All(p => !p.Alive))
+        { StopChargeAudio(); StopAllCoroutines(); Phase = BattlePhase.GameOver; resolving = false; hud.ShowGameOver(); PlaySound(settings.gameOverSound, cameraRig.view.transform.position); return; }
+        if (Enemies.Any(e => e.Alive)) return;
+        StopChargeAudio(); StopAllCoroutines(); Phase = BattlePhase.Victory; resolving = false;
+        int experience = Enemies.Sum(e => e.enemy.experience);
+        var beforeLevels = Party.Select(p => p.character.CurrentLevel).ToArray(); var beforeExp = Party.Select(p => p.character.CurrentExp).ToArray();
+        foreach (var p in Party) p.character.GainExperience(experience);
+        hud.ShowVictory(this, experience, beforeLevels, beforeExp); PlaySound(settings.victorySound, cameraRig.view.transform.position);
+    }
+    public void DefeatAllEnemies() { foreach (var enemy in Enemies) { enemy.HP = 0; enemy.Refresh(); } CheckEnd(); }
+    public void ReturnFromBattle() { if (Phase == BattlePhase.Victory) BattleSession.Instance.Finish(true); }
+    public static float FlatDistance(Vector3 a, Vector3 b) { a.y = b.y = 0; return Vector3.Distance(a, b); }
+    public BattleUnit ClosestEnemy(Vector3 position, float range) => Enemies.Where(e => e.Alive && FlatDistance(e.transform.position, position) <= range).OrderBy(e => FlatDistance(e.transform.position, position)).FirstOrDefault();
+    void DrawCircle(LineRenderer line, Vector3 centre, float radius, Color color, bool visible)
+    {
+        var area = line == movementCircle ? movementArea : skillArea;
+        if (visible) area?.Show(centre, radius); else area?.Hide();
+        if (line == aimCircle) color = new Color(1, .18f, .2f);
+        line.enabled = visible; if (!visible) return; line.startColor = line.endColor = color; line.positionCount = 65;
+        for (int i = 0; i <= 64; i++) line.SetPosition(i, centre + new Vector3(Mathf.Sin(i * Mathf.PI / 32) * radius, .07f, Mathf.Cos(i * Mathf.PI / 32) * radius));
+    }
+    void DrawArc(Vector3 origin, float radius, float yaw)
+    {
+        skillArea?.Show(origin, radius, yaw, 180);
+        aimCircle.enabled = true; aimCircle.positionCount = 35; aimCircle.startColor = aimCircle.endColor = new Color(1, .18f, .2f);
+        aimCircle.SetPosition(0, origin + Vector3.up * .1f);
+        for (int i = 0; i <= 32; i++) aimCircle.SetPosition(i + 1, origin + Quaternion.Euler(0, yaw - 90 + i * 180f / 32, 0) * Vector3.forward * radius + Vector3.up * .1f);
+        aimCircle.SetPosition(34, origin + Vector3.up * .1f);
+    }
+    void HideAim() { aimCircle.enabled = false; skillArea?.Hide(); }
+    public static void OpenBossDialogue(EncounterEnemy boss) => BattleBossDialogue.Instance?.Open(boss);
+}

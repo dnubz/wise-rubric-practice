@@ -1,0 +1,123 @@
+using System.Collections;
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+using System.IO;
+
+public class SaveSlotUI : MonoBehaviour
+{
+    [System.Serializable] public sealed class Slot
+    {
+        public Button select, delete;
+        public TMP_Text name, level, playtime, location;
+    }
+    [SerializeField] Slot[] slots;
+    [SerializeField] GameObject confirmation;
+    [SerializeField] TMP_Text confirmationText, status;
+    [SerializeField] Button confirmDelete, cancelDelete;
+    int deletingSlot = -1;
+    bool loading;
+
+    void Awake()
+    {
+        for (int i = 0; slots != null && i < slots.Length; i++)
+        {
+            int index = i;
+            slots[i].select.onClick.AddListener(() => SelectSlot(index));
+            slots[i].delete.onClick.AddListener(() => RequestDelete(index));
+        }
+        if (confirmDelete != null) confirmDelete.onClick.AddListener(ConfirmDelete);
+        if (cancelDelete != null) cancelDelete.onClick.AddListener(CancelDelete);
+        CancelDelete();
+        if (!GameSave.TryImportLegacySave(out string error) && status != null) status.text = error;
+        Refresh();
+    }
+    void OnEnable() { GameSave.SavesChanged += Refresh; }
+    void OnDisable() { GameSave.SavesChanged -= Refresh; }
+    public void Refresh()
+    {
+        for (int i = 0; slots != null && i < slots.Length; i++)
+        {
+            var row = slots[i]; bool exists = File.Exists(GameSave.SlotPath(i));
+            bool valid = GameSave.TryReadSlot(i, out var data, out _);
+            row.name.text = "Slot " + (i + 1);
+            row.level.text = valid ? "LV " + data.party[data.activeCharacter].level : "";
+            row.playtime.text = valid ? "Play time: " + FormatPlaytime(data.playSeconds) : exists ? "Unreadable save" : "Empty - start a new game";
+            row.location.text = valid ? data.inDungeon ? "Dungeon" : "Overworld" : "";
+            row.delete.gameObject.SetActive(exists); row.select.interactable = !exists || valid;
+        }
+    }
+    public static string FormatPlaytime(float seconds)
+    {
+        int minutes = Mathf.FloorToInt(seconds / 60);
+        return minutes / 60 + "h " + (minutes % 60).ToString("00") + "m";
+    }
+    public void SelectSlot(int slot)
+    {
+        if (loading || deletingSlot >= 0 || SceneTravelFade.IsTransitioning) return;
+        string error;
+        bool started = File.Exists(GameSave.SlotPath(slot)) ? GameSave.TryLoadSlot(slot, out error, LoadFailed) :
+            GameSave.TryStartNewGame(slot, out error, LoadFailed);
+        if (!started) { LoadFailed(error); return; }
+        loading = true;
+    }
+    void LoadFailed(string error) { loading = false; if (status != null) status.text = error; }
+    public void RequestDelete(int slot)
+    {
+        if (loading || SceneTravelFade.IsTransitioning || !File.Exists(GameSave.SlotPath(slot))) return;
+        deletingSlot = slot;
+        confirmationText.text = "Delete Slot " + (slot + 1) + "?\nAll progress in this slot will be lost.";
+        confirmation.SetActive(true); cancelDelete.Select();
+    }
+    public void ConfirmDelete()
+    {
+        if (deletingSlot < 0 || SceneTravelFade.IsTransitioning) return;
+        if (!GameSave.TryDeleteSlot(deletingSlot, out string error)) { confirmationText.text = error; return; }
+        CancelDelete(); Refresh();
+    }
+    public void CancelDelete() { deletingSlot = -1; if (confirmation != null) confirmation.SetActive(false); }
+    public GameObject mainMenu;
+    public GameObject saveSlots;
+    public GameObject title;
+
+    public ParticleSystem launchParticle;
+    public float delaySeconds = 2.0f;
+    public Button playButton;
+
+    public void OnPlayButtonPressed()
+    {
+        StartCoroutine(PlayParticleAndOpenRoutine());
+    }
+
+    private IEnumerator PlayParticleAndOpenRoutine()
+    {
+        if (playButton != null)
+            playButton.interactable = false;
+
+        if (launchParticle != null)
+            launchParticle.Play();
+
+        yield return new WaitForSeconds(delaySeconds);
+
+        OpenSaveSlots();
+
+        if (playButton != null)
+            playButton.interactable = true;
+    }
+
+    public void OpenSaveSlots()
+    {
+        Refresh();
+        if (mainMenu != null) mainMenu.SetActive(false);
+        if (saveSlots != null) saveSlots.SetActive(true);
+        if (title != null) title.SetActive(false);
+    }
+
+    public void BackToMainMenu()
+    {
+        CancelDelete();
+        if (saveSlots != null) saveSlots.SetActive(false);
+        if (mainMenu != null) mainMenu.SetActive(true);
+        if (title != null) title.SetActive(true);
+    }
+}

@@ -1,0 +1,12 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public sealed class BattleWorldUI : MonoBehaviour
+{
+    public BattleUnit target;
+    public Image fill;
+    public TMP_Text value;
+    public void Refresh() { if (target == null) return; fill.fillAmount = (float)target.CurrentHP / target.MaxHP; value.text = target.CurrentHP + "/" + target.MaxHP; }
+    void LateUpdate() { if (Camera.main != null) transform.rotation = Camera.main.transform.rotation; }
+}

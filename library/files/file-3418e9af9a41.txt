@@ -1,0 +1,144 @@
+using System;
+using System.IO;
+using System.Linq;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DungeonPolishSetup
+{
+    public const float SkeletonHeight = 5.2f;
+    const string Folder = "Temp/DungeonPolish";
+    static double next;
+    static DungeonPolishSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        if (EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = false; return; }
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved Dungeon arrival title/audio, coin pickup audio and imported skeleton prefab."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", "FAIL: " + error); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Dungeon/Set Up Arrival and Skeleton")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        AssetDatabase.Refresh();
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        settings.areaEnterSound = Clip("DS3 New Area sound effect");
+        settings.coinPickupSound = DungeonTravelFeedbackSetup.ImmediateClip("Collect Coin Sound Effect", "Coin Pickup Immediate");
+        settings.areaTitlePrefab = BuildTitle();
+        EditorUtility.SetDirty(settings); AssetDatabase.SaveAssetIfDirty(settings);
+        const string path = "Assets/Resources/Battle/Skeleton.prefab";
+        var root = PrefabUtility.LoadPrefabContents(path);
+        try
+        {
+            var motion = root.GetComponent<BattleEnemyMotion>();
+            if (motion.visual != null) Object.DestroyImmediate(motion.visual.gameObject);
+            var visual = new GameObject("Visual"); visual.transform.SetParent(root.transform, false);
+            AttachSkeleton(visual.transform);
+            motion.visual = visual.transform; motion.leftLeg = motion.rightLeg = motion.weaponArm = null;
+            FitSkeletonCollider(root);
+            PrefabUtility.SaveAsPrefabAsset(root, path);
+        }
+        finally { PrefabUtility.UnloadPrefabContents(root); }
+    }
+    static AudioClip Clip(string name)
+    {
+        string path = "Assets/Imported Assets/Audio/SFX/Dungeon/" + name + ".mp3";
+        var importer = (AudioImporter)AssetImporter.GetAtPath(path);
+        var sample = importer.defaultSampleSettings;
+        sample.loadType = AudioClipLoadType.DecompressOnLoad;
+        sample.preloadAudioData = true;
+        importer.defaultSampleSettings = sample; importer.SaveAndReimport();
+        return AssetDatabase.LoadAssetAtPath<AudioClip>(path) ?? throw new Exception("Missing sound: " + path);
+    }
+    public static void AttachSkeleton(Transform parent)
+    {
+        const string sourcePath = "Assets/Imported Assets/skeleton/source/skeleton.fbx";
+        var source = AssetDatabase.LoadAssetAtPath<GameObject>(sourcePath);
+        if (source == null) throw new Exception("Downloaded skeleton model missing.");
+        var model = (GameObject)PrefabUtility.InstantiatePrefab(source);
+        model.name = "Imported Skeleton"; model.transform.SetParent(parent, false);
+        foreach (var collider in model.GetComponentsInChildren<Collider>(true)) Object.DestroyImmediate(collider);
+        foreach (var camera in model.GetComponentsInChildren<Camera>(true)) Object.DestroyImmediate(camera);
+        foreach (var light in model.GetComponentsInChildren<Light>(true)) Object.DestroyImmediate(light);
+        var renderers = model.GetComponentsInChildren<Renderer>();
+        if (renderers.Length == 0) throw new Exception("Skeleton has no rendered model.");
+        Bounds bounds = renderers[0].bounds;
+        foreach (var renderer in renderers.Skip(1)) bounds.Encapsulate(renderer.bounds);
+        model.transform.localScale *= SkeletonHeight / Mathf.Max(.001f, bounds.size.y);
+        bounds = renderers[0].bounds;
+        foreach (var renderer in renderers.Skip(1)) bounds.Encapsulate(renderer.bounds);
+        model.transform.position += parent.position - new Vector3(bounds.center.x, bounds.min.y, bounds.center.z);
+        const string materialPath = "Assets/Resources/Battle/ImportedSkeleton.mat";
+        var material = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+        if (material == null) { material = new Material(Shader.Find("Universal Render Pipeline/Lit")); AssetDatabase.CreateAsset(material, materialPath); }
+        material.SetColor("_BaseColor", Color.white);
+        material.SetTexture("_BaseMap", Texture("skeletonColor"));
+        const string normalPath = "Assets/Imported Assets/skeleton/textures/skeletonNormal.png";
+        var normalImporter = (TextureImporter)AssetImporter.GetAtPath(normalPath);
+        if (normalImporter.textureType != TextureImporterType.NormalMap)
+        { normalImporter.textureType = TextureImporterType.NormalMap; normalImporter.SaveAndReimport(); }
+        material.SetTexture("_BumpMap", Texture("skeletonNormal")); material.EnableKeyword("_NORMALMAP");
+        material.SetTexture("_OcclusionMap", Texture("skeletonAO")); material.EnableKeyword("_OCCLUSIONMAP");
+        material.SetFloat("_Smoothness", .22f); material.SetFloat("_Metallic", 0);
+        EditorUtility.SetDirty(material); AssetDatabase.SaveAssetIfDirty(material);
+        foreach (var renderer in renderers) renderer.sharedMaterials = renderer.sharedMaterials.Select(_ => material).ToArray();
+        foreach (var child in parent.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 11;
+        Directory.CreateDirectory(Folder);
+        File.WriteAllText(Folder + "/skeleton-import.txt", "Source: " + sourcePath + "\nRenderers: " + renderers.Length +
+            "\nHeight: " + bounds.size.y + "\nClips: " + AssetDatabase.LoadAllAssetsAtPath(sourcePath).OfType<AnimationClip>().Count());
+    }
+    public static void FitSkeletonCollider(GameObject root)
+    {
+        var collider = root.GetComponent<CapsuleCollider>();
+        collider.height = SkeletonHeight; collider.center = Vector3.up * SkeletonHeight * .5f; collider.radius = .8f;
+        var agent = root.GetComponent<UnityEngine.AI.NavMeshAgent>(); agent.height = SkeletonHeight; agent.radius = .8f;
+    }
+    static Texture2D Texture(string name) => AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Imported Assets/skeleton/textures/" + name + ".png");
+    static DungeonAreaTitle BuildTitle()
+    {
+        var root = new GameObject("DungeonAreaTitle", typeof(RectTransform), typeof(Canvas), typeof(CanvasScaler), typeof(CanvasGroup));
+        try
+        {
+            var canvas = root.GetComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = 95;
+            var scaler = root.GetComponent<CanvasScaler>(); scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1280, 720); scaler.matchWidthOrHeight = .5f;
+            var group = root.GetComponent<CanvasGroup>(); group.alpha = 0; group.blocksRaycasts = false; group.interactable = false;
+            var band = Rect("Title Band", root.transform, new Vector2(1280, 105), Vector2.zero);
+            var shade = band.gameObject.AddComponent<Image>(); shade.color = new Color(0, 0, 0, .18f); shade.raycastTarget = false;
+            var label = Rect("Dungeon", band, new Vector2(800, 85), new Vector2(0, 10)).gameObject.AddComponent<TextMeshProUGUI>();
+            label.text = "Dungeon"; label.font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>("Assets/Fonts/MedievalSharp/MedievalSharp-Regular SDF.asset");
+            label.fontSize = 60; label.alignment = TextAlignmentOptions.Center; label.color = Color.white;
+            label.raycastTarget = false;
+            const string titleMaterialPath = "Assets/Resources/Dungeon/AreaTitleText.mat";
+            var titleMaterial = AssetDatabase.LoadAssetAtPath<Material>(titleMaterialPath);
+            if (titleMaterial == null) { titleMaterial = new Material(label.font.material); AssetDatabase.CreateAsset(titleMaterial, titleMaterialPath); }
+            // The dialogue font material may have a heavy face dilation; the
+            // area heading uses its own clean, thin text without changing that style.
+            titleMaterial.SetFloat("_FaceDilate", 0); titleMaterial.SetFloat("_ScaleRatioA", 1);
+            titleMaterial.SetFloat("_OutlineWidth", .015f); titleMaterial.SetColor("_OutlineColor", new Color(0, 0, 0, .8f));
+            EditorUtility.SetDirty(titleMaterial); AssetDatabase.SaveAssetIfDirty(titleMaterial);
+            label.fontSharedMaterial = titleMaterial;
+            var line = Rect("Fine Underline", band, new Vector2(700, 1), new Vector2(0, -32)).gameObject.AddComponent<Image>();
+            line.color = new Color(1, 1, 1, .85f); line.raycastTarget = false;
+            var cue = root.AddComponent<AudioSource>(); cue.playOnAwake = false; cue.spatialBlend = 0;
+            var controller = root.AddComponent<DungeonAreaTitle>(); var data = new SerializedObject(controller);
+            data.FindProperty("group").objectReferenceValue = group; data.FindProperty("cue").objectReferenceValue = cue;
+            data.ApplyModifiedPropertiesWithoutUndo();
+            return PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Dungeon/DungeonAreaTitle.prefab").GetComponent<DungeonAreaTitle>();
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static RectTransform Rect(string name, Transform parent, Vector2 size, Vector2 position)
+    {
+        var rect = (RectTransform)new GameObject(name, typeof(RectTransform)).transform;
+        rect.SetParent(parent, false); rect.sizeDelta = size; rect.anchoredPosition = position; return rect;
+    }
+}

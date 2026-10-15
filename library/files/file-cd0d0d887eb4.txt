@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+/// <summary>Checks the real chest meshes/collision and map mask without changing the player's scene.</summary>
+[InitializeOnLoad]
+public static class DungeonPolishChecks
+{
+    const string Folder = "Temp/DungeonPolish";
+    static double nextCheck;
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static DungeonPolishChecks() { EditorApplication.update += CheckRequest; }
+    static void CheckRequest()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: complex seeded layouts, closed/open chest renders, solid chest collision, circular minimap mask, hidden controls and yellow/red key colours."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Validate Dungeon Polish")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        DungeonGenerationChecks.Run();
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings.minimumRooms < settings.maximumRooms && settings.floorTileSize == 6, "Updated dungeon settings are missing.");
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var owned = new GameObject("DungeonPolishCheck"); SceneManager.MoveGameObjectToScene(owned, scene);
+        RenderTexture target = null;
+        try
+        {
+            var generator = owned.AddComponent<DungeonGenerator>();
+            typeof(DungeonGenerator).GetField("settings", Private).SetValue(generator, settings);
+            var room = new GameObject("ChestPreviewRoom"); room.transform.SetParent(owned.transform);
+            ((List<GameObject>)typeof(DungeonGenerator).GetField("roomRoots", Private).GetValue(generator)).Add(room);
+            MethodInfo create = typeof(DungeonGenerator).GetMethod("CreateChest", Private);
+            Type kind = create.GetParameters()[3].ParameterType;
+            create.Invoke(generator, new object[] { 0, Vector3.zero, DungeonKeyKind.None, Enum.Parse(kind, "Treasure") });
+            Transform chest = room.transform.Find("TreasureChest");
+            var bodyRenderer = chest.Find("Body").GetComponentInChildren<Renderer>();
+            var topRenderer = chest.Find("LidHinge").GetComponentInChildren<Renderer>();
+            Require(topRenderer.bounds.min.y < bodyRenderer.bounds.max.y && topRenderer.bounds.max.y > bodyRenderer.bounds.max.y,
+                "Closed lid does not cover the chest rim.");
+            Require(Mathf.Abs(topRenderer.bounds.center.x - bodyRenderer.bounds.center.x) < .01f, "Closed lid is not centred.");
+            BoxCollider blocker = chest.GetComponent<BoxCollider>();
+            Require(blocker != null && blocker.enabled && !blocker.isTrigger, "Chest lacks a solid blocker.");
+            foreach (Transform child in owned.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+            var probe = new GameObject("CollisionProbe"); probe.transform.SetParent(owned.transform);
+            var controller = probe.AddComponent<CharacterController>(); controller.center = Vector3.up;
+            controller.excludeLayers = ~(1 << 30);
+            controller.height = 2; controller.radius = .4f; controller.stepOffset = .3f;
+            probe.transform.position = new Vector3(-5, .05f, blocker.bounds.center.z);
+            Physics.SyncTransforms();
+            for (int i = 0; i < 48; i++) controller.Move(Vector3.right * .25f);
+            Require(probe.transform.position.x < blocker.bounds.min.x, "Player walks through chest.");
+            Object.DestroyImmediate(probe);
+
+            var lightObject = new GameObject("PreviewLight"); lightObject.transform.SetParent(owned.transform);
+            Light light = lightObject.AddComponent<Light>(); light.type = LightType.Directional; light.intensity = 2;
+            light.cullingMask = 1 << 30; lightObject.transform.rotation = Quaternion.Euler(45, -35, 0);
+            var cameraObject = new GameObject("PreviewCamera"); cameraObject.transform.SetParent(owned.transform);
+            Camera camera = cameraObject.AddComponent<Camera>(); camera.cullingMask = 1 << 30;
+            camera.orthographic = true; camera.orthographicSize = 3.3f;
+            camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.12f, .14f, .17f);
+            camera.transform.position = new Vector3(5, 4.5f, 6); camera.transform.LookAt(new Vector3(0, .9f, 0));
+            target = new RenderTexture(600, 600, 24); camera.targetTexture = target;
+            Capture(camera, target, Folder + "/chest-closed.png");
+            chest.Find("LidHinge").localRotation = Quaternion.Euler(-85, 0, 0);
+            Capture(camera, target, Folder + "/chest-open.png");
+
+            var naming = new BerdlyChemistry(0, Resources.Load<TextAsset>("BerdlyNaming/alkane").text,
+                Resources.Load<TextAsset>("BerdlyNaming/alkyl").text, Resources.Load<TextAsset>("BerdlyNaming/prefix").text);
+            var layout = DungeonLayout.Generate(24681, DungeonLayout.ChooseRoomCount(24681, settings.minimumRooms, settings.maximumRooms), 36, 42, naming);
+            typeof(DungeonGenerator).GetField("<Layout>k__BackingField", Private).SetValue(generator, layout);
+            var hud = new GameObject("MapCheck", typeof(RectTransform)); hud.transform.SetParent(owned.transform);
+            Canvas canvas = hud.AddComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera;
+            canvas.planeDistance = 1;
+            var scaler = hud.AddComponent<CanvasScaler>(); scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1280, 720);
+            var map = hud.AddComponent<DungeonMinimap>(); map.Initialize(generator, hud.transform); map.RevealAllRooms(); map.Visit(layout.SpawnRoom);
+            Mask mask = hud.GetComponentInChildren<Mask>();
+            Require(mask != null && mask.GetComponent<Image>().sprite != null, "Circular minimap mask is missing.");
+            foreach (Transform child in hud.GetComponentsInChildren<Transform>(true)) { Require(child.name != "Controls", "Map control hint remains."); child.gameObject.layer = 30; }
+            room.SetActive(false); Canvas.ForceUpdateCanvases();
+            Capture(camera, target, Folder + "/minimap-circle.png");
+            var mapTexture = typeof(DungeonMinimap).GetField("texture", Private).GetValue(map) as Texture2D;
+            if (mapTexture != null) Object.DestroyImmediate(mapTexture);
+            Require(DungeonKeyHud.KeyColour(DungeonKeyKind.Boss).r > .9f && DungeonKeyHud.KeyColour(DungeonKeyKind.Boss).g < .2f, "Boss key is not red.");
+            File.WriteAllText(Folder + "/layout.txt", layout.Name + "\n" + layout.Rooms.Count + " rooms; longest chain " + layout.Chains[0].Count);
+        }
+        finally
+        {
+            Object.DestroyImmediate(owned);
+            if (target != null) Object.DestroyImmediate(target);
+            SceneManager.SetActiveScene(original);
+            UnityEditor.SceneManagement.EditorSceneManager.CloseScene(scene, true);
+        }
+    }
+
+    static void Capture(Camera camera, RenderTexture target, string path)
+    {
+        camera.Render(); RenderTexture previous = RenderTexture.active; RenderTexture.active = target;
+        var image = new Texture2D(target.width, target.height, TextureFormat.RGB24, false);
+        image.ReadPixels(new Rect(0, 0, target.width, target.height), 0, 0); image.Apply();
+        File.WriteAllBytes(path, image.EncodeToPNG()); RenderTexture.active = previous; Object.DestroyImmediate(image);
+    }
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

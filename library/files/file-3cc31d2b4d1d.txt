@@ -1,0 +1,198 @@
+using UnityEngine;
+using UnityEngine.AI;
+
+[RequireComponent(typeof(NavMeshAgent), typeof(BattleAppearance))]
+public sealed class BattleUnit : MonoBehaviour
+{
+    public CharacterBase character;
+    public BattleEnemyData enemy;
+    public int characterIndex, HP, AP, shields, stun, dodgeTurns, magicBuffTurns;
+    public float magicBuff, moveRange;
+    public bool variant, movementLocked, portal;
+    public Vector3 moveOrigin;
+    public NavMeshAgent Agent { get; private set; }
+    public BattleAppearance Appearance { get; private set; }
+    public BattleWorldUI HealthUI { get; private set; }
+    public BattleDragonCompanion Dragon { get; private set; }
+    public int CurrentHP => character != null ? character.GetCurrHP() : HP;
+    public int MaxHP => character != null ? character.GetMaxHP() : enemy.hp;
+    public int Attack => character != null ? character.GetTotalAttack() : enemy.attack;
+    public int Defense => character != null ? character.GetTotalDefense() : enemy.defense;
+    public bool Alive => CurrentHP > 0;
+    public bool IsParty => character != null;
+    public float AttackRange => enemy != null ? enemy.attackRange : 3;
+    public string DisplayName => character != null ? character.characterData.displayName : enemy.displayName + (variant ? " Veteran" : "");
+    Animator animator;
+    Collider hitbox;
+    bool wasAlive;
+    BattleStatusVisual status;
+    public void Begin(BattleSettings settings)
+    {
+        Agent = GetComponent<NavMeshAgent>(); Appearance = GetComponent<BattleAppearance>();
+        animator = GetComponentInChildren<Animator>(); hitbox = GetComponent<CapsuleCollider>();
+        if (IsParty && characterIndex == 0 && settings.dragon != null)
+        {
+            var dragon = Instantiate(settings.dragon);
+            dragon.transform.SetParent(transform, true);
+            Dragon = dragon.AddComponent<BattleDragonCompanion>(); Dragon.Bind(this);
+        }
+        Appearance.Prepare();
+        if (IsParty) FitBattleHitbox();
+        Agent.enabled = true; Agent.speed = settings.walkSpeed; Agent.angularSpeed = 540; Agent.stoppingDistance = .1f;
+        Agent.obstacleAvoidanceType = ObstacleAvoidanceType.NoObstacleAvoidance;
+        if (Agent.isOnNavMesh) HoldPosition();
+        if (enemy != null) HP = enemy.hp;
+        moveRange = IsParty ? settings.characterMovement[characterIndex] : enemy.movementRange;
+        AP = 2; shields = stun = dodgeTurns = magicBuffTurns = 0; magicBuff = 0; portal = false; movementLocked = false;
+        if (HealthUI == null && !IsParty && settings.worldUI != null) { HealthUI = Instantiate(settings.worldUI, transform); HealthUI.target = this; }
+        if (!IsParty && enemy.kind == BattleEnemyKind.Skeleton && HealthUI != null && hitbox is CapsuleCollider skeletonBody)
+            HealthUI.transform.localPosition = Vector3.up * (skeletonBody.center.y + skeletonBody.height * .5f + .7f);
+        Appearance.Show(1, !Alive && IsParty); wasAlive = Alive; Refresh(); ResetMovement();
+        if (IsParty && settings.statusEffect != null)
+        {
+            if (status != null) Destroy(status.gameObject);
+            status = Instantiate(settings.statusEffect, transform).GetComponent<BattleStatusVisual>();
+            // Imported character models use different scales; effects stay the same world size.
+            Vector3 modelScale = transform.lossyScale;
+            status.transform.localScale = new Vector3(1 / Mathf.Max(.001f, Mathf.Abs(modelScale.x)), 1 / Mathf.Max(.001f, Mathf.Abs(modelScale.y)), 1 / Mathf.Max(.001f, Mathf.Abs(modelScale.z)));
+            status.Bind(this);
+        }
+    }
+    public void FitBattleHitbox()
+    {
+        var capsule = GetComponent<CapsuleCollider>();
+        if (capsule == null) return;
+        Vector3 modelScale = transform.lossyScale;
+        float heightScale = Mathf.Max(.001f, Mathf.Abs(modelScale.y));
+        float widthScale = Mathf.Max(.001f, Mathf.Abs(modelScale.x), Mathf.Abs(modelScale.z));
+        capsule.direction = 1; capsule.center = Vector3.up * (1.5f / heightScale);
+        capsule.height = 3 / heightScale; capsule.radius = .6f / widthScale;
+    }
+    public void ClearEffects()
+    {
+        if (status != null) Destroy(status.gameObject); status = null;
+        if (Dragon != null) Destroy(Dragon.gameObject); Dragon = null;
+    }
+    public void StartTurn()
+    {
+        AP = 2; ResetMovement();
+        if (IsParty) character.AdvanceBattleCooldowns();
+        if (magicBuffTurns > 0 && --magicBuffTurns == 0) magicBuff = 0;
+        if (dodgeTurns > 0) dodgeTurns--;
+    }
+    public void ResetMovement() { moveOrigin = transform.position; movementLocked = false; }
+    public void HoldPosition()
+    {
+        if (Agent == null || !Agent.enabled || !Agent.isOnNavMesh) return;
+        Agent.ResetPath(); Agent.isStopped = true; Agent.velocity = Vector3.zero;
+    }
+    public bool Move(Vector3 velocity, float delta)
+    {
+        if (!Alive || movementLocked || Agent == null || !Agent.isOnNavMesh) return false;
+        velocity.y = 0;
+        Vector3 previous = transform.position;
+        Vector3 next = LimitMovementStep(previous, velocity * Mathf.Max(0, delta));
+        Vector3 requestedStep = next - previous; requestedStep.y = 0;
+        if (requestedStep.sqrMagnitude > .00000001f && Agent.Raycast(next, out var edge))
+        {
+            // Stop just inside the wall along the input ray. Warping onto the
+            // exact NavMesh edge can snap sideways onto a neighbouring polygon.
+            float travel = Mathf.Clamp(Vector3.Dot(edge.position - previous, requestedStep.normalized) - .005f,
+                0, requestedStep.magnitude);
+            next = previous + requestedStep.normalized * travel;
+        }
+        // Manual player movement is immediate; only the active enemy follows an agent path.
+        HoldPosition();
+        if ((next - previous).sqrMagnitude > .00000001f) Agent.Warp(next);
+        Vector3 step = transform.position - previous; step.y = 0;
+        Animate("Run", step.magnitude > .005f ? 1 : 0);
+        // Face the requested direction even when movement is blocked.
+        if (velocity.sqrMagnitude > .0001f) transform.rotation = Quaternion.LookRotation(velocity, Vector3.up);
+        return step.sqrMagnitude > .00001f;
+    }
+    Vector3 LimitMovementStep(Vector3 previous, Vector3 step)
+    {
+        step.y = 0;
+        Vector3 offset = previous - moveOrigin; offset.y = 0;
+        float radius = Mathf.Max(0, moveRange);
+        if ((offset + step).sqrMagnitude <= radius * radius) return previous + step;
+        // Intersect the requested straight segment with the movement circle.
+        // Radially projecting the destination instead adds an unwanted lateral step.
+        float a = step.sqrMagnitude;
+        if (a <= .00000001f) return previous;
+        float b = Vector3.Dot(offset, step), c = offset.sqrMagnitude - radius * radius;
+        float discriminant = b * b - a * c;
+        if (discriminant < 0) return previous;
+        float fraction = Mathf.Clamp01((-b + Mathf.Sqrt(discriminant)) / a);
+        return previous + step * fraction;
+    }
+    Vector3 ClampMovement(Vector3 next)
+    {
+        Vector3 offset = next - moveOrigin; offset.y = 0;
+        if (offset.sqrMagnitude <= moveRange * moveRange) return next;
+        Vector3 limited = moveOrigin + offset.normalized * moveRange;
+        limited.y = next.y;
+        return limited;
+    }
+    public void PullTowards(Vector3 point, float distance)
+    {
+        if (!Alive || distance <= 0 || Agent == null || !Agent.enabled || !Agent.isOnNavMesh) return;
+        Vector3 previous = transform.position;
+        Vector3 next = Vector3.MoveTowards(previous, point, distance);
+        if (Agent.Raycast(next, out var edge)) next = edge.position;
+        HoldPosition();
+        if (Agent.Warp(next))
+        {
+            // Forced displacement carries the existing movement budget with it.
+            // Otherwise LateUpdate snaps enemies back when the cast ends.
+            moveOrigin += transform.position - previous;
+        }
+    }
+    public int Damage(int rawAttack, float scale = 1)
+    {
+        if (!Alive) return 0;
+        if (shields > 0) { shields--; BattleController.Instance?.Popup(transform.position, "BLOCK", Color.cyan); Refresh(); return 0; }
+        int value = Mathf.Max(1, Mathf.RoundToInt((rawAttack - Defense) * scale));
+        if (IsParty) character.TakeDamage(value); else HP = Mathf.Max(0, HP - value);
+        BattleController.Instance?.Popup(transform.position, value.ToString(), new Color(1, .3f, .3f)); Refresh(); return value;
+    }
+    public void Heal(int amount, bool sp = false)
+    {
+        if (!IsParty || !Alive) return;
+        int before = sp ? character.GetCurrSP() : CurrentHP;
+        if (sp) character.RestoreSP(amount); else character.Heal(amount);
+        int restored = (sp ? character.GetCurrSP() : CurrentHP) - before;
+        if (restored > 0) BattleController.Instance?.Popup(transform.position, "+" + restored + (sp ? " SP" : ""), sp ? Color.cyan : Color.green);
+        Refresh();
+    }
+    public void Refresh()
+    {
+        if (Appearance == null) return;
+        if (hitbox != null) hitbox.enabled = Alive;
+        if (Dragon != null) Dragon.gameObject.SetActive(Alive);
+        if (!Alive) { if (Agent.enabled && Agent.isOnNavMesh) Agent.isStopped = true; if (animator != null) animator.enabled = false; Appearance.Show(1, IsParty); if (!IsParty) gameObject.SetActive(false); }
+        else if (!wasAlive) { if (animator != null) animator.enabled = true; if (Agent.isOnNavMesh) Agent.isStopped = false; Appearance.Show(); ResetMovement(); }
+        wasAlive = Alive; HealthUI?.Refresh();
+        if (BattleController.Instance != null && BattleController.Instance.Ready) BattleController.Instance.RefreshHUD();
+    }
+    void LateUpdate()
+    {
+        if (!Alive || Agent == null || !Agent.enabled || !Agent.isOnNavMesh || BattleController.Instance == null) return;
+        if (BattleSession.MenuOpen) { Agent.isStopped = true; return; }
+        if (BattleController.Instance.Phase != BattlePhase.Player && BattleController.Instance.Phase != BattlePhase.Enemy) return;
+        Vector3 offset = transform.position - moveOrigin; offset.y = 0;
+        if (offset.magnitude > moveRange)
+        {
+            Vector3 next = ClampMovement(transform.position);
+            if (Agent.Raycast(next, out var edge)) next = edge.position;
+            Agent.Warp(next); if (Agent.hasPath) Agent.ResetPath();
+        }
+    }
+    public void Animate(string state, float speed = -1)
+    {
+        if (state == "BattleAttack") GetComponent<BattleEnemyMotion>()?.Strike();
+        if (animator == null || !animator.enabled) return;
+        if (speed >= 0) foreach (var parameter in animator.parameters) if (parameter.name == "Speed") animator.SetFloat("Speed", speed * 5);
+        if (speed < 0 && animator.HasState(0, Animator.StringToHash("Base Layer." + state))) animator.CrossFadeInFixedTime(state, .08f);
+    }
+}

@@ -1,0 +1,26 @@
+using UnityEngine;
+
+public class WorldItem : MonoBehaviour
+{
+    [SerializeField] Item item;
+
+    public void SetItem(Item newItem)
+    {
+        item = newItem;
+    }
+
+    void OnTriggerEnter(Collider other)
+    {
+        Inventory inventory =
+            other.GetComponentInParent<Inventory>();
+
+        if (inventory == null)
+            return;
+
+        inventory.AddItem(item);
+
+        Debug.Log("COLLECTED: " + item.ItemName);
+
+        Destroy(gameObject);
+    }
+}

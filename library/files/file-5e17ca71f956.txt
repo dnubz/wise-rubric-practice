@@ -1,0 +1,184 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text.RegularExpressions;
+
+public enum PinkJudgement { Perfect, Great, Good, Ok, Bad, Miss }
+
+public sealed class PinkBeatmap
+{
+    public struct Note
+    {
+        public int Key; // 0 = W, 1 = A, 2 = S, 3 = D, shared with the future healer game.
+        public double Start, End;
+        public bool IsHold => End > Start;
+    }
+
+    public double AudioStartSeconds { get; private set; }
+    public Note[] Notes { get; private set; }
+    static readonly Regex Tap = new Regex(@"^([1-4])\s+t=(\d+)$");
+    static readonly Regex Hold = new Regex(@"^([1-4])\s+t_start=(\d+)\s+t_end=(\d+)$");
+
+    public static PinkBeatmap Parse(string text)
+    {
+        if (text == null) throw new ArgumentNullException(nameof(text));
+        double offset = -1;
+        int declared = -1;
+        var notes = new List<Note>();
+        var lines = text.TrimStart('\uFEFF').Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (string raw in lines)
+        {
+            string line = raw.Trim();
+            if (line.Length == 0) continue;
+            if (line.StartsWith("start=", StringComparison.Ordinal))
+            {
+                if (offset >= 0 || !double.TryParse(line.Substring(6), NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out offset) || offset < 0 || double.IsInfinity(offset) || double.IsNaN(offset))
+                    throw new FormatException("Invalid or repeated beatmap start time.");
+                continue;
+            }
+            if (line.StartsWith("notes=", StringComparison.Ordinal))
+            {
+                if (declared >= 0 || !int.TryParse(line.Substring(6), out declared) || declared <= 0)
+                    throw new FormatException("Invalid or repeated beatmap note count.");
+                continue;
+            }
+            Match match = Tap.Match(line);
+            if (match.Success)
+            {
+                double at = double.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture) / 1000d;
+                notes.Add(new Note { Key = int.Parse(match.Groups[1].Value) - 1, Start = at, End = at });
+                continue;
+            }
+            match = Hold.Match(line);
+            if (!match.Success) throw new FormatException("Invalid beatmap note: " + line);
+            double start = double.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture) / 1000d;
+            double end = double.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture) / 1000d;
+            if (end <= start) throw new FormatException("Hold end must follow its start: " + line);
+            notes.Add(new Note { Key = int.Parse(match.Groups[1].Value) - 1, Start = start, End = end });
+        }
+        if (offset < 0 || declared != notes.Count || notes.Count == 0)
+            throw new FormatException("Beatmap headers are missing or the note count does not match.");
+        notes.Sort((a, b) => a.Start.CompareTo(b.Start));
+        foreach (Note note in notes)
+            if (double.IsInfinity(note.Start) || double.IsInfinity(note.End))
+                throw new FormatException("Beatmap note time is too large.");
+        return new PinkBeatmap { AudioStartSeconds = offset, Notes = notes.ToArray() };
+    }
+}
+
+/// <summary>PDF scoring and timing, independent of frame rate, scene UI and audio playback.</summary>
+public sealed class PinkRhythmSession
+{
+    public const double MissWindow = .468;
+    static readonly double[] Windows = { .095, .161, .249, .336, .468 };
+    static readonly double[] Weights = { 1, .85, .65, .45, .20, 0 };
+    static readonly double[] StaminaChanges = { 3.5, 2.5, 1.5, .7, -2, -3.5 };
+
+    public sealed class NoteState
+    {
+        public bool Started, Judged;
+        public PinkJudgement FirstJudgement;
+        public double HeldSeconds;
+    }
+
+    public PinkBeatmap Beatmap { get; }
+    public NoteState[] States { get; }
+    public double Score { get; private set; }
+    public int DisplayScore => Math.Min(100000, (int)Math.Round(Score, MidpointRounding.AwayFromZero));
+    public double Stamina { get; private set; }
+    public int JudgedNotes { get; private set; }
+    public bool Failed => Stamina <= 0;
+    public bool Complete => JudgedNotes == States.Length;
+    public bool Finished => Failed || Complete;
+    public bool UnlocksUltimate => Complete && !Failed && DisplayScore >= 84000;
+    // The bool marks a final judgement; hold starts also give immediate visual feedback.
+    public event Action<int, PinkJudgement, bool> JudgementShown;
+    double previousTime = double.NegativeInfinity;
+
+    public PinkRhythmSession(PinkBeatmap beatmap, double initialStamina = 100)
+    {
+        Beatmap = beatmap ?? throw new ArgumentNullException(nameof(beatmap));
+        Stamina = Math.Max(0, Math.Min(100, initialStamina));
+        States = new NoteState[beatmap.Notes.Length];
+        for (int i = 0; i < States.Length; i++) States[i] = new NoteState();
+    }
+
+    public static PinkJudgement Judge(double timingError)
+    {
+        double error = Math.Abs(timingError);
+        for (int i = 0; i < Windows.Length; i++)
+            if (error <= Windows[i] + 1e-9) return (PinkJudgement)i;
+        return PinkJudgement.Miss;
+    }
+
+    public static PinkJudgement JudgeHold(PinkJudgement first, double completion)
+    {
+        if (first >= PinkJudgement.Bad) return first;
+        if (completion + 1e-9 >= .8) return first;
+        return completion + 1e-9 >= .45 ? PinkJudgement.Ok : PinkJudgement.Bad;
+    }
+
+    // A key mask uses bit 0=W, 1=A, 2=S, 3=D. Release ends a hold once.
+    public void Tick(double time, int pressedKeys, int heldKeys)
+    {
+        if (Finished) return;
+        if (double.IsNaN(time) || double.IsInfinity(time) || time < previousTime)
+            throw new ArgumentOutOfRangeException(nameof(time), "Rhythm clock must advance monotonically.");
+        for (int i = 0; i < States.Length; i++)
+        {
+            var state = States[i];
+            var note = Beatmap.Notes[i];
+            if (state.Judged) continue;
+            if (state.Started)
+            {
+                // The key was held throughout the interval preceding this sample, including a release frame.
+                double from = Math.Max(previousTime, note.Start);
+                double to = Math.Min(time, note.End);
+                state.HeldSeconds += Math.Max(0, to - from);
+                if (time >= note.End || (heldKeys & (1 << note.Key)) == 0)
+                    FinalizeNote(i, JudgeHold(state.FirstJudgement, state.HeldSeconds / (note.End - note.Start)));
+            }
+            else if (time - note.Start > MissWindow + 1e-9)
+                FinalizeNote(i, PinkJudgement.Miss);
+            if (Failed) { previousTime = time; return; }
+        }
+        for (int key = 0; key < 4; key++)
+        {
+            if ((pressedKeys & (1 << key)) == 0) continue;
+            int chosen = -1;
+            double nearest = MissWindow + 1e-9;
+            for (int i = 0; i < States.Length; i++)
+            {
+                var note = Beatmap.Notes[i];
+                if (note.Start - time > MissWindow + 1e-9) break;
+                if (States[i].Started || States[i].Judged || note.Key != key) continue;
+                double distance = Math.Abs(time - note.Start);
+                if (distance <= nearest && (chosen < 0 || distance < nearest)) { chosen = i; nearest = distance; }
+            }
+            if (chosen < 0) continue; // Extra key presses have no unspecified stamina penalty.
+            var selected = Beatmap.Notes[chosen];
+            PinkJudgement judgement = Judge(time - selected.Start);
+            if (!selected.IsHold) FinalizeNote(chosen, judgement);
+            else
+            {
+                States[chosen].Started = true;
+                States[chosen].FirstJudgement = judgement;
+                JudgementShown?.Invoke(chosen, judgement, false);
+            }
+            if (Failed) break;
+        }
+        previousTime = time;
+    }
+
+    void FinalizeNote(int index, PinkJudgement judgement)
+    {
+        var state = States[index];
+        if (state.Judged) return;
+        state.Judged = true;
+        JudgedNotes++;
+        Score += 100000d / States.Length * Weights[(int)judgement];
+        Stamina = Math.Max(0, Math.Min(100, Stamina + StaminaChanges[(int)judgement]));
+        JudgementShown?.Invoke(index, judgement, true);
+    }
+}

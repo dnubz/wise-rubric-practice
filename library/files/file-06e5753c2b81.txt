@@ -1,0 +1,28 @@
+using System.Collections;
+using TMPro;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public sealed class BattleBossDialogue : MonoBehaviour
+{
+    public static BattleBossDialogue Instance { get; private set; }
+    public static bool IsOpen => Instance != null && Instance.panel.activeSelf;
+    public GameObject panel;
+    public TMP_Text text;
+    void Awake() { Instance = this; panel.SetActive(false); }
+    public void Open(EncounterEnemy boss) { if (!IsOpen && !BattleSession.IsActive) StartCoroutine(Dialogue(boss)); }
+    IEnumerator Dialogue(EncounterEnemy boss)
+    {
+        panel.SetActive(true);
+        string[] lines = { "Jevil: Welcome, welcome! A little chaos before you leave?", "WiSe: We came to end this. Together." };
+        foreach (string line in lines)
+        {
+            text.text = line; text.maxVisibleCharacters = 0; float elapsed = 0;
+            while (text.maxVisibleCharacters < line.Length)
+            { elapsed += Time.deltaTime * 35; text.maxVisibleCharacters = Mathf.FloorToInt(elapsed); if (Keyboard.current != null && Keyboard.current.fKey.wasPressedThisFrame) text.maxVisibleCharacters = line.Length; yield return null; }
+            do { yield return null; } while (Keyboard.current == null || !Keyboard.current.fKey.wasPressedThisFrame);
+        }
+        panel.SetActive(false); BattleSession.Instance.Begin(boss);
+    }
+    void OnDestroy() { if (Instance == this) Instance = null; }
+}

@@ -1,0 +1,56 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public class MenuToggle : MonoBehaviour
+{
+    [SerializeField] private GameObject menuUI;
+
+    private InputSystem_Actions inputActions;
+    private MenuTabManager menuTabs;
+
+    private void Awake()
+    {
+        inputActions = new InputSystem_Actions();
+        menuTabs = GetComponent<MenuTabManager>();
+    }
+
+    private void OnEnable()
+    {
+        if (inputActions == null)
+            inputActions = new InputSystem_Actions();
+
+        inputActions.Enable();
+        inputActions.Player.Menu.performed += OnMenuPressed;
+    }
+
+    private void OnDisable()
+    {
+        inputActions.Player.Menu.performed -= OnMenuPressed;
+        inputActions.Disable();
+    }
+
+    private void Start()
+    {
+        if (menuUI != null)
+            menuUI.SetActive(false);
+    }
+
+    private void OnMenuPressed(InputAction.CallbackContext ctx)
+    {
+        ToggleMenu();
+    }
+
+    public void ToggleMenu()
+    {
+        if (BattleSession.IsActive) { BattleSession.Instance.OpenMenu(); return; }
+        if (NPCChallengePrompt.BlocksGameplayInput) return;
+        if (menuUI != null)
+        {
+            bool opening = !menuUI.activeSelf;
+            if (opening && menuTabs != null)
+                menuTabs.ShowDefaultTab();
+
+            menuUI.SetActive(opening);
+        }
+    }
+}

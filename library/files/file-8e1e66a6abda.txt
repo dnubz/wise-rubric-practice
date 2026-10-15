@@ -1,0 +1,7 @@
+using UnityEngine;
+
+/// <summary>Explicit asset references keep every equipment cheat item available in player builds.</summary>
+public sealed class CheatEquipmentCatalog : ScriptableObject
+{
+    public Equipment[] equipment;
+}

@@ -1,0 +1,11 @@
+using UnityEngine;
+using UnityEngine.EventSystems;
+
+public sealed class BattleSkillHover : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
+{
+    public BattleHUD hud;
+    public int slot;
+    public void OnPointerEnter(PointerEventData eventData) => hud.ShowSkillInfo(slot);
+    public void OnPointerExit(PointerEventData eventData) => hud.HideSkillInfo();
+    void OnDisable() { if (hud != null) hud.HideSkillInfo(); }
+}

@@ -1,0 +1,7 @@
+using UnityEngine;
+
+// Observe game frames rather than the editor UI, which can skip short fades while unfocused.
+public sealed class SaveFadeFrameProbe : MonoBehaviour
+{
+    void LateUpdate() => SaveFileChecks.ObserveFade();
+}

@@ -1,0 +1,19 @@
+using UnityEngine;
+
+/// <summary>Positions the scene's saved exclamation Canvas over the active character.</summary>
+public sealed class DungeonInteractionUI : MonoBehaviour
+{
+    [SerializeField] GameObject exclamation;
+    [SerializeField] Vector3 headOffset = new Vector3(0, 3, 0);
+
+    void Awake() { exclamation.SetActive(false); }
+
+    public void ShowFor(Transform player, bool available, Camera camera = null)
+    {
+        exclamation.SetActive(available && player != null);
+        if (!available || player == null) return;
+        transform.position = player.position + headOffset;
+        if (camera == null) camera = Camera.main;
+        if (camera != null) transform.rotation = camera.transform.rotation;
+    }
+}

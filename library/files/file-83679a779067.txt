@@ -1,0 +1,48 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+public class ItemSlotUI : MonoBehaviour
+{
+    [SerializeField] private Item item;
+    [SerializeField] private TextMeshProUGUI quantityText;
+    [SerializeField] private Button button;
+
+    private InventoryUI inventoryUI;
+    public Item Item => item;
+
+    public void Setup(InventoryUI ui)
+    {
+        inventoryUI = ui;
+
+        if (button == null)
+            button = GetComponent<Button>();
+
+        if (button != null)
+        {
+            // Remove old listeners to avoid duplicates
+            button.onClick.RemoveAllListeners();
+            button.onClick.AddListener(OnSlotClicked);
+        }
+    }
+
+    public void UpdateQuantity(Inventory inventory)
+    {
+        if (quantityText == null)
+            quantityText = GetComponentInChildren<TextMeshProUGUI>();
+
+        if (item != null && quantityText != null && inventory != null)
+        {
+            int count = inventory.GetItemCount(item);
+            quantityText.text = count.ToString();
+        }
+    }
+
+    private void OnSlotClicked()
+    {
+        if (inventoryUI != null && item != null)
+        {
+            inventoryUI.ShowItemDetails(item);
+        }
+    }
+}

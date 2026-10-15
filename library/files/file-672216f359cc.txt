@@ -1,0 +1,108 @@
+using System;
+using System.Collections;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattleMovementChecks
+{
+    const string Folder = "Temp/BattleMovement";
+    static IEnumerator routine;
+    static double next;
+    static BattleMovementChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying) return;
+            try { if (!routine.MoveNext()) Finish("PASS: all three party characters stop without sideways drift at off-centre movement limits, oblique and straight NavMesh walls; reversing away works, floor height and upright facing remain stable, movement locks hold."); }
+            catch (Exception error) { Finish("FAIL: " + error); Debug.LogException(error); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        EditorApplication.isPaused = false; Application.runInBackground = true;
+        if (Time.timeSinceLevelLoad < 4) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result)
+    {
+        File.WriteAllText(Folder + "/result.txt", result);
+        routine = null; EditorApplication.isPlaying = false;
+    }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance;
+        Require(session != null, "GameScene battle session missing.");
+        if (session.menu != null) session.menu.SetActive(false);
+        Time.timeScale = 1;
+        var encounter = Object.Instantiate(session.settings.enemies[0].prefab).GetComponent<EncounterEnemy>();
+        encounter.Configure(session.settings.enemies[0], "test:movement"); encounter.enabled = false;
+        Require(session.Begin(encounter), "Cannot start test battle.");
+        float timeout = 0;
+        while ((BattleController.Instance == null || !BattleController.Instance.Ready) && timeout < 20)
+        { timeout += Time.deltaTime; yield return null; }
+        var battle = BattleController.Instance;
+        Require(battle != null && battle.Ready, "Battle did not finish loading.");
+        battle.enabled = false;
+        foreach (var unit in battle.Party)
+        {
+            var original = unit.transform.position;
+            // Start off-centre so radial projection would produce unwanted sideways motion.
+            foreach (float yaw in new[] { 0f, 37f, 90f, 180f })
+            {
+                Quaternion turn = Quaternion.Euler(0, yaw, 0);
+                Vector3 forward = turn * Vector3.forward, sideways = turn * Vector3.right;
+                Require(unit.Agent.Warp(original), "Range test origin outside NavMesh.");
+                Require(!unit.Agent.Raycast(original + sideways * .6f + forward, out _), "Range test must have clear floor.");
+                unit.moveOrigin = original; unit.moveRange = .75f; unit.movementLocked = false;
+                Require(unit.Agent.Warp(original + sideways * .6f), "Range test start failed.");
+                Vector3 start = unit.transform.position;
+                for (int frame = 0; frame < 180; frame++)
+                {
+                    unit.Move(forward * 6, 1f / 60);
+                    Vector3 offset = unit.transform.position - start;
+                    Require(Mathf.Abs(Vector3.Dot(offset, sideways)) < .002f, unit.DisplayName + " drifts sideways at its movement circle: " + offset);
+                    Require(BattleController.FlatDistance(unit.transform.position, original) <= .752f, "Movement exceeded circle.");
+                    Require(Mathf.Abs(unit.transform.position.y - start.y) < .05f && Vector3.Dot(unit.transform.up, Vector3.up) > .999f, "Boundary changed height or tilted actor.");
+                }
+                Vector3 end = unit.transform.position;
+                Require(!unit.Move(forward * 6, 1f / 60), "Blocked outward step still reports movement.");
+                Require(unit.Move(-forward * 6, 1f / 60), "Cannot move back into the circle.");
+                Require(Vector3.Dot(unit.transform.position - end, forward) < -.05f, "Reverse input did not move inward.");
+            }
+            // Ray-test the real layout's cover or perimeter, at oblique angles too.
+            foreach (float yaw in new[] { 0f, 33f, 90f, 147f, 180f, 270f })
+            {
+                Vector3 direction = Quaternion.Euler(0, yaw, 0) * Vector3.forward;
+                Require(unit.Agent.Warp(original), "Wall test origin failed.");
+                unit.HoldPosition(); unit.moveRange = 1000; unit.moveOrigin = original;
+                Require(unit.Agent.Raycast(original + direction * 100, out var edge), "No arena wall found.");
+                Require(unit.Agent.Warp(edge.position - direction * .5f), "Cannot stand inside wall.");
+                Vector3 start = unit.transform.position;
+                for (int frame = 0; frame < 120; frame++)
+                {
+                    unit.Move(direction * 6, 1f / 60);
+                    Vector3 offset = unit.transform.position - start; offset.y = 0;
+                    Require(Vector3.Cross(direction, offset).magnitude < .003f, unit.DisplayName + " drifts sideways at wall.");
+                    Require(unit.Agent.isOnNavMesh && Mathf.Abs(unit.transform.position.y - start.y) < .05f, "Wall clipped the actor off the floor.");
+                    Require(Vector3.Dot(unit.transform.forward, direction) > .999f, "Facing differs from requested walking direction.");
+                }
+                Require(unit.Move(-direction * 6, 1f / 60), "Cannot back away from wall.");
+            }
+            unit.movementLocked = true;
+            Vector3 locked = unit.transform.position;
+            Require(!unit.Move(Vector3.forward * 6, .1f) && unit.transform.position == locked, "Basic-attack movement lock bypassed.");
+            unit.movementLocked = false; unit.Agent.Warp(original); unit.ResetMovement();
+        }
+    }
+}

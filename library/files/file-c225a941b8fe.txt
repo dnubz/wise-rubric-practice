@@ -1,0 +1,8 @@
+using UnityEngine;
+
+[CreateAssetMenu(menuName = "WiSe/Save Item Catalog")]
+public sealed class SaveItemCatalog : ScriptableObject
+{
+    public Item[] items;
+    public Item Find(string name) => System.Array.Find(items, item => item != null && item.ItemName == name);
+}

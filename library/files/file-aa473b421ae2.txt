@@ -1,0 +1,301 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+
+/// <summary>A carbon tree; coordinates are only for drawing, bonds define its name.</summary>
+public sealed class BerdlyMolecule
+{
+    public readonly List<Vector2Int> Positions = new List<Vector2Int>();
+    public readonly List<List<int>> Bonds = new List<List<int>>();
+    public int Count => Bonds.Count;
+
+    public int AddCarbon(Vector2Int position, int parent = -1)
+    {
+        int index = Count;
+        Positions.Add(position);
+        Bonds.Add(new List<int>());
+        if (parent >= 0) Connect(parent, index);
+        return index;
+    }
+
+    public void Connect(int a, int b) { Bonds[a].Add(b); Bonds[b].Add(a); }
+
+    public BerdlyMolecule Copy()
+    {
+        var copy = new BerdlyMolecule();
+        for (int i = 0; i < Count; i++) copy.AddCarbon(Positions[i]);
+        for (int i = 0; i < Count; i++)
+            foreach (int other in Bonds[i]) if (other > i) copy.Connect(i, other);
+        return copy;
+    }
+}
+
+public sealed class BerdlyQuestion
+{
+    public BerdlyMolecule Molecule;
+    public string CorrectName;
+    public string[] Answers;
+    public int CorrectIndex;
+}
+
+/// <summary>
+/// Random walk -> weighted grid graph -> Kruskal MST. Names follow the project's
+/// recursive alkane/alkyl notation, including its hyphen before the parent alkane.
+/// </summary>
+public sealed class BerdlyChemistry
+{
+    public const int MaximumChain = 11;
+    public const int MinimumQuestionCarbons = 2, MaximumQuestionCarbons = 11;
+    static readonly Vector2Int[] Directions = { Vector2Int.up, Vector2Int.right, Vector2Int.down, Vector2Int.left };
+    readonly System.Random random;
+    readonly string[] alkanes, alkyls, prefixes;
+
+    public BerdlyChemistry(int seed, string alkaneTable, string alkylTable, string prefixTable)
+    {
+        random = new System.Random(seed);
+        alkanes = Lines(alkaneTable); alkyls = Lines(alkylTable); prefixes = Lines(prefixTable);
+        if (alkanes.Length < MaximumChain || alkyls.Length < MaximumChain || prefixes.Length < 10)
+            throw new ArgumentException("Berdly needs the supplied alkane, alkyl, and prefix naming tables.");
+    }
+
+    static string[] Lines(string text) => (text ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => line.Trim()).Where(line => line.Length > 0).ToArray();
+
+    public BerdlyQuestion GenerateQuestion()
+    {
+        // Bounded retries, then a known tree that still offers three one-carbon mutations.
+        for (int attempt = 0; attempt < 100; attempt++)
+        {
+            var molecule = GenerateTree();
+            if (molecule.Count < MinimumQuestionCarbons || LongestChainLength(molecule) > MaximumChain || !HasSimpleBranches(molecule)) continue;
+            var question = MakeQuestion(molecule);
+            if (question != null) return question;
+        }
+        var fallback = new BerdlyMolecule();
+        for (int i = 0; i < 7; i++) fallback.AddCarbon(new Vector2Int(i, 0), i - 1);
+        fallback.AddCarbon(new Vector2Int(2, 1), 2);
+        return MakeQuestion(fallback) ?? throw new InvalidOperationException("Could not generate four distinct molecule names.");
+    }
+
+    struct Edge { public int A, B; public double Weight; }
+
+    BerdlyMolecule GenerateTree()
+    {
+        int target = random.Next(MinimumQuestionCarbons, MaximumQuestionCarbons + 1);
+        var points = new List<Vector2Int> { Vector2Int.zero };
+        var visited = new HashSet<Vector2Int>(points);
+        Vector2Int cursor = Vector2Int.zero;
+        for (int step = 0; points.Count < target && step < 500; step++)
+        {
+            cursor += Directions[random.Next(4)];
+            if (visited.Add(cursor)) points.Add(cursor);
+        }
+        var graph = new List<Edge>();
+        for (int a = 0; a < points.Count; a++)
+            for (int b = a + 1; b < points.Count; b++)
+                if (Math.Abs(points[a].x - points[b].x) + Math.Abs(points[a].y - points[b].y) == 1)
+                    graph.Add(new Edge { A = a, B = b, Weight = random.NextDouble() });
+        graph.Sort((a, b) => a.Weight.CompareTo(b.Weight));
+        var tree = new BerdlyMolecule();
+        var sets = new int[points.Count];
+        for (int i = 0; i < points.Count; i++) { tree.AddCarbon(points[i]); sets[i] = i; }
+        foreach (var edge in graph)
+        {
+            int a = FindSet(sets, edge.A), b = FindSet(sets, edge.B);
+            if (a == b) continue;
+            sets[a] = b; tree.Connect(edge.A, edge.B);
+        }
+        return tree;
+    }
+
+    static int FindSet(int[] sets, int node)
+    {
+        while (sets[node] != node) { sets[node] = sets[sets[node]]; node = sets[node]; }
+        return node;
+    }
+
+    // Practice questions match the reference's unbranched chains and short methyl/ethyl
+    // substituents. Dungeon naming continues to support arbitrary recursive branches.
+    bool HasSimpleBranches(BerdlyMolecule molecule)
+    {
+        if (molecule.Bonds.Any(bonds => bonds.Count > 3)) return false;
+        var included = All(molecule);
+        var chain = new HashSet<int>(SelectChain(molecule, included));
+        int branches = 0;
+        foreach (int carbon in chain)
+            foreach (int neighbour in molecule.Bonds[carbon])
+                if (!chain.Contains(neighbour))
+                {
+                    if (++branches > 2 || Component(molecule, neighbour, included, chain).Count > 2) return false;
+                }
+        return true;
+    }
+
+    BerdlyQuestion MakeQuestion(BerdlyMolecule molecule)
+    {
+        string correct = Name(molecule);
+        var wrong = new HashSet<string>(StringComparer.Ordinal);
+        var candidates = Enumerable.Range(0, molecule.Count).OrderBy(_ => random.Next()).ToArray();
+        foreach (int carbon in candidates)
+        {
+            if (molecule.Bonds[carbon].Count >= 4) continue;
+            // The coordinates of a hypothetical distractor do not affect its carbon graph.
+            var changed = molecule.Copy();
+            changed.AddCarbon(changed.Positions[carbon] + Vector2Int.up, carbon);
+            if (LongestChainLength(changed) > MaximumChain || !HasSimpleBranches(changed)) continue;
+            string name = Name(changed);
+            if (name != correct) wrong.Add(name);
+            if (wrong.Count == 3) break;
+        }
+        // Tiny molecules have too few distinct one-carbon mutations for three wrong
+        // answers. Supplement with nearby alkanes so ethane/propane are not rerolled away.
+        if (wrong.Count < 3 && molecule.Count <= 4)
+            foreach (int count in Enumerable.Range(MinimumQuestionCarbons, MaximumQuestionCarbons - MinimumQuestionCarbons + 1)
+                .OrderBy(count => Math.Abs(count - molecule.Count)).ThenBy(_ => random.Next()))
+            {
+                string name = alkanes[count - 1];
+                if (name != correct) wrong.Add(name);
+                if (wrong.Count == 3) break;
+            }
+        if (wrong.Count < 3) return null;
+        var answers = wrong.ToList(); answers.Add(correct);
+        for (int i = answers.Count - 1; i > 0; i--)
+        {
+            int j = random.Next(i + 1);
+            string swap = answers[i]; answers[i] = answers[j]; answers[j] = swap;
+        }
+        return new BerdlyQuestion { Molecule = molecule, CorrectName = correct,
+            Answers = answers.ToArray(), CorrectIndex = answers.IndexOf(correct) };
+    }
+
+    public int LongestChainLength(BerdlyMolecule molecule)
+    {
+        if (molecule.Count == 0) return 0;
+        int end = Farthest(molecule, 0, out _);
+        Farthest(molecule, end, out int length);
+        return length;
+    }
+
+    static int Farthest(BerdlyMolecule molecule, int start, out int length)
+    {
+        var distances = new int[molecule.Count];
+        var queue = new Queue<int>(); queue.Enqueue(start); distances[start] = 1;
+        int end = start; length = 1;
+        while (queue.Count > 0)
+        {
+            int node = queue.Dequeue();
+            if (distances[node] > length) { end = node; length = distances[node]; }
+            foreach (int next in molecule.Bonds[node])
+                if (distances[next] == 0) { distances[next] = distances[node] + 1; queue.Enqueue(next); }
+        }
+        return end;
+    }
+    public string Name(BerdlyMolecule molecule) => NamePart(molecule, All(molecule), -1);
+    // Questions and dungeon rooms share the same 11-carbon chain limit.
+    public List<int> SelectChain(BerdlyMolecule molecule, HashSet<int> included, int root = -1)
+    {
+        var chain = BestPath(molecule, included, root);
+        if (chain.Count > MaximumChain)
+            throw new ArgumentException("The longest carbon chain cannot exceed " + MaximumChain + ".");
+        return chain;
+    }
+    static HashSet<int> All(BerdlyMolecule molecule) => new HashSet<int>(Enumerable.Range(0, molecule.Count));
+
+    string NamePart(BerdlyMolecule molecule, HashSet<int> included, int root)
+    {
+        var chain = BestPath(molecule, included, root);
+        if (chain.Count > MaximumChain)
+            throw new ArgumentException("The longest carbon chain cannot exceed " + MaximumChain + ".");
+        var groups = new SortedDictionary<string, List<int>>(StringComparer.Ordinal);
+        var onChain = new HashSet<int>(chain);
+        for (int i = 0; i < chain.Count; i++)
+            foreach (int neighbour in molecule.Bonds[chain[i]])
+            {
+                if (!included.Contains(neighbour) || onChain.Contains(neighbour)) continue;
+                var branch = Component(molecule, neighbour, included, onChain);
+                string name = NamePart(molecule, branch, neighbour);
+                if (!groups.TryGetValue(name, out var positions)) groups[name] = positions = new List<int>();
+                positions.Add(i + 1);
+            }
+        if (groups.Count == 0) return root < 0 ? alkanes[chain.Count - 1] : alkyls[chain.Count - 1];
+        var parts = new List<string>();
+        foreach (var group in groups)
+        {
+            string prefix = group.Value.Count == 1 ? "" : prefixes[group.Value.Count - 2];
+            parts.Add(string.Join(",", group.Value) + "-" + prefix + group.Key);
+        }
+        string result = string.Join("-", parts) + "-" + alkanes[chain.Count - 1];
+        return root < 0 ? result : "(" + result + ")";
+    }
+
+    public static HashSet<int> Component(BerdlyMolecule molecule, int start, HashSet<int> included, HashSet<int> excluded)
+    {
+        var seen = new HashSet<int> { start }; var queue = new Queue<int>(); queue.Enqueue(start);
+        while (queue.Count > 0)
+            foreach (int other in molecule.Bonds[queue.Dequeue()])
+                if (included.Contains(other) && !excluded.Contains(other) && seen.Add(other)) queue.Enqueue(other);
+        return seen;
+    }
+
+    // BFS from every possible end considers all diameter ties, rather than accepting
+    // whichever endpoint happened to be inserted first. Branch numbering starts at 1.
+    List<int> BestPath(BerdlyMolecule molecule, HashSet<int> included, int root)
+    {
+        List<int> best = null; List<int> bestLocants = null;
+        foreach (int start in included.OrderBy(i => i))
+        {
+            if (root >= 0 && start != root) continue;
+            var parents = new Dictionary<int, int> { [start] = -1 };
+            var queue = new Queue<int>(); queue.Enqueue(start);
+            while (queue.Count > 0)
+            {
+                int node = queue.Dequeue();
+                foreach (int other in molecule.Bonds[node])
+                    if (included.Contains(other) && !parents.ContainsKey(other))
+                    { parents[other] = node; queue.Enqueue(other); }
+            }
+            foreach (int end in included.OrderBy(i => i))
+            {
+                var path = new List<int>();
+                for (int node = end; node >= 0; node = parents[node]) path.Add(node);
+                path.Reverse();
+                if (best != null && path.Count < best.Count) continue;
+                var locants = BranchLocants(molecule, path, included);
+                bool better = best == null || path.Count > best.Count || locants.Count > bestLocants.Count ||
+                    (locants.Count == bestLocants.Count && Compare(locants, bestLocants) < 0);
+                // Equal numeric locants: use the alphabetical branch-name locants
+                // before the deterministic atom-index fallback (insertion-order invariant).
+                if (!better && best != null && path.Count == best.Count && locants.Count == bestLocants.Count && Compare(locants, bestLocants) == 0)
+                    better = string.CompareOrdinal(BranchSignature(molecule, path, included), BranchSignature(molecule, best, included)) < 0;
+                if (better) { best = path; bestLocants = locants; }
+            }
+        }
+        return best ?? new List<int>();
+    }
+
+    string BranchSignature(BerdlyMolecule molecule, List<int> chain, HashSet<int> included)
+    {
+        var onChain = new HashSet<int>(chain); var entries = new List<string>();
+        for (int i = 0; i < chain.Count; i++)
+            foreach (int other in molecule.Bonds[chain[i]])
+                if (included.Contains(other) && !onChain.Contains(other))
+                    entries.Add(NamePart(molecule, Component(molecule, other, included, onChain), other) + ":" + (i + 1).ToString("D2"));
+        entries.Sort(StringComparer.Ordinal); return string.Join("|", entries);
+    }
+
+    static List<int> BranchLocants(BerdlyMolecule molecule, List<int> path, HashSet<int> included)
+    {
+        var onPath = new HashSet<int>(path); var locants = new List<int>();
+        for (int i = 0; i < path.Count; i++)
+            foreach (int other in molecule.Bonds[path[i]])
+                if (included.Contains(other) && !onPath.Contains(other)) locants.Add(i + 1);
+        return locants;
+    }
+
+    static int Compare(List<int> a, List<int> b)
+    {
+        for (int i = 0; i < a.Count; i++) if (a[i] != b[i]) return a[i].CompareTo(b[i]);
+        return 0;
+    }
+}

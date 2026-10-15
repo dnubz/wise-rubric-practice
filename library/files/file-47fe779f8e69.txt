@@ -1,0 +1,15 @@
+using TMPro;
+using UnityEngine;
+
+public sealed class BattlePopup : MonoBehaviour
+{
+    public TMP_Text text;
+    float remaining = 1.2f;
+    void Update()
+    {
+        float delta = Time.unscaledDeltaTime; remaining -= delta;
+        transform.position += Vector3.up * delta;
+        if (Camera.main != null) transform.rotation = Camera.main.transform.rotation;
+        text.alpha = Mathf.Clamp01(remaining * 2); if (remaining <= 0) Destroy(gameObject);
+    }
+}

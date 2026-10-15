@@ -1,0 +1,255 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class SaveFileChecks
+{
+    const string Folder = "Temp/SaveFiles";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double resume, deadline;
+    static SaveGameSettings originalSettings;
+    static bool originalBackground;
+    static bool backgroundCaptured;
+    static GameObject fadeProbe;
+    static DungeonSettings dungeonSettings;
+    static string originalDungeonSettings;
+    static string failure;
+    static bool observingFade, fadeOutSeen, fadeInSeen, coveredArrivalSeen, leakedSurface;
+    static string fadeDestination;
+    static Scene fadeSource;
+    static SaveFileChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < resume) return;
+        if (routine == null)
+        {
+            if (File.Exists(Folder + "/state.request"))
+            {
+                File.Delete(Folder + "/state.request");
+                File.WriteAllText(Folder + "/state.txt", "Playing=" + EditorApplication.isPlaying + "; scene=" + SceneManager.GetActiveScene().name);
+                return;
+            }
+            if (!File.Exists(Folder + "/check.request")) return;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (EditorApplication.isPlaying)
+            {
+                if (!backgroundCaptured) { originalBackground = Application.runInBackground; backgroundCaptured = true; }
+                Application.runInBackground = true; EditorApplication.isPaused = false; Time.timeScale = 1;
+            }
+            if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+            File.Delete(Folder + "/check.request");
+            originalSettings = SaveGameSettings.Capture();
+            Application.runInBackground = true; failure = null; deadline = EditorApplication.timeSinceStartup + 180;
+            GameSave.TestSaveDirectory = Path.GetFullPath(Folder + "/sandbox-" + Guid.NewGuid().ToString("N"));
+            fadeProbe = new GameObject("Save Fade Validation"); Object.DontDestroyOnLoad(fadeProbe); fadeProbe.AddComponent<SaveFadeFrameProbe>();
+            Application.logMessageReceived += CaptureError; routine = Run();
+        }
+        try
+        {
+            Require(EditorApplication.timeSinceStartup < deadline, "Save checks timed out.");
+            if (routine.MoveNext()) { resume = EditorApplication.timeSinceStartup + (routine.Current is float f ? f : .1f); return; }
+            Require(failure == null, failure);
+            File.WriteAllText(Folder + "/check-result.txt", "PASS: save-slot and Continue fade-out/in, opaque cover through overworld restoration and dungeon resume, no intermediate overworld flash, dungeon entry/return fades, duplicate load rejection; binary/checksum/version/truncation validation; three independent slots; last-played selection; delete cancel/confirm; Save & Quit button; fresh seed; restored all party stats, equipment, item quantities, gold, character selection, overworld position/seed/terrain/chests, settings and playtime; dungeon layout/keys/chests/doors/coins restored in its first room; saved UI rendered without text overflow. Real saves were untouched.");
+            Finish();
+        }
+        catch (Exception e) { File.WriteAllText(Folder + "/check-result.txt", "FAIL: " + e); Finish(); }
+    }
+    static void Finish()
+    {
+        (routine as IDisposable)?.Dispose(); routine = null; Application.logMessageReceived -= CaptureError;
+        originalSettings?.Apply(); Application.runInBackground = originalBackground; backgroundCaptured = false;
+        if (dungeonSettings != null && originalDungeonSettings != null) JsonUtility.FromJsonOverwrite(originalDungeonSettings, dungeonSettings);
+        dungeonSettings = null; originalDungeonSettings = null;
+        observingFade = false; GameSave.TestSaveDirectory = null; EditorApplication.isPlaying = false;
+        if (fadeProbe != null) Object.DestroyImmediate(fadeProbe); fadeProbe = null;
+    }
+    static IEnumerator Run()
+    {
+        SceneManager.LoadScene("GameScene"); yield return 3f;
+        while (Time.timeSinceLevelLoad < 2) yield return .1f;
+        DisableEncounters();
+        var save = Object.FindAnyObjectByType<GameSave>(); Require(save != null, "Open GameScene to run the save checks.");
+        var characters = Field<CharacterBase[]>(save, "characters"); var inventory = Field<Inventory>(save, "inventory");
+        var switching = Field<CharacterSwitchManager>(save, "switchManager");
+        var resource = Resources.Load<SaveItemCatalog>("Save/ItemCatalog").items.OfType<ResourceItem>().First();
+        var gear = Resources.Load<SaveItemCatalog>("Save/ItemCatalog").items.OfType<Equipment>().First();
+        PlayerInventory.Instance.SetGold(321); PlayerInventory.Instance.AddItem(resource); PlayerInventory.Instance.AddItem(resource);
+        characters[0].Equip(gear, 0);
+        for (int i = 0; i < characters.Length; i++)
+        { characters[i].GainExperience(137 + i); characters[i].UnlockUltimate(); characters[i].SetCurrentHP(80 + i); characters[i].SpendSP(10 + i); characters[i].RestoreBattleCooldowns(new[] { i, 1, 2, 3 }); }
+        switching.SwitchToCharacter(2);
+        var settings = new SaveGameSettings { music = .25f, sfx = .4f, fps = 120, width = 1280, height = 720, fullscreen = false }; settings.Apply();
+        yield return .2f;
+        Require(save.TrySave(out var error), error);
+        var expected = GameSave.Read(); expected.openedPools = new[] { new Vector2Int(80, 80) };
+        expected.openedPlatformChests = new[] { new Vector2Int(81, 80) }; expected.defeatedEnemies = new[] { "save-check-enemy" };
+        BinarySaveFile.Write(GameSave.SavePath, expected);
+        string sandbox = GameSave.TestSaveDirectory;
+        string legacy = Path.Combine(sandbox, "previous.json"); var legacyData = save.Capture(); legacyData.version = 1;
+        File.WriteAllText(legacy, JsonUtility.ToJson(legacyData));
+        GameSave.TestSaveDirectory = Path.Combine(sandbox, "migration");
+        try
+        {
+            Require(GameSave.TryImportLegacySave(out error, legacy), error);
+            Require(GameSave.Read().gold == legacyData.gold && File.Exists(legacy), "Legacy import lost progress or removed the original.");
+            Require(GameSave.TryDeleteSlot(0, out error) && GameSave.TryImportLegacySave(out error, legacy) && !File.Exists(GameSave.SlotPath(0)), "Deleted legacy save reappeared.");
+        }
+        finally { GameSave.TestSaveDirectory = sandbox; }
+        int[] terrain = Enumerable.Range(0, 49).Select(i => WFCWorldManager.Instance.GetTerrainAt(new Vector3((i % 7 - 3) * 15, 0, (i / 7 - 3) * 15))).ToArray();
+        byte[] bytes = File.ReadAllBytes(GameSave.SavePath);
+        Require(System.Text.Encoding.ASCII.GetString(bytes, 0, 4) == "WISE", "Save is not the binary format.");
+        string invalid = Path.Combine(GameSave.SaveDirectory, "invalid.sav");
+        bytes[bytes.Length - 1] ^= 1; File.WriteAllBytes(invalid, bytes); Reject(invalid); bytes[bytes.Length - 1] ^= 1;
+        File.WriteAllBytes(invalid, bytes.Take(25).ToArray()); Reject(invalid);
+        bytes[4] = 99; File.WriteAllBytes(invalid, bytes); Reject(invalid);
+        for (int slot = 1; slot < 3; slot++)
+        { var data = save.Capture(); data.gold = slot * 1000; data.lastPlayedUtc = slot; BinarySaveFile.Write(GameSave.SlotPath(slot), data); }
+        Require(GameSave.LastPlayedSlot == 0 && GameSave.Read(GameSave.SlotPath(1)).gold == 1000 && GameSave.Read(GameSave.SlotPath(2)).gold == 2000, "Slots share data or last played is wrong.");
+        // Loading slot 2 must mark it played even though slot 1 was saved more recently.
+        BeginFadeCheck("GameScene");
+        Require(GameSave.TryLoadSlot(1, out error), error);
+        Require(SceneTravelFade.IsTransitioning && !GameSave.TryContinue(out _), "Double clicks can queue another load.");
+        yield return 3f; DisableEncounters();
+        while (Time.timeSinceLevelLoad < 2) yield return .1f;
+        EndFadeCheck();
+        Require(GameSave.ActiveSlot == 1 && GameSave.LastPlayedSlot == 1 && PlayerInventory.Instance.Gold == 1000,
+            "Loading does not update last played: active=" + GameSave.ActiveSlot + " last=" + GameSave.LastPlayedSlot + " gold=" + PlayerInventory.Instance.Gold);
+        BeginFadeCheck("GameScene"); Require(GameSave.TryLoadSlot(0, out error), error); yield return 3f; DisableEncounters();
+        while (Time.timeSinceLevelLoad < 2) yield return .1f;
+        EndFadeCheck();
+        save = Object.FindAnyObjectByType<GameSave>(); inventory = Field<Inventory>(save, "inventory"); characters = Field<CharacterBase[]>(save, "characters");
+        var actual = save.Capture();
+        Require(actual.seed == expected.seed && Vector3.Distance(actual.position, expected.position) < 1 && actual.activeCharacter == 2, "Overworld seed, position or character selection changed.");
+        Require(actual.gold == 321 && inventory.GetItemCount(resource) == 2 && actual.playSeconds >= expected.playSeconds, "Inventory, gold or playtime changed.");
+        Require(actual.world.chunkSize == expected.world.chunkSize && actual.world.tileSize == expected.world.tileSize && actual.world.poolChance == expected.world.poolChance, "World layout settings changed.");
+        Require(actual.openedPools.SequenceEqual(expected.openedPools) && actual.openedPlatformChests.SequenceEqual(expected.openedPlatformChests) &&
+            BattleSession.Instance.IsDefeated("save-check-enemy"), "Opened chests or defeated enemies were lost.");
+        Require(terrain.SequenceEqual(Enumerable.Range(0, 49).Select(i => WFCWorldManager.Instance.GetTerrainAt(new Vector3((i % 7 - 3) * 15, 0, (i / 7 - 3) * 15)))), "Saved WFC terrain changed.");
+        for (int i = 0; i < 3; i++) Require(actual.party[i].hp == expected.party[i].hp && actual.party[i].sp == expected.party[i].sp &&
+            actual.party[i].level == expected.party[i].level && actual.party[i].exp == expected.party[i].exp && actual.party[i].ultimate &&
+            actual.party[i].equipment.SequenceEqual(expected.party[i].equipment) && actual.party[i].cooldowns.SequenceEqual(expected.party[i].cooldowns), "Restored character stats changed: " + i);
+        Require(actual.settings.fps == 120 && actual.settings.width == 1280 && Mathf.Approximately(actual.settings.music, .25f) &&
+            Mathf.Approximately(actual.settings.sfx, .4f) && !actual.settings.fullscreen, "Settings did not restore.");
+        var quit = Object.FindAnyObjectByType<QuitMenuUI>(FindObjectsInactive.Include); var menu = Field<GameObject>(quit, "menuRoot");
+        menu.SetActive(true); Object.FindAnyObjectByType<MenuTabManager>().SwitchToTab(5);
+        yield return .2f;
+        PlayerInventory.Instance.SetGold(456); Require(save.TrySave(out error), error);
+        Capture(quit.GetComponentInParent<Canvas>(), "SaveMenu", quit.transform); menu.SetActive(false);
+        // Build and resume a real dungeon, with progress captured before leaving the session.
+        BeginFadeCheck("DungeonScene"); DungeonSession.OpenEntry("DungeonScene");
+        var session = Object.FindAnyObjectByType<DungeonSession>(); Field<Button>(session, "proceed").onClick.Invoke();
+        while (!DungeonSession.IsInside || DungeonSession.IsTransitioning) yield return .2f;
+        EndFadeCheck();
+        DisableEncounters(); var generator = DungeonSession.Generator;
+        var interactions = Field<System.Collections.IList>(generator, "interactions");
+        var chest = interactions.Cast<object>().First(v => v.GetType().GetField("Kind").GetValue(v).ToString() == "KeyChest");
+        typeof(DungeonGenerator).GetMethod("Interact", Private).Invoke(generator, new[] { chest });
+        var dungeon = generator.CaptureSave(); Require(dungeon.openedChests.Length == 1, "Dungeon chest did not open.");
+        dungeon.originalKeys = 2; dungeon.bossKeys = 1;
+        dungeon.unlockedDoors = Enumerable.Range(0, dungeon.doors.Length).ToArray();
+        dungeon.remainingCoins[0] = new Vector3[0];
+        var saved = save.Capture();
+        dungeon.hasEntrance = saved.dungeon.hasEntrance; dungeon.entrance = saved.dungeon.entrance;
+        saved.dungeon = dungeon; saved.inDungeon = true;
+        BinarySaveFile.Write(GameSave.SlotPath(0), saved);
+        string shape = Shape(dungeon);
+        dungeonSettings = Resources.Load<DungeonSettings>("Dungeon/Settings"); originalDungeonSettings = JsonUtility.ToJson(dungeonSettings);
+        dungeonSettings.useFixedSeed = true; dungeonSettings.fixedSeed = 98765;
+        dungeonSettings.minimumRooms = dungeonSettings.maximumRooms = 8;
+        BeginFadeCheck("DungeonScene"); Require(GameSave.TryContinue(out error), error); yield return 2f;
+        while (!DungeonSession.IsInside || DungeonSession.IsTransitioning) yield return .2f;
+        EndFadeCheck(true);
+        DisableEncounters(); generator = DungeonSession.Generator;
+        Require(generator.CurrentRoom == generator.Layout.SpawnRoom && Shape(generator.CaptureSave()) == shape &&
+            generator.OriginalKeys == 2 && generator.BossKeys == 1 && generator.CaptureSave().remainingCoins[0].Length == 0,
+            "Dungeon did not resume in the first room with saved layout and progress.");
+        Require(generator.CaptureSave().openedChests.SequenceEqual(dungeon.openedChests), "Dungeon chest state was lost.");
+        Require(generator.CaptureSave().unlockedDoors.SequenceEqual(dungeon.unlockedDoors), "Dungeon gate state was lost.");
+        BeginFadeCheck("GameScene"); DungeonSession.ReturnToSurface(); while (DungeonSession.IsInside || DungeonSession.IsTransitioning) yield return .2f;
+        EndFadeCheck();
+        save = Object.FindAnyObjectByType<GameSave>();
+        quit = Object.FindAnyObjectByType<QuitMenuUI>(FindObjectsInactive.Include);
+        Field<GameObject>(quit, "menuRoot").SetActive(true); Object.FindAnyObjectByType<MenuTabManager>().SwitchToTab(5);
+        yield return .2f; Field<Button>(quit, "saveAndQuit").onClick.Invoke(); yield return .5f;
+        while (SceneManager.GetActiveScene().name != "TitleScene") yield return .1f;
+        Require(!GameSave.Read().inDungeon && Shape(GameSave.Read().dungeon) == shape, "Save & Quit lost the dungeon layout.");
+        var ui = Object.FindAnyObjectByType<SaveSlotUI>(FindObjectsInactive.Include); ui.OpenSaveSlots();
+        Require(ui != null && Object.FindAnyObjectByType<ContinueSaveUI>(FindObjectsInactive.Include).GetComponentInChildren<TMP_Text>().text == "Continue Last Played", "Title continue label is wrong.");
+        Capture(ui.saveSlots.GetComponentInParent<Canvas>(), "Slots", ui.saveSlots.transform);
+        ui.RequestDelete(2); Require(Field<GameObject>(ui, "confirmation").activeSelf && File.Exists(GameSave.SlotPath(2)), "Delete must ask first.");
+        Capture(ui.saveSlots.GetComponentInParent<Canvas>(), "DeleteConfirmation", ui.saveSlots.transform);
+        ui.CancelDelete(); Require(File.Exists(GameSave.SlotPath(2)), "Cancel deleted a save.");
+        ui.RequestDelete(2); Field<Button>(ui, "confirmDelete").onClick.Invoke(); Require(!File.Exists(GameSave.SlotPath(2)), "Confirm did not delete.");
+        // Empty slot creates an initial save and a new procedural seed.
+        BeginFadeCheck("GameScene"); ui.SelectSlot(2); yield return 3f; DisableEncounters();
+        while (SceneManager.GetActiveScene().name != "GameScene" || !File.Exists(GameSave.SlotPath(2))) yield return .2f;
+        while (Time.timeSinceLevelLoad < 2) yield return .1f;
+        EndFadeCheck();
+        Require(GameSave.ActiveSlot == 2 && GameSave.TryReadSlot(2, out var fresh, out error) && fresh.seed != expected.seed && fresh.gold == 0 && fresh.party.All(p => p.hp > 0 && p.sp > 0), "New slot did not create a fresh, healthy party.");
+        Require(GameSave.TryDeleteSlot(2, out error), error);
+        bytes = File.ReadAllBytes(GameSave.SlotPath(0)); bytes[bytes.Length - 1] ^= 1; File.WriteAllBytes(GameSave.SlotPath(0), bytes);
+        Require(GameSave.LastPlayedSlot == 1, "Continue does not skip corrupt saves.");
+    }
+    static void BeginFadeCheck(string destination)
+    {
+        fadeSource = SceneManager.GetActiveScene(); fadeDestination = destination;
+        fadeOutSeen = fadeInSeen = coveredArrivalSeen = leakedSurface = false; observingFade = true;
+    }
+    public static void ObserveFade()
+    {
+        if (!observingFade || !EditorApplication.isPlaying || !SceneTravelFade.IsTransitioning) return;
+        var scene = SceneManager.GetActiveScene(); float alpha = SceneTravelFade.Opacity;
+        if (scene == fadeSource && alpha > 0 && alpha < 1) fadeOutSeen = true;
+        if (scene != fadeSource && alpha >= .999f) coveredArrivalSeen = true;
+        if (scene.name == fadeDestination && scene != fadeSource && alpha > 0 && alpha < 1) fadeInSeen = true;
+        if (fadeDestination == "DungeonScene" && scene.name == "GameScene" && scene != fadeSource && alpha < .999f) leakedSurface = true;
+    }
+    static void EndFadeCheck(bool savedDungeon = false)
+    {
+        // A portal return keeps the original scene handle; the source/destination names still differ.
+        Require(fadeOutSeen && fadeInSeen && !SceneTravelFade.IsTransitioning && SceneTravelFade.Opacity == 0,
+            "Fade missing or cover still blocks input: out=" + fadeOutSeen + " in=" + fadeInSeen);
+        if (savedDungeon) Require(coveredArrivalSeen && !leakedSurface, "Dungeon resume flashed the intermediate overworld.");
+        observingFade = false;
+    }
+    static string Shape(SavedDungeon d) => d.seed + "/" + d.name + "/" + string.Join(";", d.rooms.Select(r => r.Grid + "/" + r.Size + "/" + r.Kind + "/" + r.Key)) + "/" + string.Join(";", d.doors.Select(v => v.A + "," + v.B + "," + v.Lock));
+    static void Reject(string path) { try { GameSave.Read(path); } catch (InvalidDataException) { return; } catch (EndOfStreamException) { return; } throw new Exception("Malformed save was accepted."); }
+    static void DisableEncounters()
+    { foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false; foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false; }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static void Require(bool okay, string message) { if (!okay) throw new Exception(message); }
+    static void CaptureError(string message, string stack, LogType type)
+    { if ((type == LogType.Error || type == LogType.Exception) && (stack.Contains("GameSave") || stack.Contains("SaveSlot") || stack.Contains("BinarySave") || stack.Contains("DungeonSession"))) failure = message + "\n" + stack; }
+    static void Capture(Canvas canvas, string name, Transform textScope)
+    {
+        var mode = canvas.renderMode; var oldCamera = canvas.worldCamera; float distance = canvas.planeDistance;
+        var transforms = canvas.GetComponentsInChildren<Transform>(true); var layers = transforms.Select(t => t.gameObject.layer).ToArray();
+        var go = new GameObject("SavePreviewCamera"); var camera = go.AddComponent<Camera>(); var target = new RenderTexture(1280, 720, 24);
+        var pixels = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            camera.targetTexture = target; camera.cullingMask = 1 << 30; camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.03f, .06f, .03f);
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = 1;
+            foreach (var child in transforms) child.gameObject.layer = 30;
+            Canvas.ForceUpdateCanvases(); foreach (var text in textScope.GetComponentsInChildren<TMP_Text>())
+            { text.ForceMeshUpdate(); Require(!text.isTextOverflowing, "Text overflow: " + text.name + ": " + text.text); }
+            camera.Render(); RenderTexture.active = target; pixels.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); pixels.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", pixels.EncodeToPNG());
+        }
+        finally
+        {
+            canvas.renderMode = mode; canvas.worldCamera = oldCamera; canvas.planeDistance = distance;
+            for (int i = 0; i < transforms.Length; i++) transforms[i].gameObject.layer = layers[i];
+            RenderTexture.active = previous; Object.DestroyImmediate(go); Object.DestroyImmediate(target); Object.DestroyImmediate(pixels);
+        }
+    }
+}

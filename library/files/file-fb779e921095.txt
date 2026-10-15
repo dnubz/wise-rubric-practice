@@ -1,0 +1,90 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Shows the selected character's level and EXP in a circular HUD.</summary>
+public sealed class CharacterExperienceHud : MonoBehaviour
+{
+    [Header("Character source")]
+    [SerializeField] private CharacterHudEventChannel hudEvents;
+    [SerializeField] private CharacterSwitchManager switchManager;
+
+    [Header("UI references")]
+    [SerializeField] private Image expRingFill;
+    [SerializeField] private TMP_Text levelText;
+
+    private CharacterBase selectedCharacter;
+
+    private void Awake()
+    {
+        if (switchManager == null)
+            switchManager = FindFirstObjectByType<CharacterSwitchManager>();
+
+        if (expRingFill != null)
+        {
+            expRingFill.type = Image.Type.Filled;
+            expRingFill.fillMethod = Image.FillMethod.Radial360;
+            expRingFill.fillOrigin = (int)Image.Origin360.Top;
+            expRingFill.fillClockwise = true;
+        }
+    }
+
+    private void OnEnable()
+    {
+        if (hudEvents != null)
+        {
+            hudEvents.CharacterSelected += OnCharacterSelected;
+            hudEvents.CharacterStatsChanged += OnCharacterStatsChanged;
+        }
+
+        ShowCurrentCharacter();
+    }
+
+    private void Start()
+    {
+        // Handles either Start order when the HUD and switch manager load together.
+        ShowCurrentCharacter();
+    }
+
+    private void OnDisable()
+    {
+        if (hudEvents != null)
+        {
+            hudEvents.CharacterSelected -= OnCharacterSelected;
+            hudEvents.CharacterStatsChanged -= OnCharacterStatsChanged;
+        }
+    }
+
+    private void ShowCurrentCharacter()
+    {
+        if (switchManager == null)
+            return;
+
+        OnCharacterSelected(switchManager.CurrentCharacter);
+    }
+
+    private void OnCharacterSelected(CharacterBase character)
+    {
+        selectedCharacter = character;
+        Refresh();
+    }
+
+    private void OnCharacterStatsChanged(CharacterBase character)
+    {
+        if (character == selectedCharacter)
+            Refresh();
+    }
+
+    private void Refresh()
+    {
+        if (levelText != null)
+            levelText.text = selectedCharacter != null ? selectedCharacter.CurrentLevel.ToString() : string.Empty;
+
+        if (expRingFill != null)
+        {
+            expRingFill.fillAmount = selectedCharacter != null
+                ? (float)selectedCharacter.CurrentExp / CharacterBase.ExperiencePerLevel
+                : 0f;
+        }
+    }
+}

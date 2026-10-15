@@ -1,0 +1,67 @@
+using UnityEngine;
+
+/// <summary>Raises the steel doorway when WiSe's party approaches.</summary>
+public sealed class DungeonGateLift : MonoBehaviour
+{
+    DungeonGenerator generator;
+    Transform gateVisual;
+    BoxCollider doorwayBlocker;
+    int room, destination;
+    Vector3 closedLocalPosition;
+    float liftHeight, openRange, liftSpeed, currentLift;
+    AudioClip liftSound;
+    float soundStart;
+    bool wasOpening;
+
+    public bool IsFullyRaised { get; private set; }
+
+    public void Initialize(DungeonGenerator owner, int sourceRoom, int destinationRoom, Transform visual,
+        BoxCollider blocker, float height, float range, float speed, AudioClip sound = null, float startSeconds = 0)
+    {
+        generator = owner;
+        room = sourceRoom;
+        destination = destinationRoom;
+        gateVisual = visual;
+        doorwayBlocker = blocker;
+        closedLocalPosition = visual.localPosition;
+        liftHeight = height;
+        openRange = range;
+        liftSpeed = speed;
+        liftSound = sound; soundStart = startSeconds;
+    }
+
+    void Update()
+    {
+        MoveGate(Time.deltaTime);
+    }
+
+    void MoveGate(float deltaTime)
+    {
+        if (generator == null || gateVisual == null || doorwayBlocker == null) return;
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        bool nearby = generator.Exploring && generator.CurrentRoom == room &&
+            !NPCChallengePrompt.BlocksGameplayInput && player != null &&
+            generator.CanOpenExit(room, destination);
+        if (nearby)
+        {
+            Vector3 offset = player.position - gateVisual.position;
+            offset.y = 0;
+            nearby = offset.sqrMagnitude <= openRange * openRange;
+        }
+
+        float targetLift = nearby ? liftHeight : 0;
+        if (nearby && !wasOpening && currentLift < liftHeight)
+            DungeonAudio.Play(liftSound, transform.position, .45f, soundStart);
+        wasOpening = nearby;
+        currentLift = Mathf.MoveTowards(currentLift, targetLift, liftSpeed * deltaTime);
+        gateVisual.localPosition = closedLocalPosition + Vector3.up * currentLift;
+
+        bool fullyRaised = currentLift >= liftHeight - .01f;
+        if (fullyRaised != IsFullyRaised)
+        {
+            IsFullyRaised = fullyRaised;
+            doorwayBlocker.enabled = !fullyRaised;
+            Physics.SyncTransforms();
+        }
+    }
+}

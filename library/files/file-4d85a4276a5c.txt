@@ -1,0 +1,7 @@
+using UnityEngine;
+
+/// <summary>Terrain label retained by the existing terrain prefab assets.</summary>
+public sealed class WFCTile : MonoBehaviour
+{
+    public string tileName;
+}

@@ -1,0 +1,54 @@
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+/// <summary>Applies saved audio levels and routes scene audio sources into the shared mixer.</summary>
+public sealed class GameAudioBootstrap : MonoBehaviour
+{
+    static GameAudioBootstrap instance;
+    float nextRouteTime;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    static void Create()
+    {
+        if (instance != null) return;
+        var root = new GameObject("Game Audio");
+        DontDestroyOnLoad(root);
+        instance = root.AddComponent<GameAudioBootstrap>();
+    }
+
+    void Awake()
+    {
+        if (instance != null && instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        instance = this;
+        DontDestroyOnLoad(gameObject);
+        SceneManager.sceneLoaded += OnSceneLoaded;
+        GameAudio.ApplySavedVolumes();
+        GameAudio.RouteUnassignedSources();
+    }
+
+    void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        GameAudio.ApplySavedVolumes();
+        GameAudio.RouteUnassignedSources();
+    }
+
+    void Update()
+    {
+        if (Time.unscaledTime < nextRouteTime) return;
+        nextRouteTime = Time.unscaledTime + .25f;
+        GameAudio.RouteUnassignedSources();
+    }
+
+    void OnDestroy()
+    {
+        if (instance == this)
+        {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+            instance = null;
+        }
+    }
+}

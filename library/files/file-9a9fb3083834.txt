@@ -1,0 +1,113 @@
+using System.Collections;
+using UnityEngine;
+
+public class NormalNPC : NPCBase
+{
+    [Header("Normal NPC Settings")]
+    [Tooltip("Seconds to wait after finishing a sentence before automatically advancing to the next.")]
+    [SerializeField] private float autoAdvanceDelay = 2.0f;
+    [Tooltip("If true, dialogue will loop from the beginning while the player remains nearby.")]
+    [SerializeField] private bool loopDialogue = false;
+
+    private Coroutine autoAdvanceCoroutine;
+
+    protected override void OnPlayerApproached()
+    {
+        base.OnPlayerApproached();
+
+        StartDialogue();
+    }
+
+    protected override void HandleInput()
+    {
+        if (isDialogueActive) base.HandleInput();
+    }
+
+    protected override void OnSentenceFinished()
+    {
+        base.OnSentenceFinished();
+
+        // Auto-advance as fallback if player doesn't press F
+        if (autoAdvanceCoroutine != null)
+        {
+            StopCoroutine(autoAdvanceCoroutine);
+        }
+
+        if (currentLineIndex < dialogueLines.Length - 1)
+        {
+            autoAdvanceCoroutine = StartCoroutine(AutoAdvanceRoutine());
+        }
+        else
+        {
+            autoAdvanceCoroutine = StartCoroutine(AutoCloseRoutine());
+        }
+    }
+
+    protected override void OnFKeyPressedAfterSentence()
+    {
+        base.OnFKeyPressedAfterSentence();
+
+        // Cancel any auto-advance timer — player is manually advancing
+        if (autoAdvanceCoroutine != null)
+        {
+            StopCoroutine(autoAdvanceCoroutine);
+            autoAdvanceCoroutine = null;
+        }
+
+        if (currentLineIndex < dialogueLines.Length - 1)
+        {
+            NextSentence();
+        }
+        else
+        {
+            if (loopDialogue && isPlayerNearby)
+            {
+                StartDialogue();
+            }
+            else
+            {
+                EndDialogue();
+            }
+        }
+    }
+
+    private IEnumerator AutoAdvanceRoutine()
+    {
+        yield return new WaitForSeconds(autoAdvanceDelay);
+        autoAdvanceCoroutine = null;
+        NextSentence();
+    }
+
+    private IEnumerator AutoCloseRoutine()
+    {
+        yield return new WaitForSeconds(autoAdvanceDelay);
+        autoAdvanceCoroutine = null;
+
+        if (loopDialogue && isPlayerNearby)
+        {
+            StartDialogue();
+        }
+        else
+        {
+            EndDialogue();
+        }
+    }
+
+    protected override void OnPlayerExited()
+    {
+        if (autoAdvanceCoroutine != null)
+        {
+            StopCoroutine(autoAdvanceCoroutine);
+            autoAdvanceCoroutine = null;
+        }
+
+        base.OnPlayerExited();
+    }
+
+    protected override void OnDisable()
+    {
+        if (autoAdvanceCoroutine != null) StopCoroutine(autoAdvanceCoroutine);
+        autoAdvanceCoroutine = null;
+        base.OnDisable();
+    }
+}

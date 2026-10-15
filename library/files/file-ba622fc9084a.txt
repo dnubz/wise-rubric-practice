@@ -1,0 +1,216 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// Component to add a crisp white highlight/outline to an object (Player, Tree, NPC).
+/// Fully compatible with Unity URP for both MeshRenderer and SkinnedMeshRenderer.
+/// </summary>
+[DisallowMultipleComponent]
+public class ObjectHighlight : MonoBehaviour
+{
+    [Header("Highlight Appearance")]
+    [SerializeField] private Material outlineMaterial;
+    [SerializeField] private Color outlineColor = Color.white;
+    [SerializeField, Range(0.001f, 0.15f)] private float outlineWidth = 0.03f;
+    [SerializeField] private bool highlightOnStart = true;
+
+    [Header("Proximity (Optional)")]
+    [Tooltip("If true, only highlights when player is within proximity distance")]
+    [SerializeField] private bool useProximity = false;
+    [SerializeField] private float proximityDistance = 3.5f;
+    [SerializeField] private Transform targetTransform;
+
+    private readonly List<GameObject> outlineObjects = new List<GameObject>();
+    private Material runtimeOutlineMat;
+    private bool isHighlighted = false;
+
+    private void Awake()
+    {
+        EnsureMaterial();
+    }
+
+    private void OnEnable()
+    {
+        // Switching characters disables their objects; Start only runs on the first activation.
+        if (!useProximity && highlightOnStart)
+            EnableHighlight();
+    }
+
+    private void Start()
+    {
+        if (useProximity && targetTransform == null)
+        {
+            GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+            if (playerObj != null)
+            {
+                targetTransform = playerObj.transform;
+            }
+        }
+
+        if (!useProximity && highlightOnStart)
+        {
+            EnableHighlight();
+        }
+    }
+
+    private void Update()
+    {
+        if (!useProximity) return;
+
+        if (targetTransform != null)
+        {
+            float dist = Vector3.Distance(transform.position, targetTransform.position);
+            if (dist <= proximityDistance && !isHighlighted)
+            {
+                EnableHighlight();
+            }
+            else if (dist > proximityDistance && isHighlighted)
+            {
+                DisableHighlight();
+            }
+        }
+    }
+
+    private void EnsureMaterial()
+    {
+        if (runtimeOutlineMat != null) return;
+
+        if (outlineMaterial == null)
+        {
+            Shader shader = Shader.Find("Custom/URP_WhiteOutline");
+            if (shader != null)
+            {
+                outlineMaterial = new Material(shader);
+            }
+        }
+
+        if (outlineMaterial != null)
+        {
+            runtimeOutlineMat = new Material(outlineMaterial);
+            ApplyMaterialProperties();
+        }
+    }
+
+    [ContextMenu("Enable Highlight")]
+    public void EnableHighlight()
+    {
+        if (isHighlighted) return;
+
+        EnsureMaterial();
+        if (runtimeOutlineMat == null) return;
+
+        ApplyMaterialProperties();
+
+        // 1. MeshRenderers (Trees, Rocks, Props)
+        MeshFilter[] meshFilters = GetComponentsInChildren<MeshFilter>(true);
+        foreach (var mf in meshFilters)
+        {
+            if (mf == null || mf.sharedMesh == null) continue;
+            if (mf.gameObject.name.StartsWith("[Outline]")) continue;
+
+            MeshRenderer mr = mf.GetComponent<MeshRenderer>();
+            if (mr == null || !mr.enabled) continue;
+
+            GameObject outlineObj = new GameObject("[Outline] " + mf.gameObject.name);
+            outlineObj.transform.SetParent(mf.transform, false);
+            outlineObj.transform.localPosition = Vector3.zero;
+            outlineObj.transform.localRotation = Quaternion.identity;
+            outlineObj.transform.localScale = Vector3.one;
+
+            MeshFilter newMf = outlineObj.AddComponent<MeshFilter>();
+            newMf.sharedMesh = mf.sharedMesh;
+
+            MeshRenderer newMr = outlineObj.AddComponent<MeshRenderer>();
+            newMr.sharedMaterial = runtimeOutlineMat;
+            newMr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            newMr.receiveShadows = false;
+
+            outlineObjects.Add(outlineObj);
+        }
+
+        // 2. SkinnedMeshRenderers (Player, NPC)
+        SkinnedMeshRenderer[] skinnedRenderers = GetComponentsInChildren<SkinnedMeshRenderer>(true);
+        foreach (var smr in skinnedRenderers)
+        {
+            if (smr == null || smr.sharedMesh == null || !smr.enabled) continue;
+            if (smr.gameObject.name.StartsWith("[Outline]")) continue;
+
+            GameObject outlineObj = new GameObject("[Outline] " + smr.gameObject.name);
+            outlineObj.transform.SetParent(smr.transform, false);
+            outlineObj.transform.localPosition = Vector3.zero;
+            outlineObj.transform.localRotation = Quaternion.identity;
+            outlineObj.transform.localScale = Vector3.one;
+
+            SkinnedMeshRenderer newSmr = outlineObj.AddComponent<SkinnedMeshRenderer>();
+            newSmr.sharedMesh = smr.sharedMesh;
+            newSmr.bones = smr.bones;
+            newSmr.rootBone = smr.rootBone;
+            newSmr.sharedMaterial = runtimeOutlineMat;
+            newSmr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            newSmr.receiveShadows = false;
+
+            outlineObjects.Add(outlineObj);
+        }
+
+        isHighlighted = true;
+    }
+
+    [ContextMenu("Disable Highlight")]
+    public void DisableHighlight()
+    {
+        if (!isHighlighted) return;
+
+        foreach (var obj in outlineObjects)
+        {
+            if (obj != null)
+            {
+                // Destroy is deferred until the end of the frame. Hide old outlines immediately
+                // so a quick disable/enable cannot briefly render both old and new copies.
+                obj.SetActive(false);
+                if (Application.isPlaying) Destroy(obj);
+                else DestroyImmediate(obj);
+            }
+        }
+        outlineObjects.Clear();
+        isHighlighted = false;
+    }
+
+    public void SetColor(Color color)
+    {
+        outlineColor = color;
+        ApplyMaterialProperties();
+    }
+
+    public void SetWidth(float width)
+    {
+        outlineWidth = width;
+        ApplyMaterialProperties();
+    }
+
+    private void ApplyMaterialProperties()
+    {
+        if (runtimeOutlineMat == null) return;
+        runtimeOutlineMat.SetColor("_OutlineColor", outlineColor);
+        runtimeOutlineMat.SetFloat("_OutlineWidth", outlineWidth);
+    }
+
+    private void OnValidate()
+    {
+        ApplyMaterialProperties();
+    }
+
+    private void OnDisable()
+    {
+        DisableHighlight();
+    }
+
+    private void OnDestroy()
+    {
+        DisableHighlight();
+        if (runtimeOutlineMat != null)
+        {
+            if (Application.isPlaying) Destroy(runtimeOutlineMat);
+            else DestroyImmediate(runtimeOutlineMat);
+        }
+    }
+}

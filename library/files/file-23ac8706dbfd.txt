@@ -1,0 +1,119 @@
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class SettingsUI : MonoBehaviour
+{
+    public GameObject mainMenu;
+    public GameObject settingsPanel;
+    public GameObject title;
+
+    public Button settingsButton;
+    public Button backButton;
+    public Button applyButton;
+    public Button fullscreenButton;
+
+    [SerializeField] private TextMeshProUGUI resolutionText;
+    [SerializeField] private TextMeshProUGUI fullscreenText;
+
+    private (int width, int height)[] resolutions = new (int, int)[]
+    {
+        (1280, 720),
+        (1920, 1080),
+        (3840, 2160)
+    };
+
+    private int selectedIdx = 1;
+    private bool isFullscreen = false;
+
+    private void Awake()
+    {
+        isFullscreen = PlayerPrefs.GetInt("Fullscreen", 0) == 1;
+        int width = PlayerPrefs.GetInt("ScreenWidth", 1920);
+        selectedIdx = System.Array.FindIndex(resolutions, r => r.width == width);
+        if (selectedIdx < 0) selectedIdx = 1;
+        if (fullscreenText != null) fullscreenText.text = isFullscreen ? "Windowed" : "Fullscreen";
+        UpdateResolutionText();
+    }
+
+    private void Start()
+    {
+        if (settingsButton != null)
+            settingsButton.onClick.AddListener(OpenSettings);
+
+        if (backButton != null)
+            backButton.onClick.AddListener(BackToMainMenu);
+
+        if (applyButton != null)
+            applyButton.onClick.AddListener(ApplySettings);
+
+        if (fullscreenButton != null)
+            fullscreenButton.onClick.AddListener(ToggleFullscreen);
+    }
+
+    public void onRightButtonClick() 
+    {
+        if (selectedIdx < resolutions.Length - 1)
+        {
+            selectedIdx++;
+            UpdateResolutionText();
+        }
+    }
+
+    public void onLeftButtonClick() 
+    {
+        if (selectedIdx > 0)
+        {
+            selectedIdx--;
+            UpdateResolutionText();
+        }
+    }
+
+    public void ToggleFullscreen()
+    {
+        isFullscreen = !isFullscreen;
+        ApplyFullscreenState();
+    }
+
+    private void ApplyFullscreenState()
+    {
+        FullScreenMode mode = isFullscreen ? FullScreenMode.FullScreenWindow : FullScreenMode.Windowed;
+        Screen.SetResolution(Screen.width, Screen.height, mode);
+        PlayerPrefs.SetInt("Fullscreen", isFullscreen ? 1 : 0); PlayerPrefs.Save();
+
+        if (fullscreenText != null)
+            fullscreenText.text = isFullscreen ? "Windowed" : "Fullscreen";
+    }
+
+    private void UpdateResolutionText() 
+    {
+        if (resolutionText != null)
+        {
+            var res = resolutions[selectedIdx];
+            resolutionText.text = $"{res.width} x {res.height}";
+        }
+    }
+
+    public void ApplySettings()
+    {
+        var res = resolutions[selectedIdx];
+        FullScreenMode mode = isFullscreen ? FullScreenMode.FullScreenWindow : FullScreenMode.Windowed;
+        Screen.SetResolution(res.width, res.height, mode);
+        PlayerPrefs.SetInt("ScreenWidth", res.width); PlayerPrefs.SetInt("ScreenHeight", res.height);
+        PlayerPrefs.SetInt("Fullscreen", isFullscreen ? 1 : 0); PlayerPrefs.Save();
+    }
+
+    public void OpenSettings()
+    {
+        if (mainMenu != null) mainMenu.SetActive(false);
+        if (settingsPanel != null) settingsPanel.SetActive(true);
+        if (title != null) title.SetActive(false);
+    }
+
+    public void BackToMainMenu()
+    {
+        if (settingsPanel != null) settingsPanel.SetActive(false);
+        if (mainMenu != null) mainMenu.SetActive(true);
+        if (title != null) title.SetActive(true);
+    }
+}

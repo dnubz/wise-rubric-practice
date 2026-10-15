@@ -1,0 +1,137 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DungeonArrivalChecks
+{
+    const string Folder = "Temp/DungeonPolish";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double next;
+    static DungeonArrivalChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying) return;
+            try { if (!routine.MoveNext()) Finish("PASS: real dungeon entry plays the DS3 cue once, centred Dungeon title fades out without blocking input; unexplored exits absent from map pixels, known entrances and earned map reveals retained; coin pickup grants gold once and plays the imported SFX; skeleton source, textures, size and enemy components verified."); }
+            catch (Exception error) { Finish("FAIL: " + error); Debug.LogException(error); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result)
+    { File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static T Get<T>(object obj, string field) => (T)obj.GetType().GetField(field, Private).GetValue(obj);
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings.areaTitlePrefab != null && settings.areaEnterSound != null && settings.coinPickupSound != null, "Saved title/audio missing.");
+        Require(settings.areaEnterSound.name == "DS3 New Area sound effect" && settings.coinPickupSound.name == "Coin Pickup Immediate", "Wrong audio clips assigned.");
+        var session = Object.FindFirstObjectByType<DungeonSession>();
+        Require(session != null, "Dungeon session missing.");
+        var entry = (IEnumerator)typeof(DungeonSession).GetMethod("Enter", Private).Invoke(session, new object[] { "DungeonScene" });
+        session.StartCoroutine(entry);
+        float wait = 0;
+        while ((!DungeonSession.IsInside || DungeonSession.IsTransitioning) && wait < 40) { wait += Time.unscaledDeltaTime; yield return null; }
+        Require(DungeonSession.IsInside, "Dungeon entry timed out.");
+        int entryFrame = Time.frameCount;
+        while (Time.frameCount == entryFrame) yield return null;
+        var dungeon = DungeonSession.Generator;
+        var title = dungeon.GetComponentInChildren<DungeonAreaTitle>();
+        Require(title != null && title.IsShowing, "Arrival title did not start.");
+        var cue = title.GetComponent<AudioSource>();
+        Require(cue.isPlaying && cue.clip == settings.areaEnterSound && !cue.loop && cue.spatialBlend == 0 && cue.outputAudioMixerGroup != null, "Arrival cue missing or unrouted.");
+        var group = title.GetComponent<CanvasGroup>();
+        Require(!group.blocksRaycasts && !group.interactable && title.GetComponentInChildren<TMP_Text>().text == "Dungeon", "Title blocks input or has wrong text.");
+        var minimap = Get<DungeonMinimap>(dungeon, "minimap");
+        int spawn = dungeon.Layout.SpawnRoom;
+        int adjacent = dungeon.Layout.Graph.Bonds[spawn][0];
+        int unknown = dungeon.Layout.Graph.Bonds[adjacent].First(n => n != spawn);
+        Require(minimap.IsConnectionRevealed(spawn, adjacent) && minimap.IsConnectionRevealed(adjacent, spawn), "Known entrance missing.");
+        Require(!minimap.IsConnectionRevealed(adjacent, unknown), "Next room leaked another door.");
+        Require(DoorPixel(minimap, dungeon.Layout, adjacent, unknown).a == 0, "Unexplored door is still drawn in the minimap texture.");
+        Require(DoorPixel(minimap, dungeon.Layout, adjacent, spawn).a == 255, "Known reverse entrance is absent from texture.");
+        minimap.Visit(adjacent);
+        Require(minimap.IsConnectionRevealed(adjacent, unknown) && DoorPixel(minimap, dungeon.Layout, adjacent, unknown).a == 255, "Entering a room does not reveal its exits.");
+        minimap.RevealMainPath();
+        var main = dungeon.Layout.Chains[0];
+        Require(minimap.IsConnectionRevealed(main[main.Count - 2], main[main.Count - 1]), "Earned main-path reveal broken.");
+        var visited = Get<HashSet<int>>(minimap, "visited");
+        foreach (var door in dungeon.Layout.Doors.Where(d => !visited.Contains(d.A) && !visited.Contains(d.B) && (!main.Contains(d.A) || !main.Contains(d.B))))
+            Require(!minimap.IsConnectionRevealed(door.A, door.B), "Main-path reveal leaked an unknown branch door.");
+        minimap.RevealAllRooms(); Require(dungeon.Layout.Doors.All(d => minimap.IsConnectionRevealed(d.A, d.B)), "Earned full-map reveal broken.");
+        dungeon.BeginExploration();
+        Require(dungeon.GetComponentsInChildren<DungeonAreaTitle>().Length == 1 && cue.isPlaying, "Repeated BeginExploration restarted the arrival.");
+        // Collect one real saved coin through the generator's normal proximity update.
+        var coins = Get<List<List<GameObject>>>(dungeon, "roomCoins")[dungeon.CurrentRoom];
+        foreach (var coin in coins) if (coin != null) Object.Destroy(coin);
+        coins.Clear();
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = player.GetComponent<CharacterMovement>(); movement.enabled = false;
+        dungeon.SpawnCoin(dungeon.CurrentRoom, player.position);
+        int gold = PlayerInventory.Instance.Gold;
+        typeof(DungeonGenerator).GetMethod("Update", Private).Invoke(dungeon, null);
+        Require(PlayerInventory.Instance.Gold == gold + DungeonGenerator.CoinValue && coins.Count == 0, "Coin reward/removal failed.");
+        var coinSound = Get<AudioSource>(dungeon, "coinPickupAudio");
+        Require(coinSound != null && coinSound.isPlaying && coinSound.clip == settings.coinPickupSound && coinSound.outputAudioMixerGroup != null, "Coin pickup sound missing.");
+        typeof(DungeonGenerator).GetMethod("Update", Private).Invoke(dungeon, null);
+        Require(PlayerInventory.Instance.Gold == gold + DungeonGenerator.CoinValue, "Destroyed coin awarded twice.");
+        var skeleton = Resources.Load<BattleEnemyData>("Battle/Skeleton");
+        var model = Object.Instantiate(skeleton.prefab, dungeon.RoomCentre(spawn) + Vector3.forward * 7, Quaternion.identity);
+        model.GetComponent<EncounterEnemy>().enabled = false;
+        var imported = model.transform.Find("Visual/Imported Skeleton");
+        Require(imported != null, "Downloaded skeleton model missing.");
+        Mesh sourceMesh = imported.GetComponentInChildren<SkinnedMeshRenderer>()?.sharedMesh ?? imported.GetComponentInChildren<MeshFilter>()?.sharedMesh;
+        Require(AssetDatabase.GetAssetPath(sourceMesh) == "Assets/Imported Assets/skeleton/source/skeleton.fbx", "Downloaded skeleton mesh source missing.");
+        Require(model.GetComponent<BattleUnit>() != null && model.GetComponent<UnityEngine.AI.NavMeshAgent>() != null && model.GetComponent<CapsuleCollider>() != null, "Skeleton lost enemy/battle components.");
+        var renderers = imported.GetComponentsInChildren<Renderer>(); Bounds bounds = renderers[0].bounds;
+        foreach (var renderer in renderers.Skip(1)) bounds.Encapsulate(renderer.bounds);
+        Require(Mathf.Abs(bounds.size.y - DungeonPolishSetup.SkeletonHeight) < .05f && Mathf.Abs(bounds.min.y - model.transform.position.y) < .05f, "Skeleton size or grounding is wrong.");
+        Require(renderers.All(r => r.sharedMaterials.All(m => m.shader.name == "Universal Render Pipeline/Lit" && m.GetTexture("_BaseMap") != null)), "Skeleton material/texture missing.");
+        // Capture the arrival with the new skeleton in the dungeon's actual view.
+        var cameraRig = Object.FindFirstObjectByType<CameraController>(); cameraRig.enabled = false;
+        var camera = Camera.main; Vector3 focus = model.transform.position + Vector3.up * 1.5f;
+        camera.transform.position = focus + new Vector3(6, 8, -10); camera.transform.LookAt(focus);
+        float fadeWait = 0;
+        while (group.alpha < .95f && fadeWait < 2) { fadeWait += Time.unscaledDeltaTime; yield return null; }
+        ScreenCapture.CaptureScreenshot(Folder + "/dungeon-arrival-preview.png"); yield return null; yield return null;
+        wait = 0;
+        while (title.IsShowing && wait < 6) { wait += Time.unscaledDeltaTime; yield return null; }
+        Require(!title.IsShowing && group.alpha == 0, "Arrival title never fades out.");
+        model.GetComponent<ObjectHighlight>()?.DisableHighlight();
+        var previewLight = new GameObject("Skeleton preview light").AddComponent<Light>();
+        previewLight.type = LightType.Directional; previewLight.intensity = 2;
+        previewLight.transform.rotation = Quaternion.Euler(40, -30, 0);
+        camera.transform.position = focus + new Vector3(2.5f, 2.5f, -5); camera.transform.LookAt(focus);
+        yield return null;
+        ScreenCapture.CaptureScreenshot(Folder + "/skeleton-preview.png"); yield return null; yield return null;
+    }
+    static Color32 DoorPixel(DungeonMinimap map, DungeonLayout layout, int from, int to)
+    {
+        Vector2Int cell = layout.Rooms[from].Grid - Get<Vector2Int>(map, "minimum");
+        Vector2Int direction = layout.Rooms[to].Grid - layout.Rooms[from].Grid;
+        int x = cell.x * 20 + (direction.x == 0 ? 9 : direction.x > 0 ? 18 : 2);
+        int y = cell.y * 20 + (direction.y == 0 ? 9 : direction.y > 0 ? 18 : 2);
+        return Get<Texture2D>(map, "texture").GetPixel(x, y);
+    }
+}

@@ -1,0 +1,319 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using TMPro;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.SceneManagement;
+using UnityEngine.Rendering;
+using UnityEngine.UI;
+
+/// <summary>Additive dungeon travel keeps the original party, inventories and generated overworld in memory.</summary>
+public sealed class DungeonSession : MonoBehaviour
+{
+    static DungeonSession instance;
+    static int closedFrame = -1;
+    public static bool IsTransitioning => instance != null && instance.loading;
+    public static bool IsInside => instance != null && instance.inside;
+    public static Vector3 SurfaceReturnPosition => instance != null ? instance.returnPosition : Vector3.zero;
+    public static Quaternion SurfaceReturnRotation => instance != null ? instance.returnRotation : Quaternion.identity;
+    public static bool BlocksGameplayInput => instance != null && (instance.modal != null && instance.modal.activeSelf || instance.loading ||
+        instance.generator != null && instance.generator.IsRoomTransitioning) || closedFrame == Time.frameCount;
+    public static DungeonGenerator Generator => instance != null ? instance.generator : null;
+    [Header("Scene UI - GameplayCanvas / DungeonEntryUI")]
+    [SerializeField] GameObject modal, partyPanel;
+    [SerializeField] TextMeshProUGUI title, subtitle, body, proceedLabel;
+    [SerializeField] Button proceed, retreat;
+    [SerializeField] DungeonPartyCard[] partyCards;
+    Action accept;
+    bool loading, inside;
+    string entrySceneName;
+    Vector3 returnPosition;
+    Quaternion returnRotation;
+    Scene surface;
+    DungeonGenerator generator;
+    SavedDungeon savedDungeon;
+    Vector2Int entryEntrance, currentEntrance;
+    readonly Dictionary<Vector2Int, SavedDungeon> visitedDungeons = new Dictionary<Vector2Int, SavedDungeon>();
+    public static SavedDungeon CaptureSavedDungeon()
+    {
+        if (instance == null) return null;
+        instance.RememberDungeon();
+        return instance.savedDungeon;
+    }
+    public static SavedDungeon[] CaptureSavedDungeons()
+    {
+        if (instance == null) return Array.Empty<SavedDungeon>();
+        instance.RememberDungeon();
+        var result = new List<SavedDungeon>(instance.visitedDungeons.Values);
+        result.Sort((a, b) => a.entrance.x != b.entrance.x ? a.entrance.x.CompareTo(b.entrance.x) : a.entrance.y.CompareTo(b.entrance.y));
+        return result.ToArray();
+    }
+    void RememberDungeon()
+    {
+        if (generator == null || generator.Layout == null) return;
+        savedDungeon = generator.CaptureSave();
+        savedDungeon.hasEntrance = true; savedDungeon.entrance = currentEntrance;
+        visitedDungeons[currentEntrance] = savedDungeon;
+    }
+    SavedDungeon SavedAt(Vector2Int entrance)
+    {
+        visitedDungeons.TryGetValue(entrance, out var snapshot);
+        // Version 2 recorded only one dungeon without its entrance. Adopt it once.
+        if (snapshot == null && savedDungeon != null && !savedDungeon.hasEntrance)
+        {
+            snapshot = savedDungeon; snapshot.hasEntrance = true; snapshot.entrance = entrance;
+            visitedDungeons[entrance] = snapshot;
+        }
+        return snapshot;
+    }
+    public static void RestoreSavedDungeon(SavedDungeon saved, SavedDungeon[] all = null)
+    {
+        if (instance == null) return;
+        instance.visitedDungeons.Clear(); instance.savedDungeon = saved;
+        if (all != null) foreach (var dungeon in all)
+            if (dungeon != null && dungeon.hasEntrance) instance.visitedDungeons[dungeon.entrance] = dungeon;
+        if (saved != null && saved.hasEntrance) instance.visitedDungeons[saved.entrance] = saved;
+    }
+    public static void ResumeSavedDungeon()
+    {
+        if (instance != null && instance.savedDungeon != null && !instance.loading)
+        {
+            var saved = instance.savedDungeon;
+            var player = CharacterSwitchManager.CurrentCharacterTransform;
+            var entrance = saved.hasEntrance ? saved.entrance : DungeonIdentity.At(player != null ? player.position : Vector3.zero);
+            instance.StartCoroutine(instance.Enter(saved.scene, entrance));
+        }
+    }
+    readonly List<GameObject> suspended = new List<GameObject>();
+    readonly List<AudioSource> pausedMusic = new List<AudioSource>();
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ResetStatics() { instance = null; closedFrame = -1; }
+
+    void Awake()
+    {
+        if (instance != null && instance != this) { Destroy(gameObject); return; }
+        instance = this;
+        if (modal == null || partyPanel == null || title == null || subtitle == null || body == null ||
+            proceedLabel == null || proceed == null || retreat == null || partyCards == null)
+        {
+            Debug.LogError("Assign DungeonSession's scene UI references in the Inspector.", this);
+            enabled = false; return;
+        }
+        proceed.onClick.AddListener(Proceed);
+        retreat.onClick.AddListener(Close);
+        modal.SetActive(false);
+    }
+
+    void Proceed() { accept?.Invoke(); }
+
+    public static void OpenEntry(string sceneName, Vector3? entrancePosition = null)
+    {
+        if (IsInside || BlocksGameplayInput) return;
+        if (!Ensure()) return;
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        ShowEntry(sceneName, DungeonIdentity.At(entrancePosition ?? (player != null ? player.position : Vector3.zero)));
+    }
+
+    public static void RefreshEntryRequirements()
+    {
+        if (instance != null && !instance.inside && !instance.loading && instance.modal.activeSelf && instance.entrySceneName != null)
+            ShowEntry(instance.entrySceneName, instance.entryEntrance);
+    }
+
+    static void ShowEntry(string sceneName, Vector2Int entrance)
+    {
+        instance.entrySceneName = sceneName;
+        instance.entryEntrance = entrance;
+        CharacterBase[] characters = FindObjectsByType<CharacterBase>(FindObjectsInactive.Include);
+        bool wise = false, druid = false;
+        foreach (CharacterBase character in characters)
+        {
+            if (character.characterData == null) continue;
+            if (character is WiSe) wise |= character.HasUltimate;
+            if (character is Druid) druid |= character.HasUltimate;
+        }
+        foreach (DungeonPartyCard card in instance.partyCards)
+        {
+            if (card == null) continue;
+            CharacterBase match = Array.Find(characters, character => character.characterData == card.CharacterData);
+            card.Refresh(match);
+        }
+        bool ready = wise && druid && Application.CanStreamedLevelBeLoaded(sceneName);
+        string requirement = "";
+        if (!wise || !druid) requirement = "Unlock WiSe's and Druid's ultimates to enter. Complete Berdly's and Pink's challenges.";
+        else if (!ready) requirement = "Dungeon scene is missing from Build Settings.";
+        instance.Show("ENTER THE DUNGEON?", requirement, "PROCEED", ready ? () => instance.StartCoroutine(instance.Enter(sceneName, entrance)) : (Action)null, true);
+        instance.proceed.interactable = ready;
+    }
+
+    public static void ShowMessage(string heading, string message)
+    {
+        if (!Ensure()) return;
+        instance.entrySceneName = null; instance.Show(heading, message, "Continue", instance.Close);
+        instance.retreat.gameObject.SetActive(false);
+    }
+
+    static bool Ensure()
+    {
+        if (instance == null) instance = FindFirstObjectByType<DungeonSession>();
+        if (instance != null && instance.enabled && instance.modal != null) return true;
+        Debug.LogError("Dungeon entry UI is missing. Open GameScene and check GameplayCanvas / DungeonEntryUI.");
+        return false;
+    }
+
+    void Update()
+    {
+        if (CheatConsole.BlocksGameplayInput) return;
+        if (!loading && modal.activeSelf && Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame) Close();
+    }
+
+    void Show(string heading, string message, string button, Action action, bool showParty = false)
+    {
+        title.text = heading; body.text = message; accept = action;
+        partyPanel.SetActive(showParty); subtitle.gameObject.SetActive(showParty);
+        body.rectTransform.anchoredPosition = new Vector2(0, showParty ? -185 : 0);
+        body.rectTransform.sizeDelta = new Vector2(1000, showParty ? 55 : 230);
+        proceedLabel.text = button.ToUpperInvariant();
+        proceed.interactable = true; retreat.gameObject.SetActive(true); modal.SetActive(true);
+    }
+
+    void Close() { modal.SetActive(false); accept = null; entrySceneName = null; closedFrame = Time.frameCount; }
+
+    IEnumerator Enter(string sceneName, Vector2Int entrance)
+    {
+        Close(); loading = true;
+        DungeonAreaTitle.HideOverworld();
+        surface = SceneManager.GetActiveScene();
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null) { loading = false; ShowMessage("Cannot enter", "Select a character before entering the dungeon."); yield break; }
+        returnPosition = player.position; returnRotation = player.rotation;
+        Show("Entering Dungeon", "Preparing rooms...", "Proceed", null); proceed.interactable = false; retreat.gameObject.SetActive(false);
+        yield return SceneTravelFade.FadeOut();
+        AsyncOperation operation = null; Exception loadError = null;
+        try { operation = SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Additive); }
+        catch (Exception e) { loadError = e; }
+        if (loadError != null)
+        {
+            ShowMessage("Cannot enter", loadError.Message);
+            yield return SceneTravelFade.FadeIn(); loading = false; yield break;
+        }
+        if (operation == null) { Close(); yield return SceneTravelFade.FadeIn(); loading = false; yield break; }
+        yield return operation;
+        Scene dungeon = SceneManager.GetSceneByName(sceneName);
+        foreach (GameObject root in dungeon.GetRootGameObjects())
+        {
+            if (root.GetComponent<Camera>() != null || root.name == "Dungeon_Structure" || root.name == "ReturnToSurface_Portal") root.SetActive(false);
+        }
+        var manager = new GameObject("DungeonGenerator"); SceneManager.MoveGameObjectToScene(manager, dungeon);
+        generator = manager.AddComponent<DungeonGenerator>();
+        Exception failure = null;
+        SavedDungeon snapshot = SavedAt(entrance);
+        currentEntrance = entrance;
+        int worldSeed = WFCWorldManager.Instance != null ? WFCWorldManager.Instance.WorldSeed : Environment.TickCount;
+        IEnumerator build = generator.Build(worldSeed, snapshot, DungeonIdentity.Seed(worldSeed, entrance));
+        // Catch failures at coroutine boundaries, restoring the entry overlay instead of stranding the party.
+        while (true)
+        {
+            bool more = false; object current = null;
+            try { more = build.MoveNext(); if (more) current = build.Current; }
+            catch (Exception error) { failure = error; }
+            if (failure != null || !more) break;
+            yield return current;
+        }
+        if (failure != null)
+        {
+            Debug.LogException(failure); yield return SceneManager.UnloadSceneAsync(dungeon);
+            generator = null;
+            ShowMessage("Dungeon generation failed", "The party is still outside. Check the Console for the missing dungeon setting.");
+            yield return SceneTravelFade.FadeIn(); loading = false; yield break;
+        }
+        // Disable chunk streaming and all chunk-owned interactables together, without destroying their state.
+        if (WFCWorldManager.Instance != null) Suspend(WFCWorldManager.Instance.gameObject);
+        foreach (OverworldMinimap map in FindObjectsByType<OverworldMinimap>()) Suspend(map.gameObject);
+        foreach (Light light in FindObjectsByType<Light>())
+            if (light.gameObject.scene == surface && light.type == LightType.Directional) Suspend(light.gameObject);
+        foreach (Volume volume in FindObjectsByType<Volume>())
+            if (volume.gameObject.scene == surface) Suspend(volume.gameObject);
+        foreach (AudioSource music in FindObjectsByType<AudioSource>())
+            if (music.gameObject.scene == surface && music.isPlaying && music.loop && music.spatialBlend < .1f)
+            { music.Pause(); pausedMusic.Add(music); }
+        inside = true; SceneManager.SetActiveScene(dungeon);
+        generator.BeginExploration(false);
+        generator.TeleportToRoom(generator.Layout.SpawnRoom,
+            generator.RoomCentre(generator.Layout.SpawnRoom) + Vector3.up * .15f, returnRotation);
+        Close();
+        yield return SceneTravelFade.FadeIn();
+        loading = false; generator.ShowArrival();
+    }
+
+    void Suspend(GameObject target)
+    {
+        if (target.activeSelf && !suspended.Contains(target)) { suspended.Add(target); target.SetActive(false); }
+    }
+
+    public static void ReturnToSurface()
+    {
+        if (instance != null && instance.inside && !instance.loading) instance.StartCoroutine(instance.Return());
+    }
+
+    IEnumerator Return()
+    {
+        loading = true; Scene dungeon = generator.gameObject.scene;
+        yield return SceneTravelFade.FadeOut();
+        RememberDungeon();
+        SceneManager.SetActiveScene(surface);
+        var cameraRig = FindFirstObjectByType<CameraController>();
+        if (cameraRig != null) cameraRig.SetDungeonView(false);
+        // Move first: re-enabling WFC while the player is below ground would otherwise update its streaming target.
+        Teleport(returnPosition, returnRotation);
+        inside = false;
+        foreach (GameObject target in suspended) if (target != null) target.SetActive(true);
+        suspended.Clear();
+        foreach (AudioSource music in pausedMusic) if (music != null) music.UnPause();
+        pausedMusic.Clear();
+        yield return SceneManager.UnloadSceneAsync(dungeon);
+        generator = null; Close(); Physics.SyncTransforms();
+        yield return SceneTravelFade.FadeIn(); loading = false;
+        DungeonAreaTitle.ShowOverworld();
+    }
+
+    static void Teleport(Vector3 position, Quaternion rotation)
+    {
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = player.GetComponent<CharacterMovement>();
+        if (movement != null) movement.Teleport(position, rotation);
+        else
+        {
+            var controller = player.GetComponent<CharacterController>();
+            bool enabled = controller != null && controller.enabled;
+            if (enabled) controller.enabled = false;
+            player.SetPositionAndRotation(position, rotation);
+            if (enabled) controller.enabled = true;
+        }
+        var camera = FindFirstObjectByType<CameraController>();
+        if (camera != null) { camera.SetTarget(player); camera.SnapToTarget(); }
+        Physics.SyncTransforms();
+    }
+
+    void OnDestroy()
+    {
+        if (proceed != null) proceed.onClick.RemoveListener(Proceed);
+        if (retreat != null) retreat.onClick.RemoveListener(Close);
+        if (instance == this) instance = null;
+    }
+
+    public static GameObject UIBox(string name, Transform parent, Vector2 position, Vector2 size, Color color)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = new Vector2(.5f, .5f); rect.anchoredPosition = position; rect.sizeDelta = size;
+        var image = obj.AddComponent<Image>(); image.color = color; return obj;
+    }
+    public static TextMeshProUGUI UILabel(string name, Transform parent, Vector2 position, Vector2 size, float fontSize)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = new Vector2(.5f, .5f); rect.anchoredPosition = position; rect.sizeDelta = size;
+        var text = obj.AddComponent<TextMeshProUGUI>(); text.font = TMP_Settings.defaultFontAsset; text.fontSize = fontSize; text.alignment = TextAlignmentOptions.Center; text.raycastTarget = false; return text;
+    }
+}

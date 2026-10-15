@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#123a31">
+  <meta name="description" content="Learn how the WiSe game works, one connected guide at a time. Read feature explanations, explore C# source, and follow the scoring checklist.">
+  <title>WiSe — Learning Library</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="vendor/marked.js"></script>
+  <script defer src="vendor/purify.js"></script>
+  <script defer src="vendor/prism.js" data-manual></script>
+  <script defer src="vendor/prism-clike.js"></script>
+  <script defer src="vendor/prism-csharp.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <aside id="sidebar" class="sidebar" aria-label="Library navigation">
+    <a class="brand" href="?view=home" data-view="home"><span class="brand-mark">W<span>i</span></span><span><strong>WiSe</strong><small>LEARNING LIBRARY</small></span></a>
+    <button id="search-open" class="search-trigger"><span class="search-icon">⌕</span><span>Find a guide or script</span><kbd>⌘ K</kbd></button>
+    <nav id="navigation"></nav>
+    <div class="sidebar-bottom"><a href="WiSe-learning-guide.zip" download class="download-library"><span>↓</span> Download the library <span>↗</span></a><div class="shelf-note"><span class="dot"></span> Your game. Your field notes.</div></div>
+  </aside>
+  <div class="mobile-scrim" id="mobile-scrim"></div>
+  <div class="workspace">
+    <header class="topbar"><div class="topbar-left"><button class="icon-button mobile-toggle" id="mobile-toggle" aria-label="Open navigation">☰</button><span id="breadcrumbs">Library <span>/</span> Overview</span></div><div class="topbar-actions"><span class="edition">UNITY FIELD GUIDE <span>01</span></span><button class="icon-button" id="theme-toggle" aria-label="Switch color theme" title="Switch color theme">◐</button></div></header>
+    <main id="main" tabindex="-1"><div class="loading">Opening your library…</div></main>
+    <footer class="site-footer"><span>WiSe Learning Library</span><span>Built from your guides & game source <span class="footer-dot">·</span> October 2026</span></footer>
+  </div>
+  <dialog id="search-dialog" aria-labelledby="search-title"><div class="search-box"><div class="search-input-row"><span>⌕</span><label class="sr-only" id="search-title" for="search-input">Search the library</label><input id="search-input" placeholder="Search features, concepts, or a script…" autocomplete="off"><button class="icon-button" id="search-close" aria-label="Close search">×</button></div><div class="search-hint">Try “WFC”, “raycast”, or “BattleController” <span>Esc to close</span></div><div id="search-results" class="search-results"></div></div></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <noscript>This library needs JavaScript to connect its documents. You can also download <a href="WiSe-learning-guide.zip">the original Markdown library</a>.</noscript>
+</body>
+</html>

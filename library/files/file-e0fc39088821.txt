@@ -1,0 +1,97 @@
+using System;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Three traveling UI crescents, with one impact callback and brief portrait recoil.</summary>
+[RequireComponent(typeof(CanvasRenderer))]
+public sealed class BerdlySonicWave : MaskableGraphic
+{
+    public const float TravelSeconds = .7f, RecoilSeconds = .2f;
+    public bool IsPlaying { get; private set; }
+    public bool FromPlayer { get; private set; }
+    public float Progress => Mathf.Clamp01(elapsed / TravelSeconds);
+    Vector2 start, end, recoilOrigin;
+    RectTransform target;
+    Action impact;
+    float elapsed;
+    bool impacted;
+
+    public void Play(Vector2 from, Vector2 to, bool fromPlayer, RectTransform portrait, Action onImpact)
+    {
+        Cancel();
+        start = from; end = to; FromPlayer = fromPlayer; target = portrait;
+        if (target != null) recoilOrigin = target.anchoredPosition;
+        impact = onImpact; elapsed = 0; impacted = false; IsPlaying = true;
+        color = fromPlayer ? new Color(.15f, .73f, 1f) : new Color(1f, .20f, .25f);
+        raycastTarget = false; SetVerticesDirty();
+    }
+
+    void Update() => Advance(Time.unscaledDeltaTime);
+
+    public void Advance(float seconds)
+    {
+        if (!IsPlaying) return;
+        elapsed += Mathf.Max(0, seconds);
+        if (!impacted && elapsed >= TravelSeconds)
+        {
+            impacted = true;
+            var callback = impact; impact = null;
+            callback?.Invoke();
+            if (!IsPlaying) return; // Exit/disable from the callback must remain immediate.
+        }
+        if (impacted && target != null)
+        {
+            float p = Mathf.Clamp01((elapsed - TravelSeconds) / RecoilSeconds);
+            float shake = Mathf.Sin(p * Mathf.PI * 6) * 8f * (1f - p);
+            target.anchoredPosition = recoilOrigin + Vector2.right * shake;
+        }
+        if (elapsed >= TravelSeconds + RecoilSeconds) Cancel();
+        else SetVerticesDirty();
+    }
+
+    public void Cancel()
+    {
+        if (target != null) target.anchoredPosition = recoilOrigin;
+        target = null; impact = null; impacted = false; IsPlaying = false;
+        SetVerticesDirty();
+    }
+
+    protected override void OnDisable() { Cancel(); base.OnDisable(); }
+
+    protected override void OnPopulateMesh(VertexHelper mesh)
+    {
+        mesh.Clear();
+        if (!IsPlaying || impacted) return;
+        float p = Progress;
+        Vector2 centre = Vector2.Lerp(start, end, p);
+        float facing = FromPlayer ? 1f : -1f;
+        float fade = Mathf.Clamp01(p * 8f) * Mathf.Clamp01((1f - p) * 8f);
+        for (int wave = 0; wave < 3; wave++)
+        {
+            Vector2 origin = centre + Vector2.right * ((wave - 1) * 27f * facing);
+            float radius = 39f + wave * 5f;
+            Stroke(mesh, origin, facing, radius, 9f, WithAlpha(color, fade * .18f));
+            Stroke(mesh, origin, facing, radius, 3.4f, WithAlpha(color, fade));
+        }
+    }
+
+    static Color WithAlpha(Color tint, float alpha) { tint.a *= alpha; return tint; }
+    static void Stroke(VertexHelper mesh, Vector2 origin, float facing, float radius, float width, Color tint)
+    {
+        const int segments = 24;
+        Vector2 previous = Point(origin, facing, radius, -1.23f);
+        for (int i = 1; i <= segments; i++)
+        {
+            Vector2 next = Point(origin, facing, radius, Mathf.Lerp(-1.23f, 1.23f, i / (float)segments));
+            Vector2 direction = (next - previous).normalized;
+            Vector2 normal = new Vector2(-direction.y, direction.x) * (width * .5f);
+            int index = mesh.currentVertCount;
+            mesh.AddVert(previous - normal, tint, Vector2.zero); mesh.AddVert(previous + normal, tint, Vector2.zero);
+            mesh.AddVert(next + normal, tint, Vector2.zero); mesh.AddVert(next - normal, tint, Vector2.zero);
+            mesh.AddTriangle(index, index + 1, index + 2); mesh.AddTriangle(index, index + 2, index + 3);
+            previous = next;
+        }
+    }
+    static Vector2 Point(Vector2 origin, float facing, float radius, float angle) =>
+        origin + new Vector2(Mathf.Cos(angle) * 22f * facing, Mathf.Sin(angle) * radius);
+}

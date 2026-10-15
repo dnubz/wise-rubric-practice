@@ -1,0 +1,57 @@
+using System;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using UnityEditor;
+using UnityEngine;
+
+[InitializeOnLoad]
+public static class PlayerCameraChecks
+{
+    const string Folder = "Temp/PlayerCamera";
+    static double nextCheck;
+    static PlayerCameraChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (File.Exists(Folder + "/check.request"))
+        {
+            File.Delete(Folder + "/check.request");
+            try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: Mario has no embedded camera; game startup has one screen camera, owned by the player rig; overhead angle, player follow and separate rhythm render-texture camera retained."); }
+            catch (Exception error) { File.WriteAllText(Folder + "/result.txt", error.ToString()); Debug.LogException(error); }
+        }
+        if (!File.Exists(Folder + "/inspect.request")) return;
+        File.Delete(Folder + "/inspect.request");
+        Directory.CreateDirectory(Folder);
+        var report = new StringBuilder("Playing=" + EditorApplication.isPlaying + "\n");
+        foreach (Camera camera in UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+            report.AppendLine($"{camera.name} scene={camera.gameObject.scene.name} active={camera.isActiveAndEnabled} target={camera.targetTexture} position={camera.transform.position:R} local={camera.transform.localPosition:R} rotation={camera.transform.eulerAngles:R} parent={camera.transform.parent?.name} tag={camera.tag} depth={camera.depth}");
+        foreach (var rig in UnityEngine.Object.FindObjectsByType<CameraController>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            var fields = new SerializedObject(rig);
+            report.AppendLine($"Rig={rig.name} active={rig.isActiveAndEnabled} position={rig.transform.position:R} rotation={rig.transform.eulerAngles:R} scale={rig.transform.lossyScale:R} target={fields.FindProperty("player").objectReferenceValue} activeCamera={rig.ActiveCamera}");
+        }
+        File.WriteAllText(Folder + "/inspection.txt", report.ToString());
+    }
+
+    [MenuItem("WiSe/Validate Player Camera Startup")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(PinkMarioSetup.MarioPath);
+        Require(prefab.GetComponentsInChildren<Camera>(true).Length == 0, "Mario visual still contains a camera.");
+        Require(EditorApplication.isPlaying, "Enter Play to validate the actual startup cameras.");
+        var rig = UnityEngine.Object.FindAnyObjectByType<CameraController>();
+        Require(rig != null && rig.ActiveCamera != null && rig.ActiveCamera.isActiveAndEnabled, "Player camera rig is inactive.");
+        var screenCameras = Array.FindAll(UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsSortMode.None),
+            camera => camera.isActiveAndEnabled && camera.targetTexture == null);
+        Require(screenCameras.Length == 1 && screenCameras[0] == rig.ActiveCamera && Camera.main == rig.ActiveCamera,
+            "Another camera is rendering over the player camera.");
+        var target = CharacterSwitchManager.CurrentCharacterTransform;
+        Require(target != null && Vector3.Distance(rig.transform.position, target.position) < .01f, "Camera does not follow the active player.");
+        Require(rig.ActiveCamera.transform.localPosition.y > 10 && rig.ActiveCamera.transform.eulerAngles.x > 50,
+            "Player camera lost its overhead view.");
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}

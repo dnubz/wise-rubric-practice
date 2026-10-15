@@ -1,0 +1,36 @@
+using System;
+using UnityEngine;
+
+[Serializable]
+public sealed class SavedWorldLayout
+{
+    public int chunkSize;
+    public float tileSize, poolChance, biomeScale;
+    public Vector2Int[] forcedDungeons;
+}
+
+[Serializable]
+public sealed class SavedDungeon
+{
+    public bool hasEntrance;
+    public Vector2Int entrance;
+    public int seed, spawn, boss, berdly, maximumDegree;
+    public string name, scene = "DungeonScene";
+    public float spacing, floorTileSize;
+    public DungeonRoomData[] rooms;
+    public DungeonDoorData[] doors;
+    public int[][] chains;
+    public int originalKeys, bossKeys;
+    public int[] openedChests, unlockedDoors, brokenProps;
+    public Vector3[][] remainingCoins;
+
+    public DungeonLayout ToLayout()
+    {
+        var layout = new DungeonLayout { Seed = seed, SpawnRoom = spawn, BossRoom = boss,
+            BerdlyRoom = berdly, MaximumDegree = maximumDegree, Name = name, Graph = new BerdlyMolecule() };
+        foreach (var room in rooms) { layout.Rooms.Add(room); layout.Graph.AddCarbon(room.Grid); }
+        foreach (var door in doors) { layout.Doors.Add(door); layout.Graph.Connect(door.A, door.B); }
+        foreach (var chain in chains) layout.Chains.Add(new System.Collections.Generic.List<int>(chain));
+        return layout;
+    }
+}

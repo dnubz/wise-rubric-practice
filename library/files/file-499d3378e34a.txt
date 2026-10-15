@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BerdlyPracticeChecks
+{
+    const string Folder = "Temp/BerdlyPractice";
+    static BerdlyPracticeChecks() { EditorApplication.update += Poll; }
+    static void Poll()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: 512 reproducible randomized practice questions spanning 2-11 carbons, including ethane/propane, straight chains and 1-2 simple methyl/ethyl branches; four distinct shuffled simple answers even for tiny molecules; graph-derived correct names; uniform chalk mesh/labels without chain hints; labels reuse correctly; native UI preview rendered. Live party and saves untouched."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); }
+    }
+    [MenuItem("WiSe/Berdly/Validate Practice Questions")]
+    public static void Run()
+    {
+        Directory.CreateDirectory(Folder);
+        string alkane = Resources.Load<TextAsset>("BerdlyNaming/alkane").text;
+        string alkyl = Resources.Load<TextAsset>("BerdlyNaming/alkyl").text;
+        string prefix = Resources.Load<TextAsset>("BerdlyNaming/prefix").text;
+        var first = new BerdlyChemistry(7654, alkane, alkyl, prefix);
+        var repeat = new BerdlyChemistry(7654, alkane, alkyl, prefix);
+        var sizes = new HashSet<int>(); var branchCounts = new HashSet<int>(); var answers = new HashSet<int>();
+        var structures = new HashSet<string>();
+        var fixture = new GameObject("PracticeQuestionFixture", typeof(RectTransform), typeof(Canvas));
+        fixture.hideFlags = HideFlags.HideAndDontSave; fixture.SetActive(false);
+        var drawing = new GameObject("Molecule", typeof(RectTransform), typeof(CanvasRenderer)); drawing.transform.SetParent(fixture.transform, false);
+        var view = drawing.AddComponent<BerdlyMoleculeView>(); view.rectTransform.sizeDelta = new Vector2(600, 400);
+        try
+        {
+            for (int i = 0; i < 512; i++)
+            {
+                var q = first.GenerateQuestion(); var again = repeat.GenerateQuestion();
+                Require(q.Molecule.Count >= 2 && q.Molecule.Count <= 11 && first.LongestChainLength(q.Molecule) <= 11, "Practice size exceeded requested range.");
+                if (q.Molecule.Count == 2) Require(q.CorrectName == "ethane", "Two-carbon question name is wrong.");
+                if (q.Molecule.Count == 3) Require(q.CorrectName == "propane", "Three-carbon question name is wrong.");
+                Require(q.Molecule.Bonds.All(b => b.Count <= 3) && q.Molecule.Positions.Distinct().Count() == q.Molecule.Count, "Invalid/simple carbon graph.");
+                Require(q.Molecule.Bonds.Sum(b => b.Count) == 2 * (q.Molecule.Count - 1), "Question is not a tree.");
+                for (int a = 0; a < q.Molecule.Count; a++) foreach (int b in q.Molecule.Bonds[a])
+                    Require(Math.Abs(q.Molecule.Positions[a].x - q.Molecule.Positions[b].x) + Math.Abs(q.Molecule.Positions[a].y - q.Molecule.Positions[b].y) == 1, "Non-cardinal drawn bond.");
+                Require(q.Answers.Length == 4 && q.Answers.Distinct().Count() == 4 && q.Answers[q.CorrectIndex] == first.Name(q.Molecule), "Answer set is wrong.");
+                Require(q.Answers.All(n => !n.Contains("(") && !n.Contains("propyl") && !n.Contains("butyl")), "Answer complexity reveals the correct option.");
+                Require(q.CorrectName == again.CorrectName && q.Answers.SequenceEqual(again.Answers) && q.CorrectIndex == again.CorrectIndex &&
+                    q.Molecule.Positions.SequenceEqual(again.Molecule.Positions), "Seeded question differs.");
+                var main = new HashSet<int>(first.SelectChain(q.Molecule, new HashSet<int>(Enumerable.Range(0, q.Molecule.Count))));
+                int branches = 0;
+                foreach (int carbon in main) foreach (int b in q.Molecule.Bonds[carbon]) if (!main.Contains(b))
+                { branches++; Require(BerdlyChemistry.Component(q.Molecule, b, new HashSet<int>(Enumerable.Range(0, q.Molecule.Count)), main).Count <= 2, "Long/nested substituent."); }
+                Require(branches <= 2, "Too many practice branches.");
+                sizes.Add(q.Molecule.Count); branchCounts.Add(branches); answers.Add(q.CorrectIndex);
+                structures.Add(string.Join("|", q.Molecule.Positions.Select(p => p.x + "," + p.y)));
+                view.Show(q.Molecule, TMP_Settings.defaultFontAsset);
+                var labels = view.GetComponentsInChildren<TextMeshProUGUI>(true).Where(t => t.gameObject.activeSelf).ToArray();
+                Require(labels.Length == q.Molecule.Count && labels.All(t => t.color == labels[0].color && !t.text.Contains("color=")), "Atom colours reveal the answer.");
+                using (var mesh = new VertexHelper())
+                {
+                    typeof(BerdlyMoleculeView).GetMethod("OnPopulateMesh", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.DeclaredOnly).Invoke(view, new object[] { mesh });
+                    int bondVertices = (q.Molecule.Count - 1) * 4;
+                    var vertex = new UIVertex(); var reference = new UIVertex(); mesh.PopulateUIVertex(ref reference, bondVertices);
+                    for (int v = bondVertices; v < mesh.currentVertCount; v++)
+                    { mesh.PopulateUIVertex(ref vertex, v); Require(vertex.color.Equals(reference.color), "Mesh has chain-dependent atom colours."); }
+                    Require(mesh.currentVertCount == bondVertices + q.Molecule.Count * 40, "Outline geometry is incomplete.");
+                }
+            }
+            Require(sizes.SetEquals(Enumerable.Range(2, 10)) && branchCounts.SetEquals(new[] { 0, 1, 2 }) && answers.Count == 4 && structures.Count >= 200, "Questions lack size/branch/answer variety.");
+            CapturePreview(view, fixture);
+        }
+        finally { Object.DestroyImmediate(fixture); }
+    }
+    static void CapturePreview(BerdlyMoleculeView view, GameObject fixture)
+    {
+        var canvas = fixture.GetComponent<Canvas>(); canvas.renderMode = RenderMode.WorldSpace;
+        canvas.GetComponent<RectTransform>().sizeDelta = new Vector2(680, 440);
+        fixture.transform.position = new Vector3(100000, 100000, 100000);
+        var cameraObject = new GameObject("PracticePreviewCamera"); cameraObject.hideFlags = HideFlags.HideAndDontSave;
+        var camera = cameraObject.AddComponent<Camera>(); camera.orthographic = true; camera.orthographicSize = 220;
+        camera.transform.position = fixture.transform.position - Vector3.forward * 10;
+        camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.12f, .16f, .18f);
+        camera.cullingMask = 1 << 30; canvas.worldCamera = camera;
+        foreach (var child in fixture.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+        var texture = new RenderTexture(680, 440, 24); camera.targetTexture = texture;
+        Texture2D image = null; var previous = RenderTexture.active;
+        try
+        {
+            fixture.SetActive(true); Canvas.ForceUpdateCanvases(); camera.Render(); RenderTexture.active = texture;
+            image = new Texture2D(680, 440, TextureFormat.RGB24, false); image.ReadPixels(new Rect(0, 0, 680, 440), 0, 0); image.Apply();
+            File.WriteAllBytes(Folder + "/preview.png", image.EncodeToPNG());
+        }
+        finally { RenderTexture.active = previous; camera.targetTexture = null; Object.DestroyImmediate(cameraObject); Object.DestroyImmediate(texture); if (image != null) Object.DestroyImmediate(image); }
+    }
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

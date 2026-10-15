@@ -1,0 +1,226 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class InteractionPromptChecks
+{
+    const string Folder = "Temp/InteractionPrompts";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double next;
+    static IEnumerator routine;
+    static GameObject probe, stage;
+    static InteractionPromptChecks() => EditorApplication.update += Update;
+    static void Update()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying) return;
+            try { if (!routine.MoveNext()) Finish("PASS: actual CharacterController jumps: WiSe/RandaL cannot cross; Druid floating jump lands from shore. Centred chest, no raft or ramp. Swimming/switch access blocked. Saved sprite, billboard scale and chest loot verified."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (EditorApplication.isPlaying) EditorApplication.isPaused = false;
+        if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3 || WFCWorldManager.Instance == null) return;
+        File.Delete(Folder + "/check.request");
+        routine = Run();
+    }
+    static void Finish(string result)
+    {
+        File.WriteAllText(Folder + "/check-result.txt", result);
+        if (probe != null) Object.DestroyImmediate(probe);
+        if (stage != null) Object.DestroyImmediate(stage);
+        routine = null; EditorApplication.isPlaying = false;
+    }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static T Get<T>(object obj, string field) => (T)obj.GetType().GetField(field, Private).GetValue(obj);
+    static void Set(object obj, string field, object value) => obj.GetType().GetField(field, Private).SetValue(obj, value);
+    static IEnumerator Run()
+    {
+        var world = WFCWorldManager.Instance; world.enabled = false;
+        var promptPrefab = Resources.Load<WorldInteractionPrompt>("Interaction/WorldInteractionPrompt");
+        Require(promptPrefab != null && promptPrefab.Bubble.sprite != null, "Saved F sprite prefab missing.");
+        Require(AssetDatabase.GetAssetPath(promptPrefab.Bubble.sprite) == "Assets/UI/Interaction/InteractF.png", "F marker must use imported PNG, not generated art.");
+        var texture = promptPrefab.Bubble.sprite.texture;
+        var importer = (TextureImporter)AssetImporter.GetAtPath(AssetDatabase.GetAssetPath(texture));
+        Require(importer.textureType == TextureImporterType.Sprite && importer.alphaIsTransparency, "F sprite import settings wrong.");
+        stage = Object.Instantiate(Resources.Load<PoolGlideCliff>("Interaction/PoolGlideCliff")).gameObject;
+        var cliff = stage.GetComponent<PoolGlideCliff>();
+        stage.transform.position = new Vector3(-5000, world.WaterSurfaceHeight, -5000);
+        var shore = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        shore.name = "Test shoreline"; shore.transform.SetParent(stage.transform, false);
+        shore.transform.localPosition = new Vector3(0, -.5f, -31);
+        shore.transform.localScale = new Vector3(12, 1, 12);
+        var place = shore.transform;
+        Physics.SyncTransforms();
+        var characters = Object.FindObjectsByType<CharacterMovement>(FindObjectsInactive.Include).Where(c => c.gameObject.scene.IsValid()).ToArray();
+        Require(characters.Length >= 3, "GameScene must contain all three characters.");
+        string details = "";
+        foreach (var original in characters.Where(c => c.GetComponentInChildren<CharacterBase>(true) != null).Take(3))
+        {
+            bool druid = original.GetComponentInChildren<Druid>(true) != null;
+            foreach (bool floating in druid ? new[] { false, true } : new[] { false })
+            {
+                probe = new GameObject("Jump reachability probe");
+                probe.SetActive(false);
+                var controller = probe.AddComponent<CharacterController>();
+                var source = original.GetComponent<CharacterController>();
+                controller.height = source.height; controller.radius = source.radius; controller.center = source.center;
+                controller.skinWidth = source.skinWidth; controller.stepOffset = source.stepOffset; controller.slopeLimit = source.slopeLimit;
+                var movement = probe.AddComponent<CharacterMovement>();
+                Druid role = druid ? probe.AddComponent<Druid>() : null;
+                if (role != null) role.characterData = original.GetComponentInChildren<Druid>(true).characterData;
+                probe.SetActive(true); movement.enabled = false;
+                probe.GetComponent<CharacterSurfaceAudio>().enabled = false;
+                if (role != null) role.enabled = false;
+                foreach (string field in new[] { "moveSpeed", "jumpHeight", "gravity", "floatGravityScale" }) Set(movement, field, Get<float>(original, field));
+                movement.SetFloating(floating, .35f);
+                Vector3 start = stage.transform.position - stage.transform.forward * 25.6f;
+                start.y = shore.GetComponent<Collider>().bounds.max.y + .3f - controller.center.y + controller.height * .5f;
+                movement.Teleport(start, stage.transform.rotation);
+                var apply = typeof(CharacterMovement).GetMethod("ApplyJumpAndGravity", Private);
+                float settle = 0;
+                while (!controller.isGrounded && settle < 2) { apply.Invoke(movement, new object[] { Vector3.zero }); settle += Time.deltaTime; yield return null; }
+                Require(controller.isGrounded, "Probe must begin on the flat shoreline.");
+                Set(movement, "jumpRequested", true);
+                bool landed = false;
+                float elapsed = 0;
+                while (elapsed < 8)
+                {
+                    Vector3 destination = cliff.Landing.bounds.center; destination.y = probe.transform.position.y;
+                    Vector3 direction = (destination - probe.transform.position).normalized;
+                    if (Vector3.Distance(destination, probe.transform.position) < 1.8f)
+                    { movement.SetFloating(false); direction = Vector3.zero; }
+                    apply.Invoke(movement, new object[] { direction * Get<float>(original, "moveSpeed") });
+                    elapsed += Time.deltaTime;
+                    Bounds area = cliff.Landing.bounds;
+                    if (Mathf.Abs(probe.transform.position.x - area.center.x) < area.extents.x &&
+                        Mathf.Abs(probe.transform.position.z - area.center.z) < area.extents.z && controller.isGrounded && controller.bounds.min.y >= cliff.TopHeight - .3f)
+                    { landed = true; break; }
+                    if (elapsed > 1f && controller.bounds.min.y < stage.transform.position.y - .5f) break;
+                    yield return null;
+                }
+                details += original.name + " float=" + floating + " landed=" + landed + " position=" + probe.transform.position + " seconds=" + elapsed + "\n";
+                File.WriteAllText(Folder + "/details.txt", details);
+                Require(druid || !landed, "Incorrect jump reachability: " + details);
+                if (druid && floating) Require(landed, "Druid must reach the lowered cliff with float: " + details);
+                if (landed)
+                {
+                    Require(cliff.Supports(probe.transform), "Druid landing access rejected.");
+                    var chest = Object.Instantiate(AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Normal Chest.prefab"), probe.transform.position + Vector3.forward, Quaternion.identity, stage.transform).GetComponent<Chest>();
+                    chest.RequireDruidLanding(cliff);
+                    Require(chest.CanInteract(probe.transform), "Landed Druid must access chest.");
+                    movement.Teleport(new Vector3(probe.transform.position.x, world.WaterSurfaceHeight, probe.transform.position.z), Quaternion.identity);
+                    Require(!chest.CanInteract(probe.transform), "Druid swimming below cliff must not open chest.");
+                    var wise = characters.First(c => c.GetComponentInChildren<WiSe>(true) != null);
+                    Require(!cliff.Supports(wise.transform), "Other characters must not access cliff loot.");
+                    Vector3 landedPosition = cliff.Landing.bounds.center;
+                    landedPosition.y = cliff.TopHeight + .2f - controller.center.y + controller.height * .5f;
+                    movement.Teleport(landedPosition, Quaternion.identity); controller.Move(Vector3.down * .4f);
+                    var playerField = typeof(CharacterSwitchManager).GetField("<CurrentCharacterTransform>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
+                    object previousPlayer = playerField.GetValue(null);
+                    try
+                    {
+                        playerField.SetValue(null, probe.transform);
+                        chest.OpenChest();
+                        Require(chest.IsOpened, "Landed Druid could not open chest through actual interaction.");
+                    }
+                    finally { playerField.SetValue(null, previousPlayer); }
+
+                }
+                Object.DestroyImmediate(probe); probe = null;
+            }
+        }
+        // Billboard is stable in screen space despite parent scaling and zoom.
+        var marker = WorldInteractionPrompt.Create(stage.transform);
+        var camera = Camera.main; Require(camera != null, "Main camera missing.");
+        Vector3 oldPosition = camera.transform.position; Quaternion oldRotation = camera.transform.rotation;
+        try
+        {
+            camera.transform.SetPositionAndRotation(stage.transform.position + new Vector3(0, 16, -22), Quaternion.LookRotation(new Vector3(0, -8, 22)));
+            var summit = cliff.transform.Find("Flat Stone Summit").gameObject;
+            marker.SetTarget(null, summit, cliff.Landing.bounds.center);
+            marker.Show(true, "Open chest"); marker.RefreshPosition();
+            var spritePoint = camera.WorldToScreenPoint(marker.transform.position);
+            Bounds summitBounds = summit.GetComponent<Renderer>().bounds;
+            float top = float.NegativeInfinity;
+            for (int i = 0; i < 8; i++)
+            {
+                Vector3 corner = summitBounds.center + Vector3.Scale(summitBounds.extents, new Vector3((i & 1) == 0 ? -1 : 1, (i & 2) == 0 ? -1 : 1, (i & 4) == 0 ? -1 : 1));
+                top = Mathf.Max(top, camera.WorldToScreenPoint(corner).y);
+            }
+            var iconCorners = new Vector3[4]; marker.Bubble.rectTransform.GetWorldCorners(iconCorners);
+            float bottom = iconCorners.Min(p => camera.WorldToScreenPoint(p).y);
+            Require(spritePoint.z > 0 && bottom > top, "F bubble overlaps the object silhouette.");
+            float scale = marker.transform.lossyScale.y;
+            camera.transform.position -= camera.transform.forward * 10; marker.RefreshPosition();
+            Require(marker.transform.lossyScale.y > scale, "Billboard must preserve size when zooming out.");
+        }
+        finally { camera.transform.SetPositionAndRotation(oldPosition, oldRotation); }
+        PreviewPool(world);
+    }
+    static void PreviewPool(WFCWorldManager world)
+    {
+        var cliff = Object.FindObjectsByType<PoolGlideCliff>().First(c => c.gameObject != stage);
+        var chest = cliff.transform.parent.GetComponentsInChildren<Chest>().First(c => c.name.StartsWith("Pool Chest"));
+        Require(!cliff.transform.parent.GetComponentsInChildren<Transform>().Any(t => t.name.StartsWith("Pool Boat") || t.name.Contains("Ramp") || t.name.Contains("Launch Ledge")), "Pool must contain no raft or ramp.");
+        var chestRenderers = chest.GetComponentsInChildren<Renderer>().Where(r => r.enabled && (r is MeshRenderer || r is SkinnedMeshRenderer)).ToArray();
+        Require(chestRenderers.Length > 0, "Chest visual missing.");
+        Bounds chestBounds = chestRenderers[0].bounds;
+        foreach (var renderer in chestRenderers.Skip(1)) chestBounds.Encapsulate(renderer.bounds);
+        Require(
+            Vector2.Distance(new Vector2(chestBounds.center.x, chestBounds.center.z), new Vector2(cliff.transform.position.x, cliff.transform.position.z)) < .01f &&
+            Mathf.Abs(chestBounds.min.y - cliff.TopHeight - .02f) < .01f, "Chest must sit centred on the summit.");
+        var druid = Object.FindObjectsByType<Druid>(FindObjectsInactive.Include).First(c => c.gameObject.scene.IsValid());
+        druid.gameObject.SetActive(true);
+        var movement = druid.GetComponent<CharacterMovement>(); movement.enabled = false;
+        var controller = druid.GetComponent<CharacterController>();
+        Physics.SyncTransforms();
+        float footOffset = controller.bounds.min.y - druid.transform.position.y;
+        Vector3 position = cliff.transform.position + Vector3.right * 1.8f;
+        position.y = cliff.TopHeight + .4f - footOffset;
+        movement.Teleport(position, Quaternion.identity); controller.Move(Vector3.down * .8f);
+        Require(chest.CanInteract(druid.transform), "Actual central cliff must allow a landed Druid beside the chest.");
+        var marker = Get<WorldInteractionPrompt>(chest, "spritePrompt");
+        marker.Show(true, "Open chest");
+        var camera = Camera.main;
+        RenderTexture previousTarget = camera.targetTexture, previousActive = RenderTexture.active;
+        Vector3 oldPosition = camera.transform.position; Quaternion oldRotation = camera.transform.rotation;
+        bool oldOrtho = camera.orthographic; float oldSize = camera.orthographicSize;
+        var target = new RenderTexture(1200, 800, 24);
+        Texture2D image = null;
+        try
+        {
+            camera.targetTexture = target; camera.orthographic = true; camera.orthographicSize = 12;
+            camera.transform.position = cliff.transform.position + new Vector3(19, 23, -25);
+            camera.transform.LookAt(cliff.transform.position + Vector3.up * 3);
+            marker.RefreshPosition(); Canvas.ForceUpdateCanvases(); camera.Render();
+            RenderTexture.active = target; image = new Texture2D(1200, 800, TextureFormat.RGB24, false);
+            image.ReadPixels(new Rect(0, 0, 1200, 800), 0, 0); image.Apply();
+            File.WriteAllBytes(Folder + "/cliff-chest-preview.png", image.EncodeToPNG());
+            camera.orthographicSize = 43;
+            Vector3 midpoint = cliff.transform.position;
+            camera.transform.position = midpoint + new Vector3(50, 70, -55); camera.transform.LookAt(midpoint);
+            marker.Show(false); camera.Render();
+            image.ReadPixels(new Rect(0, 0, 1200, 800), 0, 0); image.Apply();
+            File.WriteAllBytes(Folder + "/pool-gap-preview.png", image.EncodeToPNG());
+        }
+        finally
+        {
+            camera.targetTexture = previousTarget; RenderTexture.active = previousActive;
+            camera.orthographic = oldOrtho; camera.orthographicSize = oldSize;
+            camera.transform.SetPositionAndRotation(oldPosition, oldRotation);
+            if (image != null) Object.DestroyImmediate(image); Object.DestroyImmediate(target);
+        }
+    }
+}

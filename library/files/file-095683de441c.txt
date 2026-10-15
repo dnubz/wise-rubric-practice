@@ -1,0 +1,20 @@
+using UnityEngine;
+
+public enum BattleEnemyKind { Skeleton, Minion, Jevil }
+
+[CreateAssetMenu(menuName = "WiSe/Battle/Settings")]
+public sealed class BattleSettings : ScriptableObject
+{
+    public BattleEnemyData[] enemies;
+    public BattleEnemyData boss;
+    public float[] characterMovement = { 8, 7, 9 };
+    public int minimumEnemies = 3, maximumEnemies = 5;
+    public float arenaHalfSize = 33, walkSpeed = 6;
+    public AudioClip music, bossMusic, enterSound, attackSound, magicSound, hitSound, healSound, victorySound, gameOverSound;
+    public GameObject projectile, impact, dragon, laser;
+    public GameObject areaEffect, statusEffect, crescentEffect;
+    public AudioClip shieldSound, portalSound, teleportSound, laserSound, chargeSound, melodySound;
+    public BattleWorldUI worldUI;
+    public BattlePopup popup;
+    public GameObject pinkModel;
+}

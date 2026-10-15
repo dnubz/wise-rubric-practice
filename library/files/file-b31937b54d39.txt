@@ -1,0 +1,246 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.Rendering.Universal;
+
+public class CameraController : MonoBehaviour
+{
+    public Camera ActiveCamera =>
+        cameras != null && currentCamera >= 0 && currentCamera < cameras.Length
+            ? cameras[currentCamera]
+            : null;
+
+    [SerializeField] Camera[] cameras;
+    [SerializeField] Transform player;
+    [SerializeField] InputActionReference changeCam;
+    [SerializeField] InputActionReference zoom;
+    [SerializeField] float transitionDuration = 0.5f;
+
+    [Header("Zoom")]
+    [SerializeField] float zoomSpeed = 5f;
+    [SerializeField] float minFOV = 20f;
+    [SerializeField] float maxFOV = 80f;
+    [SerializeField] float zoomSmoothTime = 0.12f;
+
+    [Header("Dungeon view")]
+    [SerializeField, Range(15, 85)] float dungeonTilt = 65f;
+    [SerializeField] float dungeonYaw = 45f;
+    [SerializeField] float dungeonFocusHeight = 1.5f;
+    Vector3[] normalPositions, viewPositions;
+    Quaternion[] normalRotations, viewRotations;
+    CameraClearFlags[] normalClearFlags;
+    Color[] normalBackgrounds;
+    bool[] normalPostProcessing;
+    UniversalAdditionalCameraData[] cameraData;
+    bool dungeonView;
+
+    float targetFOV;
+    float currentFOV;
+    float zoomVelocity = 0f;
+    float[] cameraBaseFOV;
+
+    int currentCamera = 0;
+    bool isTransitioning = false;
+    bool minimapScrollFocused = false;
+    float transitionTimer = 0f;
+
+    Vector3 fromPos;
+    Quaternion fromRot;
+    Vector3 toPos;
+    Quaternion toRot;
+
+    void OnEnable()
+    {
+        if (changeCam != null && changeCam.action != null)
+        {
+            changeCam.action.Enable();
+            changeCam.action.performed += ChangeCamera;
+        }
+
+        if (zoom != null && zoom.action != null)
+        {
+            zoom.action.Enable();
+            zoom.action.performed += OnZoom;
+        }
+
+        CharacterSwitchManager.OnActiveCharacterChanged += SetTarget;
+
+        if (CharacterSwitchManager.CurrentCharacterTransform != null)
+        {
+            player = CharacterSwitchManager.CurrentCharacterTransform;
+        }
+    }
+
+    void OnDisable()
+    {
+        minimapScrollFocused = false;
+
+        if (changeCam != null && changeCam.action != null)
+        {
+            changeCam.action.performed -= ChangeCamera;
+        }
+
+        if (zoom != null && zoom.action != null)
+        {
+            zoom.action.performed -= OnZoom;
+        }
+
+        CharacterSwitchManager.OnActiveCharacterChanged -= SetTarget;
+    }
+
+    public void SetTarget(Transform newTarget)
+    {
+        player = newTarget;
+    }
+
+    // Teleports move the whole rig immediately, retaining the selected view and zoom.
+    public void SnapToTarget()
+    {
+        if (player != null) transform.position = player.position;
+    }
+
+    void CacheViews()
+    {
+        if (normalPositions != null || cameras == null || cameras.Length == 0) return;
+        normalPositions = new Vector3[cameras.Length]; viewPositions = new Vector3[cameras.Length];
+        normalRotations = new Quaternion[cameras.Length]; viewRotations = new Quaternion[cameras.Length];
+        normalClearFlags = new CameraClearFlags[cameras.Length]; normalBackgrounds = new Color[cameras.Length];
+        normalPostProcessing = new bool[cameras.Length]; cameraData = new UniversalAdditionalCameraData[cameras.Length];
+        for (int i = 0; i < cameras.Length; i++)
+        {
+            normalPositions[i] = viewPositions[i] = cameras[i].transform.localPosition;
+            normalRotations[i] = viewRotations[i] = cameras[i].transform.localRotation;
+            normalClearFlags[i] = cameras[i].clearFlags; normalBackgrounds[i] = cameras[i].backgroundColor;
+            cameraData[i] = cameras[i].GetUniversalAdditionalCameraData();
+            normalPostProcessing[i] = cameraData[i].renderPostProcessing;
+        }
+    }
+
+    public void SetDungeonView(bool enabled)
+    {
+        CacheViews();
+        if (normalPositions == null || dungeonView == enabled) return;
+        dungeonView = enabled; isTransitioning = false;
+        Vector3 focus = Vector3.up * dungeonFocusHeight;
+        for (int i = 0; i < cameras.Length; i++)
+        {
+            if (enabled)
+            {
+                // Keep the four views' order and viewing distance, with the character centred.
+                float yawOffset = Mathf.DeltaAngle(normalRotations[0].eulerAngles.y, normalRotations[i].eulerAngles.y);
+                viewRotations[i] = Quaternion.Euler(dungeonTilt, dungeonYaw + yawOffset, 0);
+                float distance = Vector3.Distance(normalPositions[i], focus);
+                viewPositions[i] = focus - viewRotations[i] * Vector3.forward * distance;
+            }
+            else
+            {
+                viewPositions[i] = normalPositions[i]; viewRotations[i] = normalRotations[i];
+            }
+            cameras[i].transform.SetLocalPositionAndRotation(viewPositions[i], viewRotations[i]);
+            cameras[i].clearFlags = enabled ? CameraClearFlags.SolidColor : normalClearFlags[i];
+            cameras[i].backgroundColor = enabled ? Color.black : normalBackgrounds[i];
+            cameraData[i].renderPostProcessing = enabled || normalPostProcessing[i];
+        }
+    }
+
+    void Start()
+    {
+        CacheViews();
+        // Cache the default FOV of every camera before any zoom is applied
+        cameraBaseFOV = new float[cameras.Length];
+        for (int i = 0; i < cameras.Length; i++)
+            cameraBaseFOV[i] = cameras[i].fieldOfView;
+
+        targetFOV = cameraBaseFOV[currentCamera];
+        currentFOV = targetFOV;
+
+        SetCamera();
+    }
+
+    void LateUpdate()
+    {
+        if (player != null)
+            transform.position = player.position;
+
+        // Smoothly interpolate current FOV towards target FOV
+        currentFOV = Mathf.SmoothDamp(currentFOV, targetFOV, ref zoomVelocity, zoomSmoothTime);
+        cameras[currentCamera].fieldOfView = currentFOV;
+
+        // Only run the camera-switch transition when actually switching
+        if (!isTransitioning) return;
+
+        transitionTimer += Time.deltaTime;
+
+        float t = Mathf.Clamp01(transitionTimer / transitionDuration);
+        float smoothT = Mathf.SmoothStep(0f, 1f, t);
+
+        cameras[currentCamera].transform.localPosition =
+            Vector3.Lerp(fromPos, toPos, smoothT);
+
+        cameras[currentCamera].transform.localRotation =
+            Quaternion.Slerp(fromRot, toRot, smoothT);
+
+        if (t >= 1f)
+        {
+            isTransitioning = false;
+            cameras[currentCamera].transform.localPosition = toPos;
+            cameras[currentCamera].transform.localRotation = toRot;
+        }
+    }
+
+    void OnZoom(InputAction.CallbackContext ctx)
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput) return;
+        if (minimapScrollFocused) return;
+
+        // Scroll Y positive = scroll up = zoom IN = smaller FOV
+        // Scroll Y negative = scroll down = zoom OUT = larger FOV
+        float scrollY = ctx.ReadValue<Vector2>().y;
+        targetFOV -= scrollY * zoomSpeed * 0.1f;
+        targetFOV = Mathf.Clamp(targetFOV, minFOV, maxFOV);
+    }
+
+    public void SetMinimapScrollFocus(bool focused)
+    {
+        minimapScrollFocused = focused;
+    }
+
+    void ChangeCamera(InputAction.CallbackContext ctx)
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput) return;
+        int previousCamera = currentCamera;
+
+        if (ctx.control.name == "q")
+            currentCamera = (currentCamera + 1) % cameras.Length;
+
+        if (ctx.control.name == "e")
+            currentCamera = (currentCamera + cameras.Length - 1) % cameras.Length;
+
+        fromPos = cameras[previousCamera].transform.localPosition;
+        fromRot = cameras[previousCamera].transform.localRotation;
+
+        toPos = viewPositions[currentCamera];
+        toRot = viewRotations[currentCamera];
+
+        // Sync FOV target to the new camera's base FOV, keeping current zoom delta
+        float zoomDelta = targetFOV - cameraBaseFOV[previousCamera];
+        targetFOV = Mathf.Clamp(cameraBaseFOV[currentCamera] + zoomDelta, minFOV, maxFOV);
+        currentFOV = cameras[currentCamera].fieldOfView;
+
+        cameras[previousCamera].gameObject.SetActive(false);
+        cameras[currentCamera].gameObject.SetActive(true);
+
+        cameras[currentCamera].transform.localPosition = fromPos;
+        cameras[currentCamera].transform.localRotation = fromRot;
+
+        transitionTimer = 0f;
+        isTransitioning = true;
+    }
+
+    void SetCamera()
+    {
+        for (int i = 0; i < cameras.Length; i++)
+        {
+            cameras[i].gameObject.SetActive(i == currentCamera);
+        }
+    }
+}

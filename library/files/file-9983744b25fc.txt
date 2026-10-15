@@ -1,0 +1,26 @@
+using UnityEngine;
+
+[RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
+public sealed class BattleAreaIndicator : MonoBehaviour
+{
+    Mesh mesh;
+    readonly Vector3[] vertices = new Vector3[66];
+    readonly int[] triangles = new int[64 * 3];
+    void Awake()
+    {
+        mesh = new Mesh { name = "Battle area preview" };
+        for (int i = 0; i < 64; i++) { triangles[i * 3] = 0; triangles[i * 3 + 1] = i + 1; triangles[i * 3 + 2] = i + 2; }
+        GetComponent<MeshFilter>().sharedMesh = mesh;
+    }
+    public void Show(Vector3 centre, float radius, float yaw = 0, float degrees = 360)
+    {
+        transform.position = centre + Vector3.up * .045f;
+        vertices[0] = Vector3.zero;
+        for (int i = 0; i <= 64; i++)
+            vertices[i + 1] = Quaternion.Euler(0, yaw - degrees * .5f + i * degrees / 64, 0) * Vector3.forward * radius;
+        mesh.Clear(); mesh.vertices = vertices; mesh.triangles = triangles; mesh.RecalculateBounds();
+        GetComponent<MeshRenderer>().enabled = true;
+    }
+    public void Hide() => GetComponent<MeshRenderer>().enabled = false;
+    void OnDestroy() { if (mesh != null) Destroy(mesh); }
+}

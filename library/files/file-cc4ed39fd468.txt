@@ -1,0 +1,140 @@
+using UnityEngine;
+using UnityEngine.Events;
+
+public class MinigameNPC : NPCBase
+{
+    public enum MinigameKind
+    {
+        BerdlyChemistry,
+        PinkRhythm
+    }
+
+    [Header("Minigame Type & Music")]
+    [SerializeField] private MinigameKind minigameKind = MinigameKind.BerdlyChemistry;
+    [Tooltip("Exclusive theme music played when the player approaches this NPC.")]
+    [SerializeField] private AudioClip exclusiveThemeMusic;
+
+    [Header("Challenge Prompt UI")]
+    [Tooltip("Optional shared challenge prompt. A matching Yes/No panel is created automatically when unassigned.")]
+    [SerializeField] private NPCChallengePrompt challengePrompt;
+
+    [Header("Events")]
+    [SerializeField] private UnityEvent onAcceptChallenge;
+    [SerializeField] private UnityEvent onDeclineChallenge;
+
+    private bool awaitingChallengeResponse;
+    Collider musicCollider;
+    public AudioClip ApproachMusic => exclusiveThemeMusic;
+    public float MusicRadius => proximityRadius;
+    public MinigameKind Kind => minigameKind;
+    public bool IsChallengePending => awaitingChallengeResponse;
+    public string ChallengeName => minigameKind == MinigameKind.PinkRhythm ? "Pink" : "Berdly";
+
+    protected override void Awake() { base.Awake(); musicCollider = GetComponent<Collider>(); }
+
+    void OnEnable() { OverworldMusicController.Instance?.Register(this); }
+
+    protected override void Start()
+    {
+        base.Start();
+        OverworldMusicController.Instance?.Register(this);
+    }
+
+    public float DistanceToPlayerSquared(Transform player)
+    {
+        Collider body = musicCollider;
+        Vector3 point = body != null && body.enabled ? body.ClosestPoint(player.position) : transform.position;
+        return (point - player.position).sqrMagnitude;
+    }
+
+    protected override void OnPlayerApproached()
+    {
+        base.OnPlayerApproached();
+
+        StartDialogue();
+    }
+
+    protected override void HandleInput()
+    {
+        if (awaitingChallengeResponse || NPCChallengePrompt.BlocksGameplayInput) return;
+        if (isDialogueActive) base.HandleInput();
+    }
+
+    protected override void OnSentenceFinished()
+    {
+        if (speechBubble != null) speechBubble.SetInteractPromptVisible(true);
+    }
+
+    protected override void OnFKeyPressedAfterSentence()
+    {
+        if (!isDialogueActive || isTyping || awaitingChallengeResponse) return;
+        base.OnFKeyPressedAfterSentence();
+
+        if (currentLineIndex < dialogueLines.Length - 1)
+        {
+            NextSentence();
+        }
+        else
+        {
+            // End of dialogue -> Show challenge modal (YES / NO prompt)
+            ShowChallengeModal();
+        }
+    }
+
+    protected virtual void ShowChallengeModal()
+    {
+        if (!isPlayerNearby || !isDialogueActive || isTyping ||
+            currentLineIndex != dialogueLines.Length - 1 || awaitingChallengeResponse) return;
+        awaitingChallengeResponse = true;
+        EndDialogue();
+        if (challengePrompt == null) challengePrompt = NPCChallengePrompt.GetOrCreate();
+        challengePrompt.Open(this, ChallengeName, OnAcceptChallengeClicked, OnDeclineChallengeClicked);
+    }
+
+    public override void StartDialogue()
+    {
+        if (awaitingChallengeResponse || NPCChallengePrompt.BlocksGameplayInput) return;
+        base.StartDialogue();
+    }
+
+    public virtual void OnAcceptChallengeClicked()
+    {
+        if (!awaitingChallengeResponse) return;
+        CancelChallengePrompt();
+        EndDialogue();
+        onAcceptChallenge?.Invoke();
+        if (this != null && minigameKind == MinigameKind.BerdlyChemistry && !BerdlyBattleController.IsOpen)
+            BerdlyBattleController.TryOpenFromNPC(this);
+        else if (this != null && minigameKind == MinigameKind.PinkRhythm && !PinkRhythmController.IsOpen)
+            PinkRhythmController.TryOpenFromNPC(this);
+    }
+
+    public virtual void OnDeclineChallengeClicked()
+    {
+        if (!awaitingChallengeResponse) return;
+        CancelChallengePrompt();
+        EndDialogue();
+        onDeclineChallenge?.Invoke();
+    }
+
+    public void CancelChallengePrompt()
+    {
+        awaitingChallengeResponse = false;
+        if (challengePrompt != null) challengePrompt.Close(this);
+    }
+
+    protected override void OnDisable()
+    {
+        CancelChallengePrompt();
+        BerdlyBattleController.CloseForNPC(this);
+        PinkRhythmController.CloseForNPC(this);
+        OverworldMusicController.Instance?.Unregister(this);
+        base.OnDisable();
+    }
+
+    protected override void OnPlayerExited()
+    {
+        CancelChallengePrompt();
+        base.OnPlayerExited();
+    }
+}

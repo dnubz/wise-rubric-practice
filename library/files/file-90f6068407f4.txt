@@ -1,0 +1,41 @@
+using System;
+using UnityEngine;
+
+public sealed class BattleProjectile : MonoBehaviour
+{
+    public BattleUnit owner, target;
+    public int attack;
+    public float scale = 1, speed = 18, radius = .16f, coverDamageMultiplier = 1;
+    public Action<BattleUnit> onHit;
+    public Action onComplete;
+    Vector3 direction;
+    float travelled;
+    bool ready, finished;
+    public void Launch(Vector3 start, Vector3 destination)
+    { transform.position = start; direction = (destination - start).normalized; transform.rotation = Quaternion.LookRotation(direction); ready = true; }
+    void Update()
+    {
+        if (!ready || finished || BattleSession.MenuOpen) return;
+        float step = speed * Time.deltaTime * (BattleController.Instance != null ? BattleController.Instance.SequenceSpeed : 1);
+        var hits = Physics.SphereCastAll(transform.position, radius, direction, step, ~0, QueryTriggerInteraction.Collide);
+        Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (var hit in hits)
+        {
+            var cover = hit.collider.GetComponentInParent<BattleCover>();
+            var unit = hit.collider.GetComponentInParent<BattleUnit>();
+            if (cover != null && cover.HP > 0) { cover.Damage(Mathf.Max(1, Mathf.RoundToInt(attack * scale * coverDamageMultiplier))); Finish(); return; }
+            if (unit == null)
+            {
+                // Solid arena props absorb shots too, even when they have no destructible cover component.
+                if (!hit.collider.isTrigger) { Finish(); return; }
+                continue;
+            }
+            if (unit == owner || !unit.Alive || unit.IsParty == owner.IsParty) continue;
+            unit.Damage(attack, scale); onHit?.Invoke(unit); Finish(); return;
+        }
+        transform.position += direction * step; travelled += step;
+        if (travelled > 60) Finish();
+    }
+    void Finish() { if (finished) return; finished = true; BattleController.Instance?.Impact(transform.position); onComplete?.Invoke(); Destroy(gameObject); }
+    void OnDestroy() { if (!finished) { finished = true; onComplete?.Invoke(); } }
+}

@@ -1,0 +1,124 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+// Inactive fixtures exercise the real UI code without touching the live party or save files.
+[InitializeOnLoad]
+public static class MenuStatBarChecks
+{
+    const string Folder = "Temp/MenuStatBars";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static MenuStatBarChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/result.txt", "PASS: Items/Equipment/Stats HP and SP meshes fill from the left at 0/25/50/75/100%; fixed full-width rectangles survive gear changes and reopening; stats react immediately to HP/SP/EXP/equipment changes and follow character selection. Live party and saves untouched."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/result.txt", "FAIL: " + e); }
+    }
+    [MenuItem("WiSe/UI/Check Menu Stat Bars")]
+    public static void Run()
+    {
+        var root = new GameObject("MenuStatBarFixtures"); root.hideFlags = HideFlags.HideAndDontSave; root.SetActive(false);
+        var channel = ScriptableObject.CreateInstance<CharacterHudEventChannel>();
+        StatsMenuPanelUI stats = null;
+        try
+        {
+            var characters = new CharacterBase[3];
+            string[] paths = { "WiSe", "RandaL", "Druid" };
+            for (int i = 0; i < characters.Length; i++)
+            {
+                var go = Child(root, "Party" + i); var character = go.AddComponent<WiSe>();
+                character.characterData = AssetDatabase.LoadAssetAtPath<CharacterData>("Assets/CharacterData/" + paths[i] + ".asset");
+                character.RestoreSavedState(1, 0, false, character.GetMaxHP(), character.GetMaxSP(), new Equipment[2]);
+                character.SetHudEventChannel(channel); characters[i] = character;
+            }
+            var items = Child(root, "Items").AddComponent<InventoryUI>();
+            var equipment = Child(root, "Equipment").AddComponent<EquipmentUI>();
+            stats = Child(root, "Stats").AddComponent<StatsMenuPanelUI>();
+            var panels = new MonoBehaviour[] { items, equipment, stats };
+            foreach (var panel in panels)
+            {
+                Set(panel, "characters", characters);
+                string hp = panel == stats ? "avatarHP" : "hpBars", sp = panel == stats ? "avatarSP" : "spBars";
+                Set(panel, hp, Enumerable.Range(0, 3).Select(i => Bar(panel.gameObject, "HP" + i)).ToArray());
+                Set(panel, sp, Enumerable.Range(0, 3).Select(i => Bar(panel.gameObject, "SP" + i)).ToArray());
+            }
+            Set(stats, "hudEvents", channel);
+            foreach (string name in new[] { "hpText", "spText", "expText", "attack", "characterName" })
+                Set(stats, name, Child(stats.gameObject, name).AddComponent<TextMeshProUGUI>());
+            Set(stats, "equipment", new TMP_Text[] { Child(stats.gameObject, "Gear0").AddComponent<TextMeshProUGUI>(), Child(stats.gameObject, "Gear1").AddComponent<TextMeshProUGUI>() });
+            Call(stats, "OnEnable");
+            var target = characters[0];
+            foreach (float ratio in new[] { 0f, .25f, .5f, .75f, 1f })
+            {
+                target.RestoreSavedState(1, 0, false, Mathf.RoundToInt(target.GetMaxHP() * ratio), Mathf.RoundToInt(target.GetMaxSP() * ratio), new Equipment[2]);
+                items.UpdateBars(); Call(equipment, "UpdateBars");
+                foreach (var panel in panels)
+                {
+                    CheckMesh(Field<Image[]>(panel, panel == stats ? "avatarHP" : "hpBars")[0], (float)target.GetCurrHP() / target.GetMaxHP());
+                    CheckMesh(Field<Image[]>(panel, panel == stats ? "avatarSP" : "spBars")[0], (float)target.GetCurrSP() / target.GetMaxSP());
+                }
+                Require(Field<TMP_Text>(stats, "spText").text == target.GetCurrSP() + "/" + target.GetMaxSP(), "Stats SP text did not react to state restoration.");
+            }
+            var gear = AssetDatabase.FindAssets("t:Equipment").Select(g => AssetDatabase.LoadAssetAtPath<Equipment>(AssetDatabase.GUIDToAssetPath(g))).First(g => g.SpBonus > 0);
+            target.Equip(gear, 0); items.UpdateBars(); Call(equipment, "UpdateBars");
+            Require(Field<TMP_Text[]>(stats, "equipment")[0].text == gear.ItemName, "Stats equipment stayed stale.");
+            foreach (var panel in panels) CheckMesh(Field<Image[]>(panel, panel == stats ? "avatarSP" : "spBars")[0], (float)target.GetCurrSP() / target.GetMaxSP());
+            target.SpendSP(35); target.TakeDamage(20); target.GainExperience(137);
+            Require(Field<TMP_Text>(stats, "spText").text == target.GetCurrSP() + "/" + target.GetMaxSP() &&
+                Field<TMP_Text>(stats, "hpText").text == target.GetCurrHP() + "/" + target.GetMaxHP() && Field<TMP_Text>(stats, "expText").text == "37/100", "Stats did not react to live HP/SP/EXP changes.");
+            target.RestoreSP(15); target.Unequip(0); items.UpdateBars(); Call(equipment, "UpdateBars");
+            Require(Field<TMP_Text[]>(stats, "equipment")[0].text == "Empty", "Stats did not react to removing gear.");
+            Call(stats, "OnDisable"); Call(stats, "OnEnable");
+            var listeners = (Action<Transform>)typeof(CharacterSwitchManager).GetField("OnActiveCharacterChanged", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+            Require(listeners != null && listeners.GetInvocationList().Any(d => d.Target == stats), "Stats is not subscribed to character selection.");
+            Call(stats, "OnActiveCharacterChanged", characters[2].transform);
+            Require(Field<TMP_Text>(stats, "characterName").text == characters[2].characterData.displayName, "Stats stayed on the previous character.");
+            characters[2].Equip(gear, 0);
+            Require(Field<TMP_Text[]>(stats, "equipment")[0].text == gear.ItemName, "Selected character's gear did not update.");
+        }
+        finally
+        {
+            if (stats != null) Call(stats, "OnDisable");
+            Object.DestroyImmediate(root); Object.DestroyImmediate(channel);
+        }
+    }
+    static GameObject Child(GameObject parent, string name)
+    { var go = new GameObject(name, typeof(RectTransform)); go.transform.SetParent(parent.transform, false); return go; }
+    static Image Bar(GameObject parent, string name)
+    {
+        var track = Child(parent, name.StartsWith("HP") ? "HPBar" : "ManaBar");
+        ((RectTransform)track.transform).sizeDelta = new Vector2(257.9f, 24);
+        var go = Child(track, name); var rect = (RectTransform)go.transform;
+        rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.pivot = Vector2.one * .5f;
+        rect.sizeDelta = new Vector2(204.2f, 15.1f); return go.AddComponent<Image>();
+    }
+    static void CheckMesh(Image image, float ratio)
+    {
+        Require(Mathf.Abs(image.rectTransform.rect.width - 204.2f) < .01f, "Bar width changed rather than its fill.");
+        using (var vertices = new VertexHelper())
+        {
+            typeof(Image).GetMethod("OnPopulateMesh", Private, null, new[] { typeof(VertexHelper) }, null).Invoke(image, new object[] { vertices });
+            if (ratio == 0) { Require(vertices.currentVertCount == 0, "Empty bar still shows fill."); return; }
+            var mesh = new Mesh();
+            try
+            {
+                vertices.FillMesh(mesh); var points = mesh.vertices;
+                float left = points.Min(v => v.x), right = points.Max(v => v.x);
+                Require(Mathf.Abs(left - image.rectTransform.rect.xMin) < .01f && Mathf.Abs(right - left - 204.2f * ratio) < .02f, "Bar mesh is centered or stale: " + image.name + " ratio=" + ratio);
+            }
+            finally { Object.DestroyImmediate(mesh); }
+        }
+    }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static void Set(object owner, string name, object value) => owner.GetType().GetField(name, Private).SetValue(owner, value);
+    static void Call(object owner, string name, params object[] args) => owner.GetType().GetMethod(name, Private).Invoke(owner, args);
+    static void Require(bool okay, string message) { if (!okay) throw new Exception(message); }
+}

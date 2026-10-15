@@ -1,0 +1,38 @@
+using UnityEngine;
+
+// Saved, editable platform prefab; only its placement is generated at runtime.
+public sealed class OverworldPlatformObstacle : MonoBehaviour
+{
+    public BoxCollider[] platforms;
+    public Chest chest;
+    public event System.Action<OverworldPlatformObstacle> Destroyed;
+    void OnDestroy() => Destroyed?.Invoke(this);
+    public Bounds LocalFootprint => new Bounds(new Vector3(0, 0, 17f), new Vector3(14, 2, 50));
+    public Bounds WorldFootprint
+    {
+        get
+        {
+            Bounds local = LocalFootprint;
+            Vector3 size = transform.TransformVector(local.size);
+            return new Bounds(transform.TransformPoint(local.center), new Vector3(Mathf.Abs(size.x), 2, Mathf.Abs(size.z)));
+        }
+    }
+    public bool Reserves(Vector3 point)
+    {
+        Vector3 local = transform.InverseTransformPoint(point);
+        Bounds b = LocalFootprint;
+        return local.x >= b.min.x && local.x <= b.max.x && local.z >= b.min.z && local.z <= b.max.z;
+    }
+    public void Configure(int seed, bool opened, System.Action onOpened)
+    {
+        // Follow the final deck even when its position is edited in the prefab.
+        Bounds deck = platforms[2].bounds;
+        if (ChunkSpawnUtility.TryGetVisualBounds(chest.gameObject, out Bounds visual))
+            chest.transform.position += new Vector3(deck.center.x - visual.center.x,
+                deck.max.y + .02f - visual.min.y, deck.center.z - visual.center.z);
+        chest.RequirePlatformLanding(platforms[2]);
+        chest.ConfigureLootSeed(seed);
+        if (opened) chest.RestoreOpenedState();
+        chest.Opened += onOpened;
+    }
+}

@@ -1,0 +1,176 @@
+using System;
+using System.IO;
+using System.Linq;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+// Editor only: saves ordinary UI children and merchant prefabs, never builds UI during gameplay.
+[InitializeOnLoad]
+public static class NPCShopSetup
+{
+    const string Folder = "Temp/NPCShops";
+    const string MerchantFolder = "Assets/Prefabs/NPCMerchants";
+    static double nextCheck;
+    static Sprite rounded, outline, dots;
+    static TMP_FontAsset font;
+    static Material textMaterial;
+    static NPCShopSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: saved resource shop UI, four merchant prefabs/prices, NPC F prompts and unique minigame dialogue; assigned merchants to the existing procedural NPC spawner."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/UI/Set Up Resource Merchants")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder); Directory.CreateDirectory(MerchantFolder);
+        AssetDatabase.Refresh();
+        font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>("Assets/Fonts/MedievalSharp/MedievalSharp-Regular SDF.asset");
+        textMaterial = AssetDatabase.LoadAssetAtPath<Material>("Assets/UI/Dialogue/MedievalSharp Dialogue.mat");
+        rounded = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Rounded.png");
+        outline = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Outline.png");
+        dots = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Dots.png");
+        if (font == null || rounded == null || outline == null || dots == null) throw new InvalidOperationException("Existing UI assets missing.");
+
+        var merchants = new GameObject[4];
+        string[] resources = { "Wood", "Rock", "Cactus", "Mushroom" };
+        string[] names = { "Marlow", "Rock Merchant", "Cactus Merchant", "Mushroom Merchant" };
+        int[] prices = { 30, 40, 50, 60 };
+        for (int i = 0; i < resources.Length; i++)
+        {
+            var resource = AssetDatabase.LoadAssetAtPath<ResourceItem>("Assets/Scripts/Inventory/Items/Resource/" + resources[i] + ".asset");
+            var itemFields = new SerializedObject(resource); itemFields.FindProperty("cost").intValue = prices[i]; itemFields.ApplyModifiedPropertiesWithoutUndo();
+            string path = MerchantFolder + "/" + resources[i] + "Merchant.prefab";
+            var root = PrefabUtility.LoadPrefabContents(File.Exists(path) ? path : i == 0 || i == 3 ? "Assets/Prefabs/MARI2.prefab" : "Assets/Prefabs/character_rogue.prefab");
+            try
+            {
+                if (root.TryGetComponent<NormalNPC>(out var old)) Object.DestroyImmediate(old);
+                var npc = root.GetComponent<InteractableNPC>(); if (npc == null) npc = root.AddComponent<InteractableNPC>();
+                root.name = resources[i] + "Merchant";
+                npc.SetDialogue(names[i], $"I buy {resources[i].ToLowerInvariant()} for {prices[i]} coins each.", "Finished gathering? Press F to see what you can sell.");
+                var fields = new SerializedObject(npc);
+                fields.FindProperty("resourceToBuy").objectReferenceValue = resource;
+                fields.FindProperty("shopInventory").objectReferenceValue = null;
+                fields.FindProperty("shopUI").objectReferenceValue = null;
+                fields.FindProperty("speechBubble").objectReferenceValue = root.GetComponentInChildren<NPCSpeechBubble>(true);
+                fields.ApplyModifiedPropertiesWithoutUndo();
+                AddPrompts(root);
+                merchants[i] = PrefabUtility.SaveAsPrefabAsset(root, path);
+            }
+            finally { PrefabUtility.UnloadPrefabContents(root); }
+        }
+        foreach (string path in new[] { "Assets/Prefabs/UI/SpeechBubbleCanvas.prefab", "Assets/Prefabs/MARI2.prefab", "Assets/Prefabs/Berdly.prefab", "Assets/Prefabs/Pink.prefab", "Assets/Prefabs/character_rogue.prefab" })
+        {
+            var root = PrefabUtility.LoadPrefabContents(path);
+            try
+            {
+                AddPrompts(root);
+                if (path.EndsWith("Berdly.prefab")) root.GetComponent<MinigameNPC>().SetDialogue("Berdly", "Rooms as carbons, doors as bonds! Naming molecules is my specialty.", "Think you can match my chemistry skills?", "Finish my challenge to unlock WiSe's ultimate. Ready?");
+                if (path.EndsWith("Pink.prefab")) root.GetComponent<MinigameNPC>().SetDialogue("Pink", "Let's-a go! Rainbow Road needs a good rhythm.", "Follow the notes. Keep holding the sliders until they finish!", "Ready to try my rhythm challenge?");
+                PrefabUtility.SaveAsPrefabAsset(root, path);
+            }
+            finally { PrefabUtility.UnloadPrefabContents(root); }
+        }
+
+        Scene scene = SceneManager.GetSceneByName("GameScene");
+        if (!scene.IsValid() || !scene.isLoaded) throw new InvalidOperationException("Open GameScene first.");
+        string backup = Folder + "/GameScene-before-shops.unity"; if (!File.Exists(backup)) File.Copy(scene.path, backup);
+        var main = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<Canvas>(true)).First(c => c.name == "GameplayCanvas");
+        if (main.transform.Find("ResourceShopUI") == null)
+        {
+            var ui = BuildPanel();
+            try
+            {
+                var prefab = PrefabUtility.SaveAsPrefabAsset(ui.gameObject, "Assets/Prefabs/UI/ResourceShopUI.prefab");
+                var saved = (GameObject)PrefabUtility.InstantiatePrefab(prefab, scene); saved.transform.SetParent(main.transform, false);
+                Stretch((RectTransform)saved.transform);
+            }
+            finally { Object.DestroyImmediate(ui.gameObject); }
+        }
+        foreach (var spawner in scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<NPCSpawner>(true)))
+        {
+            var fields = new SerializedObject(spawner); var array = fields.FindProperty("npcPrefabs");
+            foreach (var prefab in merchants.Concat(new[] { AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/MARI2.prefab") }))
+            {
+                bool exists = false; for (int i = 0; i < array.arraySize; i++) if (array.GetArrayElementAtIndex(i).objectReferenceValue == prefab) exists = true;
+                if (exists) continue;
+                int index = array.arraySize++; array.GetArrayElementAtIndex(index).objectReferenceValue = prefab;
+            }
+            fields.ApplyModifiedPropertiesWithoutUndo();
+        }
+        AssetDatabase.SaveAssets(); EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+    }
+
+    static void AddPrompts(GameObject root)
+    {
+        foreach (var bubble in root.GetComponentsInChildren<NPCSpeechBubble>(true))
+        {
+            var prompt = bubble.transform.Find("InteractPrompt");
+            if (prompt == null)
+            {
+                var badge = Box("InteractPrompt", bubble.transform, new Vector2(-125, -82), new Vector2(56, 30), new Color(.145f, .15f, .205f));
+                Label("F", badge.transform, Vector2.zero, new Vector2(50, 28), 22, "F"); prompt = badge.transform;
+            }
+            prompt.gameObject.SetActive(false);
+            var fields = new SerializedObject(bubble); fields.FindProperty("interactPrompt").objectReferenceValue = prompt.gameObject; fields.ApplyModifiedPropertiesWithoutUndo();
+        }
+    }
+    static RectTransform BuildPanel()
+    {
+        var manager = Rect("ResourceShopUI", null, Vector2.zero, new Vector2(1280, 720));
+        var canvas = manager.gameObject.AddComponent<Canvas>(); canvas.overrideSorting = true; canvas.sortingOrder = 220;
+        manager.gameObject.AddComponent<GraphicRaycaster>();
+        var overlay = PlainImage("SellOverlay", manager, Vector2.zero, Vector2.zero, new Color(0, 0, 0, .42f)); Stretch(overlay.rectTransform); overlay.raycastTarget = true;
+        var panel = Box("Panel", overlay.transform, Vector2.zero, new Vector2(1100, 510), new Color(.105f, .19f, .165f, .98f));
+        panel.gameObject.AddComponent<Mask>().showMaskGraphic = true;
+        var pattern = PlainImage("Dots", panel.transform, Vector2.zero, Vector2.zero, new Color(.19f, .35f, .24f, .75f));
+        Stretch(pattern.rectTransform); pattern.sprite = dots; pattern.type = Image.Type.Tiled;
+        var title = Label("Title", panel.transform, new Vector2(0, 125), new Vector2(1000, 90), 36, "Sell all <color=#F1CB61>WOOD</color> to Marlow?");
+        var details = Label("Details", panel.transform, new Vector2(0, -5), new Vector2(1000, 85), 31, "4 x 30 coin = <color=#F1CB61>120 COINS</color>");
+        var sell = Action("SellAllButton", panel.transform, -225, "SELL ALL", out var sellLabel);
+        var close = Action("CancelButton", panel.transform, 225, "CANCEL", out var closeLabel);
+        var border = PlainImage("GoldBorder", panel.transform, Vector2.zero, Vector2.zero, new Color(.95f, .79f, .38f)); Stretch(border.rectTransform); border.sprite = outline; border.type = Image.Type.Sliced;
+        var component = manager.gameObject.AddComponent<ResourceSellUI>(); var fields = new SerializedObject(component);
+        Assign(fields, "panel", overlay.gameObject); Assign(fields, "title", title); Assign(fields, "details", details);
+        Assign(fields, "sellLabel", sellLabel); Assign(fields, "closeLabel", closeLabel); Assign(fields, "sellButton", sell); Assign(fields, "closeButton", close);
+        fields.ApplyModifiedPropertiesWithoutUndo(); overlay.gameObject.SetActive(false); return manager;
+    }
+    static Button Action(string name, Transform parent, float x, string text, out TextMeshProUGUI label)
+    {
+        var image = Box(name, parent, new Vector2(x, -165), new Vector2(370, 92), new Color(.145f, .15f, .205f)); image.raycastTarget = true;
+        var border = PlainImage("WhiteBorder", image.transform, Vector2.zero, Vector2.zero, Color.white); Stretch(border.rectTransform); border.sprite = outline; border.type = Image.Type.Sliced;
+        label = Label("Label", image.transform, Vector2.zero, new Vector2(330, 70), 33, text);
+        var button = image.gameObject.AddComponent<Button>(); button.targetGraphic = image;
+        var colors = button.colors; colors.highlightedColor = new Color(1.3f, 1.3f, 1.3f); colors.pressedColor = new Color(.7f, .7f, .7f);
+        colors.disabledColor = new Color(.5f, .65f, .55f, .75f); button.colors = colors;
+        return button;
+    }
+    static RectTransform Rect(string name, Transform parent, Vector2 position, Vector2 size)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.layer = 5; if (parent != null) obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = position; rect.sizeDelta = size; return rect;
+    }
+    static void Stretch(RectTransform rect) { rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one; rect.offsetMin = rect.offsetMax = Vector2.zero; }
+    static Image PlainImage(string name, Transform parent, Vector2 position, Vector2 size, Color color)
+    { var image = Rect(name, parent, position, size).gameObject.AddComponent<Image>(); image.color = color; image.raycastTarget = false; return image; }
+    static Image Box(string name, Transform parent, Vector2 position, Vector2 size, Color color)
+    { var image = PlainImage(name, parent, position, size, color); image.sprite = rounded; image.type = Image.Type.Sliced; return image; }
+    static TextMeshProUGUI Label(string name, Transform parent, Vector2 position, Vector2 size, float sizeValue, string text)
+    {
+        var label = Rect(name, parent, position, size).gameObject.AddComponent<TextMeshProUGUI>();
+        label.font = font; label.fontSharedMaterial = textMaterial; label.fontStyle = FontStyles.Bold; label.characterSpacing = 3;
+        label.fontSize = sizeValue; label.enableAutoSizing = true; label.fontSizeMin = 18; label.fontSizeMax = sizeValue;
+        label.color = Color.white; label.text = text; label.alignment = TextAlignmentOptions.Center;
+        label.textWrappingMode = TextWrappingModes.Normal; label.raycastTarget = false; return label;
+    }
+    static void Assign(SerializedObject fields, string name, Object value) { fields.FindProperty(name).objectReferenceValue = value; }
+}

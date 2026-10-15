@@ -1,0 +1,404 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.Serialization;
+
+[RequireComponent(typeof(CharacterController), typeof(CharacterSurfaceAudio))]
+public class CharacterMovement : MonoBehaviour
+{
+    [SerializeField] private float moveSpeed = 5.0f;
+    [SerializeField] private float rotationSpeed = 10.0f;
+    [SerializeField] private float jumpHeight = 1.5f;
+    [SerializeField] private float gravity = -19.62f;
+    [SerializeField, Min(0f)] private float jumpBufferSeconds = .15f;
+    [SerializeField, Min(0f)] private float jumpGroundGraceSeconds = .1f;
+    [SerializeField] private Animator animator;
+    [FormerlySerializedAs("floatRiseSpeed")]
+    [SerializeField, Min(0.1f)] private float maxFloatFallSpeed = 1.8f;
+    [SerializeField] private float floatGravityScale = 0.04f;
+
+    [Header("Swimming")]
+    [Tooltip("Swimming speed relative to walking/running speed.")]
+    [SerializeField, Range(0.1f, 1.5f)] private float swimSpeedMultiplier = 0.9f;
+    [SerializeField, Range(0.2f, 0.75f)] private float swimSubmersion = 0.5f;
+    [SerializeField, Min(1f)] private float swimBuoyancy = 14f;
+    [SerializeField, Min(1f)] private float swimDrag = 6f;
+    [SerializeField, Min(0.1f)] private float swimStrokeSpeed = 1.5f;
+
+    private CharacterController controller;
+    private InputSystem_Actions inputActions;
+    private Vector2 moveInput;
+    private Vector3 velocity;
+    private bool jumpRequested;
+    private float jumpExpiresAt, lastGroundedAt = float.NegativeInfinity;
+    private bool groundContactFresh;
+    private bool isFloating = false;
+    private float floatFallSpeedOverride;
+    private float airborneTime;
+    private float groundedAnimationGrace;
+    private bool isSwimming;
+    private float swimTargetY;
+    private bool hasSwimmingParameter;
+    private bool hasSwimState;
+    private float breakElapsed;
+    private System.Action breakImpact, breakFinished, breakSwing;
+    public bool IsBreakingDecoration { get; private set; }
+    private static readonly int BreakStateHash = Animator.StringToHash("Base Layer.BreakDecoration");
+
+    public bool IsGrounded => !isSwimming && groundContactFresh && controller != null && controller.isGrounded;
+    public bool IsSwimming => isSwimming;
+    public void Teleport(Vector3 position, Quaternion rotation)
+    {
+        FinishBreaking();
+        bool enabled = controller != null && controller.enabled;
+        if (enabled) controller.enabled = false;
+        transform.SetPositionAndRotation(position, rotation);
+        velocity = Vector3.zero; jumpRequested = false; isSwimming = false;
+        lastGroundedAt = float.NegativeInfinity;
+        groundContactFresh = false;
+        airborneTime = 0f; groundedAnimationGrace = 0f;
+        if (enabled) controller.enabled = true;
+    }
+    public float SwimSpeed => moveSpeed * swimSpeedMultiplier;
+
+    private static readonly int SpeedHash = Animator.StringToHash("Speed");
+    private static readonly int JumpHash = Animator.StringToHash("Jump");
+    private static readonly int JumpStateHash = Animator.StringToHash("Jump");
+    private static readonly int IsGroundedHash = Animator.StringToHash("IsGrounded");
+    private static readonly int IdleStateHash = Animator.StringToHash("Base Layer.Idle");
+    private static readonly int RunStateHash = Animator.StringToHash("Base Layer.Run");
+    private static readonly int SwimStateHash = Animator.StringToHash("Base Layer.Swim");
+    private static readonly int IsSwimmingHash = Animator.StringToHash("IsSwimming");
+    private static readonly int SwimAnimationSpeedHash = Animator.StringToHash("SwimAnimationSpeed");
+    private bool hasSwimAnimationSpeed;
+
+    private void Awake()
+    {
+        controller = GetComponent<CharacterController>();
+        inputActions = new InputSystem_Actions();
+
+        if (animator == null)
+            animator = GetComponentInChildren<Animator>();
+        if (animator != null)
+        {
+            hasSwimState = animator.HasState(0, SwimStateHash);
+            foreach (AnimatorControllerParameter parameter in animator.parameters)
+            {
+                if (parameter.nameHash == IsSwimmingHash && parameter.type == AnimatorControllerParameterType.Bool)
+                    hasSwimmingParameter = true;
+                if (parameter.nameHash == SwimAnimationSpeedHash && parameter.type == AnimatorControllerParameterType.Float)
+                    hasSwimAnimationSpeed = true;
+            }
+        }
+    }
+
+    private void OnEnable()
+    {
+        if (inputActions == null)
+            inputActions = new InputSystem_Actions();
+
+        inputActions.Enable();
+
+        InputAction moveAction = inputActions.asset.FindAction("Move");
+        if (moveAction != null)
+        {
+            moveAction.performed += OnMovePerformed;
+            moveAction.canceled += OnMoveCanceled;
+        }
+
+        InputAction jumpAction = inputActions.asset.FindAction("Jump");
+        if (jumpAction != null)
+            jumpAction.performed += OnJumpPerformed;
+    }
+
+    private void OnDisable()
+    {
+        FinishBreaking();
+        if (inputActions != null)
+        {
+            InputAction moveAction = inputActions.asset.FindAction("Move");
+            if (moveAction != null)
+            {
+                moveAction.performed -= OnMovePerformed;
+                moveAction.canceled -= OnMoveCanceled;
+            }
+
+            InputAction jumpAction = inputActions.asset.FindAction("Jump");
+            if (jumpAction != null)
+                jumpAction.performed -= OnJumpPerformed;
+
+            inputActions.Disable();
+        }
+
+        moveInput = Vector2.zero;
+        jumpRequested = false;
+        lastGroundedAt = float.NegativeInfinity;
+        groundContactFresh = false;
+        isFloating = false;
+        floatFallSpeedOverride = 0f;
+        airborneTime = 0f;
+        groundedAnimationGrace = 0f;
+        velocity = Vector3.zero;
+        isSwimming = false;
+        if (animator != null && hasSwimmingParameter) animator.SetBool(IsSwimmingHash, false);
+    }
+
+    private void OnMovePerformed(InputAction.CallbackContext ctx) => moveInput = ctx.ReadValue<Vector2>();
+    private void OnMoveCanceled(InputAction.CallbackContext ctx) => moveInput = Vector2.zero;
+
+    private void OnJumpPerformed(InputAction.CallbackContext ctx)
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput) return;
+        if (IsBreakingDecoration) return;
+        // Input runs before movement: a press at a floor seam or just before
+        // landing must survive until the controller confirms ground contact.
+        jumpRequested = true;
+        jumpExpiresAt = Time.time + jumpBufferSeconds;
+    }
+
+    public void SetFloating(bool floating, float maxFallSpeed = 0f)
+    {
+        isFloating = floating;
+        floatFallSpeedOverride = floating ? maxFallSpeed : 0f;
+    }
+
+    private void Update()
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput)
+        {
+            FinishBreaking();
+            jumpRequested = false;
+            lastGroundedAt = float.NegativeInfinity;
+            if (animator != null) animator.SetFloat(SpeedHash, 0f);
+            return;
+        }
+        if (IsBreakingDecoration)
+        {
+            // Keep WiSe planted during the strike, while gravity still keeps his feet on the floor.
+            jumpRequested = false;
+            ApplyJumpAndGravity(Vector3.zero);
+            AdvanceBreaking(Time.deltaTime);
+            return;
+        }
+        UpdateSwimmingState();
+        Vector3 horizontalMovement = GetHorizontalMovement();
+        if (isSwimming) ApplySwimming(horizontalMovement);
+        else ApplyJumpAndGravity(horizontalMovement);
+        UpdateAnimator();
+    }
+
+    public bool TryPlayBreakAction(Vector3 target, System.Action impact, System.Action finished, System.Action swingSound = null)
+    {
+        if (IsBreakingDecoration || isSwimming || !isActiveAndEnabled || animator == null ||
+            !animator.HasState(0, BreakStateHash) || NPCChallengePrompt.BlocksGameplayInput) return false;
+        Vector3 direction = target - transform.position; direction.y = 0;
+        if (direction.sqrMagnitude > .001f) transform.rotation = Quaternion.LookRotation(direction);
+        breakElapsed = 0; breakImpact = impact; breakFinished = finished; breakSwing = swingSound;
+        IsBreakingDecoration = true; jumpRequested = false;
+        animator.ResetTrigger(JumpHash); animator.SetFloat(SpeedHash, 0); animator.SetBool(IsGroundedHash, true);
+        animator.CrossFadeInFixedTime(BreakStateHash, .06f, 0, 0);
+        return true;
+    }
+
+    private void AdvanceBreaking(float deltaTime)
+    {
+        breakElapsed += deltaTime;
+        // Interactions already check reach. Face the target and slash from the
+        // current position instead of pulling the player into its trunk/body.
+        var swing = animator.GetCurrentAnimatorStateInfo(0);
+        // Start the whoosh as the arm swings forward, rather than during the initial windup.
+        if (breakSwing != null && swing.fullPathHash == BreakStateHash && swing.normalizedTime >= .20f)
+        {
+            var sound = breakSwing; breakSwing = null; sound();
+        }
+        if (breakElapsed >= .32f && breakImpact != null &&
+            swing.fullPathHash == BreakStateHash && swing.normalizedTime >= .44f)
+        {
+            var impact = breakImpact; breakImpact = null; impact();
+        }
+        if (breakElapsed >= .75f) FinishBreaking();
+    }
+
+    private void FinishBreaking()
+    {
+        if (!IsBreakingDecoration) return;
+        IsBreakingDecoration = false; breakImpact = null; breakSwing = null;
+        var finished = breakFinished; breakFinished = null;
+        if (animator != null && animator.isActiveAndEnabled && animator.HasState(0, IdleStateHash))
+            animator.CrossFadeInFixedTime(IdleStateHash, .1f);
+        finished?.Invoke();
+    }
+
+    private void UpdateSwimmingState()
+    {
+        WFCWorldManager world = WFCWorldManager.Instance;
+        bool swimming = false;
+        if (world != null && world.isActiveAndEnabled && world.TryGetWaterSurface(transform.position, out float surface))
+        {
+            float bodyHeight = Mathf.Max(0.5f, controller.bounds.size.y);
+            float footOffset = controller.bounds.min.y - transform.position.y;
+            float depth = world.GetWaterBedDepth(transform.position);
+            // Start at surface contact, rather than waiting until the body sinks.
+            // Feet above the surface (on a boat or during a jump) remain on land.
+            swimming = depth > (isSwimming ? 0.04f : 0.08f) &&
+                controller.bounds.min.y <= surface + (isSwimming ? 0.18f : 0.06f);
+            // Stay above the prefab bed while crossing the shallow shoreline.
+            float immersion = Mathf.Min(bodyHeight * swimSubmersion, world.WaterDepth * 0.7f,
+                Mathf.Max(0f, depth - 0.05f));
+            swimTargetY = surface - immersion - footOffset;
+        }
+
+        if (swimming == isSwimming) return;
+        isSwimming = swimming;
+        jumpRequested = false;
+        lastGroundedAt = float.NegativeInfinity;
+        velocity.y = 0f;
+        airborneTime = 0f;
+        groundedAnimationGrace = 0f;
+        if (animator != null)
+        {
+            animator.ResetTrigger(JumpHash);
+            if (hasSwimmingParameter) animator.SetBool(IsSwimmingHash, isSwimming);
+            if (isSwimming || hasSwimState)
+            {
+                int state = isSwimming
+                    ? (hasSwimState ? SwimStateHash : IdleStateHash)
+                    : (moveInput.sqrMagnitude > 0.01f ? RunStateHash : IdleStateHash);
+                if (animator.HasState(0, state)) animator.CrossFadeInFixedTime(state, 0.12f);
+            }
+        }
+    }
+
+    private void ApplySwimming(Vector3 horizontalMovement)
+    {
+        if (jumpRequested)
+        {
+            velocity.y = swimStrokeSpeed;
+            jumpRequested = false;
+        }
+        float raisedSurface = inputActions.Player.Jump.IsPressed() ? 0.15f : 0f;
+        float bob = Mathf.Sin(Time.time * 3f) * 0.025f;
+        float error = swimTargetY + raisedSurface + bob - transform.position.y;
+        velocity.y += (error * swimBuoyancy - velocity.y * swimDrag) * Time.deltaTime;
+        velocity.y = Mathf.Clamp(velocity.y, -2f, 2f);
+        controller.Move((horizontalMovement + velocity) * Time.deltaTime);
+        airborneTime = 0f;
+    }
+
+    private Vector3 GetHorizontalMovement()
+    {
+        Vector3 forward = Camera.main.transform.forward;
+        Vector3 right = Camera.main.transform.right;
+
+        forward.y = 0f;
+        right.y = 0f;
+        forward.Normalize();
+        right.Normalize();
+
+        Vector3 moveDirection = right * moveInput.x + forward * moveInput.y;
+        moveDirection.Normalize();
+
+        if (moveDirection.magnitude >= 0.1f)
+        {
+            Quaternion targetRotation = Quaternion.LookRotation(moveDirection, Vector3.up);
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
+            return moveDirection * (isSwimming ? SwimSpeed : moveSpeed);
+        }
+
+        return Vector3.zero;
+    }
+
+    private void ApplyJumpAndGravity(Vector3 horizontalMovement)
+    {
+        // Re-enabling a controller after teleport/switching can retain its old
+        // contact flag. Only trust it after a fresh movement collision check.
+        bool wasGrounded = groundContactFresh && controller.isGrounded;
+        if (wasGrounded && velocity.y <= 0) lastGroundedAt = Time.time;
+        if (wasGrounded && velocity.y < 0)
+            velocity.y = -2f;
+
+        ConsumeBufferedJump();
+
+        // Holding jump slows descent only after the jump reaches its apex.
+        bool slowFalling = isFloating && !wasGrounded && velocity.y <= 0f;
+        velocity.y += gravity * (slowFalling ? floatGravityScale : 1f) * Time.deltaTime;
+        if (slowFalling)
+        {
+            float fallLimit = floatFallSpeedOverride > 0f
+                ? floatFallSpeedOverride : maxFloatFallSpeed;
+            velocity.y = Mathf.Max(velocity.y, -fallLimit);
+        }
+
+        CollisionFlags collisions = controller.Move(
+            (horizontalMovement + velocity) * Time.deltaTime);
+        groundContactFresh = true;
+        bool hitGround = (collisions & CollisionFlags.Below) != 0;
+        if (!wasGrounded && hitGround)
+        {
+            velocity.y = -2f;
+            if (animator != null)
+            {
+                animator.ResetTrigger(JumpHash);
+
+                // Settle directly into the grounded pose after a real fall.
+                if (airborneTime > 0.1f &&
+                    animator.GetCurrentAnimatorStateInfo(0).shortNameHash == JumpStateHash)
+                {
+                    int groundedState = moveInput.sqrMagnitude > 0.01f
+                        ? RunStateHash : IdleStateHash;
+                    if (animator.HasState(0, groundedState))
+                    {
+                        animator.SetBool(IsGroundedHash, true);
+                        animator.CrossFadeInFixedTime(groundedState, 0.05f);
+                    }
+                }
+            }
+        }
+
+        airborneTime = hitGround ? 0f : airborneTime + Time.deltaTime;
+        if (hitGround && velocity.y <= 0)
+        {
+            lastGroundedAt = Time.time;
+            // Use a landing press in this frame, rather than letting it expire
+            // before the next Update on a slow frame.
+            ConsumeBufferedJump();
+        }
+    }
+
+    private void ConsumeBufferedJump()
+    {
+        if (jumpRequested && Time.time > jumpExpiresAt) jumpRequested = false;
+        if (!jumpRequested || velocity.y > 0 || Time.time - lastGroundedAt > jumpGroundGraceSeconds) return;
+        velocity.y = Mathf.Sqrt(jumpHeight * -2f * gravity);
+        if (animator != null) animator.SetTrigger(JumpHash);
+        jumpRequested = false;
+        // Do not reuse floor contact for another press during this jump.
+        lastGroundedAt = float.NegativeInfinity;
+    }
+
+    private void UpdateAnimator()
+    {
+        if (animator == null) return;
+
+        if (isSwimming)
+        {
+            animator.SetFloat(SpeedHash, hasSwimState ? moveInput.magnitude * SwimSpeed : 0f);
+            animator.SetBool(IsGroundedHash, !hasSwimState);
+            if (hasSwimAnimationSpeed)
+                animator.SetFloat(SwimAnimationSpeedHash,
+                    Mathf.Lerp(0.7f, 1.15f, Mathf.Clamp01(moveInput.magnitude)));
+            return;
+        }
+
+        float currentSpeed = moveInput.magnitude * moveSpeed;
+        animator.SetFloat(SpeedHash, currentSpeed);
+        if (controller.isGrounded)
+            groundedAnimationGrace = 0.08f;
+        else
+            groundedAnimationGrace = Mathf.Max(0f, groundedAnimationGrace - Time.deltaTime);
+
+        // A one-frame loss of floor contact should not restart the jump pose.
+        bool groundedForAnimation = controller.isGrounded ||
+            (velocity.y <= 0f && groundedAnimationGrace > 0f);
+        animator.SetBool(IsGroundedHash, groundedForAnimation);
+    }
+}

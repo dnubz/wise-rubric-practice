@@ -1,0 +1,92 @@
+using UnityEngine;
+using UnityEngine.Events;
+
+public class InteractableNPC : NPCBase
+{
+    [Header("Interactable Settings")]
+    [Tooltip("Event triggered when the player presses F at the end of the dialogue (e.g. open Shop UI).")]
+    [SerializeField] private UnityEvent onInteract;
+
+    [Header("Optional Shop")]
+    [Tooltip("Assign a ShopInventory to open the shop after this NPC's dialogue.")]
+    [SerializeField] private ShopInventory shopInventory;
+    [SerializeField] private ShopUI shopUI;
+    [Header("Resource Merchant")]
+    [Tooltip("This merchant buys only this resource, at its saved Cost per item.")]
+    [SerializeField] private ResourceItem resourceToBuy;
+    public ResourceItem BoughtResource => resourceToBuy;
+    public bool IsShop => shopInventory != null || resourceToBuy != null;
+
+    protected override void OnPlayerApproached()
+    {
+        base.OnPlayerApproached();
+
+        StartDialogue();
+    }
+
+    protected override void HandleInput()
+    {
+        if (isDialogueActive) base.HandleInput();
+    }
+
+    protected override void OnSentenceFinished()
+    {
+        if (speechBubble != null) speechBubble.SetInteractPromptVisible(true);
+    }
+
+    protected override void OnFKeyPressedAfterSentence()
+    {
+        if (!isDialogueActive || isTyping) return;
+
+        // If there are more lines, pressing F advances to the next line
+        if (currentLineIndex < dialogueLines.Length - 1)
+        {
+            NextSentence();
+        }
+        else
+        {
+            // On the last line, pressing F triggers the special interaction!
+            EndDialogue();
+            TriggerInteraction();
+        }
+    }
+
+    public virtual void TriggerInteraction()
+    {
+        if (resourceToBuy != null)
+        {
+            var selling = FindAnyObjectByType<ResourceSellUI>(FindObjectsInactive.Include);
+            if (selling != null) selling.Open(this);
+            else Debug.LogWarning($"[{npcName}] ResourceSellUI is missing from the scene.");
+            return;
+        }
+        if (shopInventory != null)
+        {
+            if (shopUI == null)
+                shopUI = FindFirstObjectByType<ShopUI>(FindObjectsInactive.Include);
+
+            if (shopUI == null)
+            {
+                Debug.LogWarning($"[{npcName}] No ShopUI was found in the scene.");
+                return;
+            }
+
+            if (!shopUI.IsOpen)
+                shopUI.OpenShop(shopInventory);
+            return;
+        }
+
+        onInteract?.Invoke();
+    }
+
+    protected override void OnPlayerExited()
+    {
+        ResourceSellUI.CloseFor(this);
+        base.OnPlayerExited();
+    }
+    protected override void OnDisable()
+    {
+        ResourceSellUI.CloseFor(this);
+        base.OnDisable();
+    }
+}

@@ -1,0 +1,9 @@
+using UnityEngine;
+
+public static class DungeonIdentity
+{
+    // Entrances are placed deterministically by the overworld spawner. Quantization
+    // ignores harmless float drift when an entrance's chunk is reloaded.
+    public static Vector2Int At(Vector3 position) => new Vector2Int(Mathf.RoundToInt(position.x), Mathf.RoundToInt(position.z));
+    public static int Seed(int worldSeed, Vector2Int entrance) => WorldRandom.Seed(worldSeed, entrance.x, entrance.y, 0x44554E47);
+}

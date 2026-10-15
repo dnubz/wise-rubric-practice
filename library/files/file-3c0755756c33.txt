@@ -1,0 +1,24 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a83442ee8ab248c29d05518ff001042b, type: 3}
+  m_Name: Equipment
+  m_EditorClassIdentifier: Assembly-CSharp::CheatEquipmentCatalog
+  equipment:
+  - {fileID: 11400000, guid: 04a5d9dfe615fb3498027cf223060bb1, type: 2}
+  - {fileID: 11400000, guid: a9fd82d601b9c2a499095d754700dee1, type: 2}
+  - {fileID: 11400000, guid: 5ab2f1620f26e7247a855f71678b6819, type: 2}
+  - {fileID: 11400000, guid: bf3f7e98cc12471459d4d058ca6eb4d5, type: 2}
+  - {fileID: 11400000, guid: da2a9dd9e9266ef4d8635c3f33154a1e, type: 2}
+  - {fileID: 11400000, guid: 8411ffd98b6600c41be6577c919e07b3, type: 2}
+  - {fileID: 11400000, guid: cf4897aeeb333d34e8f73b80b85b91ba, type: 2}
+  - {fileID: 11400000, guid: bc58600d6fc0cf142955ed2d1620d880, type: 2}
+  - {fileID: 11400000, guid: d1c16e7cc1de9584287cea23d8a43d98, type: 2}

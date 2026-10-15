@@ -1,0 +1,146 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class WiseSkillChecks
+{
+    const string Folder = "Temp/WiseSkills";
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static WiseSkillChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: actual crescent front/back/range and cover hits, kill refunds/heal; shield ally range/cap/one-hit block; ten round-robin fireballs overlapping in flight, shared damage, collision-only triple cover damage; two-turn dodge aura and early/perfect/late/missed timing with five perfect counters; persistent animated dragon and effect cleanup."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result) { File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static void Set(object target, string property, object value) => target.GetType().GetProperty(property).SetValue(target, value);
+    static void Warp(BattleUnit unit, Vector3 point) { unit.HoldPosition(); Require(unit.Agent.Warp(point), "Warp failed."); unit.ResetMovement(); }
+    static IEnumerator Cast(BattleController battle, BattleUnit wise, int slot, Vector3 point)
+    {
+        wise.AP = 2; wise.character.RestoreSP(wise.character.GetMaxSP()); wise.character.BattleCooldowns[slot] = 0;
+        battle.SelectSkill(slot); Set(battle, "AimPoint", point); battle.ConfirmSkill();
+        Require(battle.Phase == BattlePhase.Acting, "Skill did not start: " + slot);
+        float deadline = Time.realtimeSinceStartup + 12;
+        while (battle.Phase == BattlePhase.Acting && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(battle.Phase == BattlePhase.Player, "Skill did not finish: " + slot);
+    }
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance; Require(session != null, "Session missing.");
+        if (session.menu != null) session.menu.SetActive(false); Time.timeScale = 1;
+        if (!BattleSession.IsActive)
+        {
+            var encounter = Object.Instantiate(session.settings.enemies[0].prefab).GetComponent<EncounterEnemy>();
+            encounter.Configure(session.settings.enemies[0], "test:wise"); encounter.enabled = false;
+            Require(session.Begin(encounter), "Battle could not begin.");
+        }
+        float deadline = Time.realtimeSinceStartup + 30;
+        while ((BattleController.Instance == null || !BattleController.Instance.Ready) && Time.realtimeSinceStartup < deadline) yield return null;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Battle load failed.");
+        var wise = battle.Party[0]; battle.SelectCharacter(0);
+        Vector3 centre = battle.Layout.transform.position;
+        var originalCover = battle.Layout.cover[0];
+        foreach (var cover in battle.Layout.cover) cover.gameObject.SetActive(false);
+        battle.RebuildGround();
+        foreach (var enemy in battle.Enemies) { enemy.HP = 0; enemy.Refresh(); }
+        Warp(wise, centre); wise.transform.rotation = Quaternion.identity;
+        Warp(battle.Party[1], centre + Vector3.left * 6);
+        Warp(battle.Party[2], centre + Vector3.left * 12);
+        var data = battle.settings.enemies.First(e => e.kind == BattleEnemyKind.Skeleton);
+        var front = battle.SpawnEnemy(data, centre + Vector3.forward * 4, false);
+        var behind = battle.SpawnEnemy(data, centre + new Vector3(3, 0, -.1f), false);
+        var far = battle.SpawnEnemy(data, centre + Vector3.forward * 6, false);
+        front.HP = behind.HP = far.HP = 1000;
+        var testCover = Object.Instantiate(originalCover); testCover.gameObject.SetActive(true);
+        testCover.transform.position = centre + new Vector3(-3, 0, 2);
+        Set(testCover, "HP", 1000); battle.Layout.cover = battle.Layout.cover.Concat(new[] { testCover }).ToArray();
+        var cast = Cast(battle, wise, 0, centre); bool sweepSeen = false;
+        while (cast.MoveNext()) { sweepSeen |= Object.FindAnyObjectByType<BattleCrescentVisual>() != null; yield return null; }
+        sweepSeen |= Object.FindAnyObjectByType<BattleCrescentVisual>() != null;
+        Require(front.HP < 1000 && behind.HP == 1000 && far.HP == 1000 && testCover.HP == 1000 - 25 - wise.Attack, "Crescent hit outside its preview or missed cover.");
+        Require(sweepSeen && wise.movementLocked && wise.character.BattleCooldowns[0] == 1, $"Crescent feedback/lock/cooldown missing: sweep={sweepSeen}, lock={wise.movementLocked}, cooldown={wise.character.BattleCooldowns[0]}.");
+        front.HP = 1; wise.character.SetCurrentHP(wise.MaxHP - 100); wise.moveOrigin = centre - Vector3.forward * 2;
+        cast = Cast(battle, wise, 0, centre); while (cast.MoveNext()) yield return null;
+        Require(!front.Alive && !wise.movementLocked && wise.character.BattleCooldowns[0] == 0 && wise.CurrentHP == wise.MaxHP - 100 + Mathf.CeilToInt(wise.MaxHP * .05f), "Kill did not refund/heal.");
+        Require(Vector3.Distance(wise.moveOrigin, wise.transform.position) < .01f, "Kill did not reset movement origin.");
+
+        for (int i = 0; i < 4; i++) { cast = Cast(battle, wise, 1, centre); while (cast.MoveNext()) yield return null; }
+        yield return null;
+        Require(wise.shields == 3 && battle.Party[1].shields == 3 && battle.Party[2].shields == 0, "Shield cap/ally radius failed.");
+        var status = wise.GetComponentInChildren<BattleStatusVisual>();
+        int hp = wise.CurrentHP; Require(wise.Damage(9999) == 0 && wise.CurrentHP == hp && wise.shields == 2, "Shield did not absorb exactly one hit.");
+        yield return null;
+        Require(status.shield.GetComponentsInChildren<LineRenderer>().Count(l => l.enabled) == 2, "Shield visuals did not show remaining charges.");
+
+        behind.HP = far.HP = 1000;
+        Warp(behind, centre + new Vector3(-3, 0, 7)); Warp(far, centre + new Vector3(3, 0, 7));
+        testCover.transform.position = centre + Vector3.forward * 11; Set(testCover, "HP", 1000);
+        Physics.SyncTransforms();
+        var dragon = wise.Dragon; Require(dragon != null && dragon.GetComponent<Animator>().runtimeAnimatorController != null, "Flying companion missing.");
+        cast = Cast(battle, wise, 2, centre + Vector3.forward * 7);
+        var seen = new HashSet<BattleProjectile>(); var targets = new List<BattleUnit>(); int maxFlying = 0, totalAttack = 0;
+        while (cast.MoveNext())
+        {
+            var shots = Object.FindObjectsByType<BattleProjectile>().Where(p => p.owner == wise).ToArray(); maxFlying = Mathf.Max(maxFlying, shots.Length);
+            foreach (var shot in shots) if (seen.Add(shot)) { targets.Add(shot.target); totalAttack += shot.attack; Require(shot.coverDamageMultiplier == 3, "Dragon fireball cover multiplier missing."); }
+            yield return null;
+        }
+        Require(targets.Count == 10 && Enumerable.Range(0, 10).All(i => targets[i] == (i % 2 == 0 ? behind : far)), "Volley did not fire five rounds across both targets: " + targets.Count);
+        Require(maxFlying > 1 && behind.HP < 1000 && far.HP < 1000 && totalAttack == 2 * Mathf.RoundToInt((60 + wise.Attack * 1.1f) * .7f), "Volley concurrency/per-enemy damage split failed.");
+        Require(testCover.HP == 1000 && wise.Dragon == dragon, "Volley damaged untouched cover or removed companion.");
+        // Actual projectile collision must block the target and triple cover damage.
+        testCover.transform.position = centre + Vector3.forward * 3;
+        Physics.SyncTransforms(); bool done = false;
+        battle.StartCoroutine(Complete(battle.FireProjectile(wise, centre + Vector3.forward * 8 + Vector3.up * 2, 10, start: centre + Vector3.up * 2, coverDamageMultiplier: 3), () => done = true));
+        deadline = Time.realtimeSinceStartup + 5; while (!done && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(done && testCover.HP == 970, "Fireball did not deal triple collision damage to cover: " + testCover.HP);
+        testCover.gameObject.SetActive(false); battle.RebuildGround();
+
+        wise.character.UnlockUltimate(); cast = Cast(battle, wise, 3, centre); while (cast.MoveNext()) yield return null;
+        yield return null; Require(wise.dodgeTurns == 2 && status.dodge.activeSelf, "Two-turn dodge stance/aura missing.");
+        Set(battle, "Phase", BattlePhase.Enemy);
+        foreach (float timing in new[] { .2f, .7f, .89f, -1f })
+        {
+            Warp(wise, centre); Warp(behind, centre + Vector3.forward * 2); behind.HP = 1000;
+            done = false; bool evaded = false;
+            var dodge = (IEnumerator)typeof(BattleController).GetMethod("Dodge", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(battle, new object[] { behind, wise, (Action<bool>)(value => evaded = value) });
+            battle.StartCoroutine(Complete(dodge, () => done = true));
+            if (timing >= 0) battle.StartCoroutine((IEnumerator)typeof(BattleChecks).GetMethod("DodgeInput", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { timing, timing == .7f }));
+            deadline = Time.realtimeSinceStartup + 6; while (!done && Time.realtimeSinceStartup < deadline) yield return null;
+            Require(done && evaded == (timing >= 0), "Dodge window failed: " + timing);
+            int counters = timing == .7f ? 5 * Mathf.Max(1, 3 + wise.Attack - behind.Defense) : 0;
+            Require(behind.HP == 1000 - counters, "Early/late must only evade; perfect must allow five counters.");
+        }
+        wise.StartTurn(); yield return null; Require(wise.dodgeTurns == 1 && status.dodge.activeSelf, "Stance ended early.");
+        wise.StartTurn(); yield return null; Require(wise.dodgeTurns == 0 && !status.dodge.activeSelf, "Stance aura did not expire.");
+        wise.ClearEffects(); yield return null; Require(dragon == null && status == null, "Battle-only feedback leaked after cleanup.");
+    }
+    static IEnumerator Complete(IEnumerator action, Action done) { yield return action; done(); }
+}

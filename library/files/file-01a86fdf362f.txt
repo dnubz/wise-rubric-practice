@@ -1,0 +1,151 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.AI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class EncounterNavigationChecks
+{
+    const string Folder = "Temp/EncounterNavigation";
+    const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static EncounterNavigationChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: real WFC terrain NavMesh detects a player 35m away, repaths to a moved player and follows beyond the old 12m home limit; generated dungeon rooms have isolated NavMeshes, agents route around a solid wall, breaking/removing it opens the route, and inactive rooms remove their navigation."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result) { File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool condition, string message) { if (!condition) throw new Exception(message); }
+    static float Flat(Vector3 a, Vector3 b) => Vector3.ProjectOnPlane(a - b, Vector3.up).magnitude;
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var player = CharacterSwitchManager.CurrentCharacterTransform;
+        var movement = player.GetComponent<CharacterMovement>();
+        movement.enabled = false;
+        var world = WFCWorldManager.Instance;
+        Require(world != null, "WFC world is missing.");
+        world.enabled = false;
+        var navigation = world.GetComponent<ExplorationNavigation>();
+        float deadline = Time.realtimeSinceStartup + 35;
+        while (!navigation.Ready && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(navigation.Ready, "Generated WFC terrain NavMesh did not finish.");
+        var data = Resources.Load<BattleSettings>("Battle/Settings").enemies.First(e => e.kind == BattleEnemyKind.Skeleton);
+        Require(NavMesh.SamplePosition(player.position, out var playerSpot, 8, NavMesh.AllAreas), "Spawn area has no walkable NavMesh.");
+        movement.Teleport(playerSpot.position, Quaternion.identity);
+        var path = new NavMeshPath(); Vector3 start = default; bool found = false;
+        for (int i = 0; i < 16; i++)
+        {
+            float angle = i * Mathf.PI / 8;
+            Vector3 point = playerSpot.position + new Vector3(Mathf.Sin(angle), 0, Mathf.Cos(angle)) * 35;
+            if (NavMesh.SamplePosition(point, out var spot, 3, NavMesh.AllAreas) && Flat(spot.position, player.position) > 32 &&
+                NavMesh.CalculatePath(spot.position, player.position, NavMesh.AllAreas, path) && path.status == NavMeshPathStatus.PathComplete)
+            { start = spot.position; found = true; break; }
+        }
+        Require(found, "No connected 35m overworld path found.");
+        var model = Object.Instantiate(data.prefab, start, Quaternion.identity, world.transform);
+        var encounter = model.GetComponent<EncounterEnemy>(); encounter.Configure(data, "navigation-check");
+        var agent = model.GetComponent<NavMeshAgent>();
+        deadline = Time.realtimeSinceStartup + 4;
+        while ((!agent.enabled || !agent.isOnNavMesh || agent.pathPending || !agent.hasPath) && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(encounter.CurrentState == EncounterEnemy.State.Chase && agent.enabled && agent.isOnNavMesh && agent.hasPath,
+            "Enemy does not detect/pursue the player beyond the old range.");
+        Vector3 shifted = player.position + Vector3.right * 3;
+        Require(NavMesh.SamplePosition(shifted, out var moved, 3, NavMesh.AllAreas), "Moved player target has no NavMesh.");
+        movement.Teleport(moved.position, Quaternion.identity);
+        float wait = Time.realtimeSinceStartup + .7f;
+        while (Time.realtimeSinceStartup < wait) yield return null;
+        Require(Flat(agent.destination, player.position) < .3f, "Agent does not refresh its destination when the player moves.");
+        deadline = Time.realtimeSinceStartup + 14;
+        while (Flat(model.transform.position, start) < 13 && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(Flat(model.transform.position, start) >= 13, "Chase is still capped at the old home radius.");
+        encounter.enabled = false; Object.Destroy(model);
+        File.WriteAllText(Folder + "/world.txt", "PASS: real terrain pursuit, detection and repathing beyond home radius.");
+        // The real dungeon session suspends the overworld before visiting rooms.
+        navigation.enabled = false;
+        world.GetComponent<Unity.AI.Navigation.NavMeshSurface>().enabled = false;
+
+        var dungeonObject = new GameObject("NavigationDungeonCheck");
+        var dungeon = dungeonObject.AddComponent<DungeonGenerator>();
+        var build = dungeon.Build(world.WorldSeed);
+        while (build.MoveNext()) yield return build.Current;
+        var rooms = (List<GameObject>)typeof(DungeonGenerator).GetField("roomRoots", Private).GetValue(dungeon);
+        Require(rooms.All(r => r.GetComponent<ExplorationNavigation>() != null), "A generated room lacks navigation.");
+        foreach (var npc in dungeon.GetComponentsInChildren<NPCBase>(true)) npc.enabled = false;
+        foreach (var enemy in dungeon.GetComponentsInChildren<EncounterEnemy>(true)) enemy.enabled = false;
+        int room = dungeon.Layout.Rooms.FindIndex(r => r.Kind == DungeonRoomKind.Enemy);
+        Require(room >= 0, "No generated enemy room.");
+        dungeon.VisitRoom(room);
+        var root = rooms[room]; var nav = root.GetComponent<ExplorationNavigation>();
+        Vector3 centre = dungeon.RoomCentre(room);
+        // Use the actual generated room floor; isolate a clear test corridor through its decorations.
+        foreach (var collider in root.GetComponentsInChildren<Collider>())
+            if (collider.gameObject != root && collider.gameObject.name != "InvisibleBoundary") collider.enabled = false;
+        var wall = GameObject.CreatePrimitive(PrimitiveType.Cube); wall.transform.SetParent(root.transform);
+        wall.transform.position = centre + Vector3.up * 4; wall.transform.localScale = new Vector3(8, 8, 1.5f);
+        movement.Teleport(centre + Vector3.back * 7, Quaternion.identity);
+        nav.RequestRebuild();
+        deadline = Time.realtimeSinceStartup + 15;
+        while (!nav.Ready && Time.realtimeSinceStartup < deadline) yield return null;
+        // Request may arrive while the first build is running; wait for the queued update too.
+        wait = Time.realtimeSinceStartup + 1.5f; while (Time.realtimeSinceStartup < wait) yield return null;
+        Require(nav.Ready, "Dungeon room navigation did not build.");
+        model = Object.Instantiate(data.prefab, centre + Vector3.forward * 7, Quaternion.identity, root.transform);
+        encounter = model.GetComponent<EncounterEnemy>(); encounter.Configure(data, "dungeon-navigation-check", true);
+        agent = model.GetComponent<NavMeshAgent>();
+        deadline = Time.realtimeSinceStartup + 5;
+        while ((!agent.enabled || !agent.isOnNavMesh || agent.pathPending || !agent.hasPath) && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(encounter.CurrentState == EncounterEnemy.State.Chase && agent.hasPath && agent.pathStatus == NavMeshPathStatus.PathComplete,
+            "Dungeon enemy does not pursue with a complete NavMesh path.");
+        Require(agent.path.corners.Length > 2 && agent.path.corners.Any(c => Mathf.Abs(c.x - centre.x) > 4),
+            "Dungeon path does not route around the blocking wall.");
+        Vector3 before = model.transform.position;
+        wait = Time.realtimeSinceStartup + 1; while (Time.realtimeSinceStartup < wait) yield return null;
+        Require(Flat(before, model.transform.position) > .5f, "Dungeon agent stays stuck.");
+        encounter.enabled = false;
+        wall.GetComponent<Collider>().enabled = false; nav.RequestRebuild();
+        deadline = Time.realtimeSinceStartup + 15;
+        while (nav.IsBuilding && Time.realtimeSinceStartup < deadline) yield return null;
+        yield return null; yield return null;
+        bool clear = NavMesh.CalculatePath(centre + Vector3.forward * 7, player.position, NavMesh.AllAreas, path);
+        var sources = (List<NavMeshBuildSource>)typeof(ExplorationNavigation).GetField("lastSources", Private).GetValue(nav);
+        File.WriteAllText(Folder + "/sources.txt", "wall=" + wall.GetComponent<Collider>().enabled + "; count=" + sources.Count + "\n" +
+            string.Join("\n", sources.Select(s => s.shape + " " + s.size + " " + (s.component != null ?
+                s.component.GetType().Name + ":" + s.component.name + ":" + s.component.transform.position : "null") + " " + s.transform.GetColumn(3))));
+        File.WriteAllText(Folder + "/removed-wall.txt", "rayBlocked=" + NavMesh.Raycast(centre + Vector3.forward * 7, player.position, out _, NavMesh.AllAreas) + "; building=" + nav.IsBuilding + "; status=" + path.status +
+            "; target=" + player.position + "; corners=" + string.Join(", ", path.corners.Select(c => c.ToString())));
+        File.WriteAllText(Folder + "/surfaces.txt", string.Join("\n", Unity.AI.Navigation.NavMeshSurface.activeSurfaces.Select(s =>
+            s.name + " " + s.transform.position + " " + s.navMeshData?.name)) + "\nobstacles=" +
+            string.Join("\n", Object.FindObjectsByType<NavMeshObstacle>().Select(o => o.name + " " + o.transform.position + " " + o.carving)));
+        Require(clear && !nav.IsBuilding && path.status == NavMeshPathStatus.PathComplete &&
+            path.corners.All(c => Mathf.Abs(c.x - centre.x) < .5f), "Removing the obstacle leaves a stale blocked path.");
+        dungeon.VisitRoom(dungeon.Layout.SpawnRoom);
+        Require(!root.activeInHierarchy && !NavMesh.SamplePosition(centre, out _, .5f, NavMesh.AllAreas),
+            "An inactive dungeon room retains its navigation.");
+        Object.Destroy(dungeonObject);
+    }
+}

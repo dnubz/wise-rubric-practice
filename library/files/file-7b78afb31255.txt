@@ -1,0 +1,113 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DruidPullChecks
+{
+    const string Folder = "Temp/DruidPull";
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static DruidPullChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: actual Druid pull at normal and 4x speed leaves Skeleton/Minion close after returning to player phase; forced displacement preserves spent movement, AP and locks, with ordinary resets on the next turn."); }
+            catch (Exception error) { Finish("FAIL: " + error); Debug.LogException(error); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result)
+    { File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance;
+        Require(session != null, "Battle session missing.");
+        if (session.menu != null) session.menu.SetActive(false); Time.timeScale = 1;
+        // An overworld enemy may already have hit the player during startup.
+        if (!BattleSession.IsActive)
+        {
+            var encounter = Object.Instantiate(session.settings.enemies[0].prefab).GetComponent<EncounterEnemy>();
+            encounter.Configure(session.settings.enemies[0], "test:druid-pull"); encounter.enabled = false;
+            Require(session.Begin(encounter), "Cannot begin battle: input blocked=" + NPCChallengePrompt.BlocksGameplayInput);
+        }
+        float timeout = Time.realtimeSinceStartup + 30;
+        while ((BattleController.Instance == null || !BattleController.Instance.Ready) && Time.realtimeSinceStartup < timeout) yield return null;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Battle did not load.");
+        var druid = battle.Party[2]; battle.SelectCharacter(2);
+        var skill = battle.Skill(2, 1);
+        float distance = Mathf.Min(skill.radius - .3f, 5.5f);
+        Require(distance > 3, "Pull radius is too small for test.");
+        Vector3 direction = Vector3.zero;
+        for (int yaw = 0; yaw < 360; yaw += 15)
+        {
+            var candidate = Quaternion.Euler(0, yaw, 0) * Vector3.forward;
+            if (!druid.Agent.Raycast(druid.transform.position + candidate * (distance + 7), out _)) { direction = candidate; break; }
+        }
+        Require(direction != Vector3.zero, "No clear test line in arena.");
+        var oldEnemies = battle.Enemies.ToArray();
+        var targets = new[] {
+            battle.SpawnEnemy(battle.settings.enemies.First(e => e.kind == BattleEnemyKind.Skeleton), druid.transform.position + direction * distance, false),
+            battle.SpawnEnemy(battle.settings.enemies.First(e => e.kind == BattleEnemyKind.Minion), druid.transform.position + direction * (distance - .5f), false)
+        };
+        foreach (var enemy in oldEnemies) { enemy.HP = 0; enemy.Refresh(); }
+        foreach (float speed in new[] { 1f, 4f })
+        {
+            var starts = new Vector3[targets.Length]; var spent = new Vector3[targets.Length];
+            for (int i = 0; i < targets.Length; i++)
+            {
+                var enemy = targets[i]; enemy.HoldPosition();
+                Require(enemy.Agent.Warp(druid.transform.position + direction * (distance - i * .5f)), "Target spawn failed.");
+                // The enemy already used part of its movement approaching Druid.
+                enemy.moveOrigin = enemy.transform.position + direction * (enemy.moveRange * .75f);
+                enemy.AP = 1; enemy.movementLocked = true;
+                starts[i] = enemy.transform.position; spent[i] = enemy.transform.position - enemy.moveOrigin;
+            }
+            druid.AP = 2; druid.character.RestoreSP(druid.character.GetMaxSP()); druid.character.BattleCooldowns[1] = 0;
+            typeof(BattleController).GetProperty("SequenceSpeed").SetValue(battle, speed);
+            battle.SelectSkill(1); Require(battle.SelectedSkill == 1, "Cannot select pull.");
+            battle.ConfirmSkill(); Require(battle.Phase == BattlePhase.Acting, "Pull did not start.");
+            timeout = Time.realtimeSinceStartup + 12;
+            while (battle.Phase == BattlePhase.Acting && Time.realtimeSinceStartup < timeout) yield return null;
+            Require(battle.Phase == BattlePhase.Player, "Pull did not return to player turn.");
+            var landed = targets.Select(e => e.transform.position).ToArray();
+            for (int i = 0; i < targets.Length; i++)
+            {
+                Require(BattleController.FlatDistance(landed[i], druid.transform.position) < 1.7f, targets[i].DisplayName + " rebounded after pull: distance=" + BattleController.FlatDistance(landed[i], druid.transform.position));
+                Require(Vector3.Distance(targets[i].transform.position - targets[i].moveOrigin, spent[i]) < .01f, "Pull changed spent movement instead of translating the origin.");
+                Require(targets[i].AP == 1 && targets[i].movementLocked, "Pull refunded AP or removed a movement lock.");
+            }
+            timeout = Time.realtimeSinceStartup + .5f;
+            while (Time.realtimeSinceStartup < timeout)
+            {
+                foreach (var enemy in targets) Require(Vector3.Distance(enemy.transform.position, landed[Array.IndexOf(targets, enemy)]) < .01f, "Enemy drifted back after the skill finished.");
+                yield return null;
+            }
+        }
+        foreach (var enemy in targets)
+        {
+            enemy.StartTurn();
+            Require(enemy.AP == 2 && !enemy.movementLocked && Vector3.Distance(enemy.moveOrigin, enemy.transform.position) < .001f, "Next-turn reset failed.");
+        }
+    }
+}

@@ -1,0 +1,162 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>Deterministically places NPCs on terrain within their owning chunk.</summary>
+public class NPCSpawner : MonoBehaviour
+{
+    [Header("NPC Prefabs")]
+    [SerializeField] private GameObject[] npcPrefabs;
+
+    [Header("Spawn Settings")]
+    [SerializeField, Range(0f, 1f)] private float spawnChance = 0.35f;
+    [SerializeField, Min(1)] private int maxNPCsPerChunk = 2;
+    [SerializeField, Range(0f, 1f)] private float additionalNPCChance = 0.2f;
+    [SerializeField, Min(0f)] private float minimumNPCSpacing = 14f;
+    [SerializeField, Min(0f)] private float scatterRadius = 32f;
+
+    [Header("Temporary Testing")]
+    [Tooltip("Makes Pink and Berdly much more common while keeping the existing NPC cap, spacing and terrain checks. Turn off to restore normal spawning.")]
+    [SerializeField] private bool boostChallengeNPCSpawns;
+
+    [Header("Obstacle & Water Avoidance")]
+    [SerializeField, Min(0.1f)] private float obstacleCheckRadius = 1.5f;
+    [SerializeField] private LayerMask obstacleLayerMask = ~0;
+    [SerializeField, Min(1)] private int maxSpawnAttempts = 30;
+    [SerializeField] private bool avoidWater = true;
+
+    public void TrySpawnNPCs(Vector2Int chunkCoord, Vector3 chunkWorldCentre, int seed, Transform chunkParent)
+    {
+        if (chunkParent == null || npcPrefabs == null || npcPrefabs.Length == 0)
+            return;
+
+        int chunkSeed = seed ^ (chunkCoord.x * 73856093) ^ (chunkCoord.y * 19349663);
+        System.Random rng = new System.Random(chunkSeed);
+        float chunkChance = boostChallengeNPCSpawns ? Mathf.Max(spawnChance, 0.85f) : spawnChance;
+        float secondNPCChance = boostChallengeNPCSpawns ? Mathf.Max(additionalNPCChance, 0.6f) : additionalNPCChance;
+        if (rng.NextDouble() >= Mathf.Clamp01(chunkChance)) return;
+
+        Physics.SyncTransforms();
+        TerrainCollider[] terrain = ChunkSpawnUtility.GetOwnedTerrain(chunkParent);
+        List<Vector3> placedPositions = new List<Vector3>();
+
+        for (int i = 0; i < Mathf.Max(1, maxNPCsPerChunk); i++)
+        {
+            if (i > 0 && rng.NextDouble() >= Mathf.Clamp01(secondNPCChance))
+                break;
+
+            GameObject prefab = ChooseNPCPrefab(rng);
+            if (prefab == null) continue;
+
+            Vector3 spawnPos = FindSpawnPosition(chunkCoord, chunkWorldCentre, terrain,
+                placedPositions, rng, chunkParent, out bool found);
+            if (!found) continue;
+
+            float yRot = (float)(rng.NextDouble() * 360.0);
+            Quaternion spawnRotation = Quaternion.Euler(0f, yRot, 0f) * prefab.transform.rotation;
+            GameObject npc = Instantiate(prefab, spawnPos, spawnRotation, chunkParent);
+
+            NPCBase npcBehaviour = npc.GetComponent<NPCBase>();
+            if (npcBehaviour != null)
+                npcBehaviour.SetModelRotationOffset(prefab.transform.rotation);
+
+            AlignVisualBottomToGround(npc, spawnPos.y);
+            if (ChunkSpawnUtility.TryGetVisualBounds(npc, out Bounds visualBounds) &&
+                !ChunkSpawnUtility.Contains(chunkCoord, visualBounds.min.x, visualBounds.max.x,
+                    visualBounds.min.z, visualBounds.max.z, 0.25f))
+            {
+                npc.SetActive(false);
+                Destroy(npc);
+                continue;
+            }
+
+            placedPositions.Add(npc.transform.position);
+            Physics.SyncTransforms();
+        }
+    }
+
+    private GameObject ChooseNPCPrefab(System.Random rng)
+    {
+        if (!boostChallengeNPCSpawns) return npcPrefabs[rng.Next(npcPrefabs.Length)];
+
+        int totalWeight = 0;
+        foreach (GameObject prefab in npcPrefabs)
+            if (prefab != null) totalWeight += prefab.GetComponent<MinigameNPC>() != null ? 4 : 1;
+        if (totalWeight == 0) return null;
+        int pick = rng.Next(totalWeight);
+        foreach (GameObject prefab in npcPrefabs)
+        {
+            if (prefab == null) continue;
+            pick -= prefab.GetComponent<MinigameNPC>() != null ? 4 : 1;
+            if (pick < 0) return prefab;
+        }
+        return null;
+    }
+
+    private Vector3 FindSpawnPosition(Vector2Int chunkCoord, Vector3 chunkCentre,
+        TerrainCollider[] terrain, List<Vector3> placedPositions, System.Random rng, Transform chunkParent, out bool found)
+    {
+        found = false;
+        float halfChunk = ChunkSpawnUtility.ChunkWidth * 0.5f;
+        float inset = Mathf.Max(obstacleCheckRadius + 1f, minimumNPCSpacing * 0.5f, 5f);
+        float offsetRange = Mathf.Min(Mathf.Max(0f, scatterRadius), halfChunk - inset);
+        if (offsetRange <= 0f) return chunkCentre;
+
+        for (int attempt = 0; attempt < Mathf.Max(1, maxSpawnAttempts); attempt++)
+        {
+            float ox = (float)(rng.NextDouble() * 2.0 - 1.0) * offsetRange;
+            float oz = (float)(rng.NextDouble() * 2.0 - 1.0) * offsetRange;
+            Vector3 candidate = new Vector3(chunkCentre.x + ox, 0f, chunkCentre.z + oz);
+
+            if (!ChunkSpawnUtility.Contains(chunkCoord, candidate.x, candidate.x,
+                    candidate.z, candidate.z, inset) ||
+                !ChunkSpawnUtility.TryGetGround(terrain, candidate.x, candidate.z, avoidWater,
+                    out Vector3 ground))
+                continue;
+
+            candidate.y = ground.y;
+            bool tooClose = false;
+            foreach (Vector3 placed in placedPositions)
+            {
+                Vector2 delta = new Vector2(candidate.x - placed.x, candidate.z - placed.z);
+                if (delta.sqrMagnitude < minimumNPCSpacing * minimumNPCSpacing)
+                {
+                    tooClose = true;
+                    break;
+                }
+            }
+            if (tooClose) continue;
+
+            Collider[] overlaps = Physics.OverlapSphere(candidate + Vector3.up * 0.5f,
+                obstacleCheckRadius, obstacleLayerMask, QueryTriggerInteraction.Ignore);
+            bool blocked = false;
+            foreach (Collider col in overlaps)
+            {
+                if (!ChunkSpawnUtility.IsOwnedObstacle(col, chunkParent)) continue;
+                blocked = true;
+                break;
+            }
+            if (blocked) continue;
+
+            found = true;
+            return candidate;
+        }
+
+        return chunkCentre;
+    }
+
+    private static void AlignVisualBottomToGround(GameObject npc, float groundY)
+    {
+        Renderer[] renderers = npc.GetComponentsInChildren<Renderer>();
+        float lowestY = float.PositiveInfinity;
+        foreach (Renderer renderer in renderers)
+        {
+            if (!renderer.enabled ||
+                (!(renderer is MeshRenderer) && !(renderer is SkinnedMeshRenderer)))
+                continue;
+            lowestY = Mathf.Min(lowestY, renderer.bounds.min.y);
+        }
+
+        if (!float.IsPositiveInfinity(lowestY))
+            npc.transform.position += Vector3.up * (groundY - lowestY);
+    }
+}

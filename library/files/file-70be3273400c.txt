@@ -1,0 +1,384 @@
+using System;
+using UnityEngine;
+
+/// <summary>
+/// Modular procedural spawner for world buildings, structures, and landmarks.
+///
+/// Design: Buildings are parented to their chunk object and are fully
+/// deterministic — (globalSeed + chunkCoord) always produces the same
+/// building at the same position. No mutable state (no processedChunks,
+/// no spawnedBuildingPositions list), so unloading and reloading a chunk
+/// always gives exactly the same result.
+/// </summary>
+public class BuildingSpawner : MonoBehaviour
+{
+    [Serializable]
+    public class BuildingEntry
+    {
+        public string name = "Building";
+        [Tooltip("The building/structure prefab to spawn.")]
+        public GameObject prefab;
+        [Tooltip("Relative weight for picking this building when a spawn occurs.")]
+        [Range(0.01f, 10f)] public float weight = 1f;
+        [Tooltip("Radius around this building to clear conflicting trees and rocks.")]
+        public float clearanceRadius = 8f;
+        [Tooltip("If true, rotates only at 0, 90, 180, or 270 degrees. If false, full 360° rotation.")]
+        public bool cardinalRotationOnly = true;
+
+        [Header("Spawn Height")]
+        [Tooltip("Y value to use when spawning.")]
+        public float spawnY = 2.7f;
+        [Tooltip("If true, candidatePos.y is set exactly to spawnY. If false, spawnY is added on top of detected ground height.")]
+        public bool useExactY = true;
+
+        [Header("Scene Entrance (Optional)")]
+        [Tooltip("If true, attaches an interactive [F] entrance that switches scenes (e.g. for Dungeons).")]
+        public bool hasSceneEntrance = false;
+        [Tooltip("Name of the scene to load when entering this building.")]
+        public string targetSceneName = "DungeonScene";
+        [Tooltip("Prompt displayed on the floating prompt.")]
+        public string promptText = "[F] Enter";
+        [Tooltip("Local position of the entrance interaction point relative to the building.")]
+        public Vector3 entranceOffset = new Vector3(0, 0, 10f);
+
+        [Header("Healing Spot Settings")]
+        [Tooltip("If true, a healing spot will spawn near this building.")]
+        public bool spawnHealingSpot = true;
+        [Tooltip("Minimum distance from building center to spawn the healing spot.")]
+        public float minHealingSpotDist = 5f;
+        [Tooltip("Maximum distance from building center to spawn the healing spot.")]
+        public float maxHealingSpotDist = 9f;
+    }
+
+    [Header("Building Prefabs")]
+    [Tooltip("List of building prefabs that can spawn across the world.")]
+    [SerializeField] private BuildingEntry[] buildings;
+
+    [Header("Spawn Settings")]
+    [Tooltip("Probability (0 to 1) that any building will spawn in a newly generated chunk. 0.5 = 50% chance per chunk.")]
+    [SerializeField, Range(0f, 1f)] private float spawnChance = 0.15f;
+
+    [Tooltip("Independent chance per eligible chunk of placing a dungeon on valid dry terrain.")]
+    [SerializeField, Range(0f, 1f)] private float dungeonSpawnChance = 0.45f;
+
+    [Tooltip("Minimum chunk distance from (0,0) before buildings can start appearing.")]
+    [SerializeField] private int minChunkDistance = 0;
+
+    [Header("Environment & Obstacle Settings")]
+    [Tooltip("Avoid placing buildings on water tiles.")]
+    [SerializeField] private bool avoidWater = true;
+
+    [Header("Healing Spot Settings")]
+    [Tooltip("Prefab for the healing spot to spawn near buildings.")]
+    [SerializeField] private GameObject healingSpotPrefab;
+
+    [Tooltip("Global toggle to spawn healing spots near buildings.")]
+    [SerializeField] private bool spawnHealingSpots = true;
+
+    [Tooltip("Probability (0 to 1) of spawning a healing spot when a building spawns.")]
+    [Range(0f, 1f)]
+    [SerializeField] private float healingSpotChance = 1f;
+
+    [Tooltip("Radius around the healing spot to clear conflicting trees and rocks.")]
+    [SerializeField] private float healingSpotClearanceRadius = 2.5f;
+
+    [Tooltip("Vertical offset above detected terrain ground for the healing spot.")]
+    [SerializeField] private float healingSpotYOffset = 0.02f;
+
+    /// <summary>
+    /// Called by WFCWorldManager once per newly generated chunk.
+    /// Deterministic: same chunkCoord + seed always produces the same result.
+    /// </summary>
+    public void TrySpawnBuilding(Vector2Int chunkCoord, Vector3 chunkWorldCentre, int seed, Transform chunkParent, bool forceDungeon = false)
+    {
+        if (chunkParent == null || buildings == null || buildings.Length == 0) return;
+        int chunkDist = Mathf.Max(Mathf.Abs(chunkCoord.x), Mathf.Abs(chunkCoord.y));
+        if (chunkDist < minChunkDistance && !forceDungeon) return;
+        int chunkSeed = seed ^ (chunkCoord.x * 492876847) ^ (chunkCoord.y * 265443576);
+        var rng = new System.Random(chunkSeed);
+        if (chunkDist >= minChunkDistance && rng.NextDouble() < Mathf.Clamp01(spawnChance))
+        {
+            BuildingEntry selected = PickBuildingByWeight(rng);
+            // Dungeons have their own roll; the existing rolls for shops and other buildings remain available.
+            if (selected != null && !IsDungeon(selected)) SpawnBuilding(selected, chunkCoord, chunkWorldCentre, rng, chunkParent);
+        }
+        SpawnDungeon(chunkCoord, chunkWorldCentre, seed, chunkParent, forceDungeon);
+    }
+
+    static bool IsDungeon(BuildingEntry entry) => entry != null && entry.hasSceneEntrance && entry.targetSceneName == "DungeonScene";
+
+    public DungeonEntrance TryEnsureDungeon(Vector2Int chunkCoord, Vector3 chunkWorldCentre, int seed, Transform chunkParent)
+    {
+        if (chunkParent == null || buildings == null) return null;
+        foreach (var entrance in chunkParent.GetComponentsInChildren<DungeonEntrance>())
+            if (entrance.isActiveAndEnabled && entrance.TargetSceneName == "DungeonScene") return entrance;
+        var building = SpawnDungeon(chunkCoord, chunkWorldCentre, seed, chunkParent, true);
+        return building != null ? building.GetComponentInChildren<DungeonEntrance>() : null;
+    }
+
+    GameObject SpawnDungeon(Vector2Int chunkCoord, Vector3 centre, int seed, Transform parent, bool force)
+    {
+        // The cheat and normal generation consume the same random sequence for reproducible placement.
+        var rng = new System.Random(seed ^ (chunkCoord.x * 492876847) ^ (chunkCoord.y * 265443576) ^ 0x44554E47);
+        double roll = rng.NextDouble();
+        if (!force && roll >= Mathf.Clamp01(dungeonSpawnChance)) return null;
+        var selected = PickBuildingByWeight(rng, true);
+        return selected != null ? SpawnBuilding(selected, chunkCoord, centre, rng, parent) : null;
+    }
+
+    GameObject SpawnBuilding(BuildingEntry selected, Vector2Int chunkCoord, Vector3 chunkWorldCentre, System.Random rng, Transform chunkParent)
+    {
+        // Only terrain belonging to this chunk may support its building.
+        Physics.SyncTransforms();
+        TerrainCollider[] terrain = ChunkSpawnUtility.GetOwnedTerrain(chunkParent);
+        GameObject buildingObj = null;
+        Vector3 candidatePos = chunkWorldCentre;
+        Bounds footprint = default;
+
+        for (int attempt = 0; attempt < 16; attempt++)
+        {
+            float searchWidth = Mathf.Max(1f, ChunkSpawnUtility.ChunkWidth * .8f);
+            float offsetX = (float)(rng.NextDouble() - .5) * searchWidth;
+            float offsetZ = (float)(rng.NextDouble() - .5) * searchWidth;
+            candidatePos = new Vector3(chunkWorldCentre.x + offsetX, 0f,
+                chunkWorldCentre.z + offsetZ);
+
+            if (!ChunkSpawnUtility.TryGetGround(terrain, candidatePos.x, candidatePos.z,
+                    avoidWater, out Vector3 ground))
+                continue;
+
+            candidatePos.y = selected.useExactY
+                ? selected.spawnY
+                : ground.y + selected.spawnY;
+
+            float yRot = selected.cardinalRotationOnly
+                ? rng.Next(0, 4) * 90f
+                : (float)(rng.NextDouble() * 360.0);
+
+            buildingObj = Instantiate(selected.prefab, candidatePos,
+                Quaternion.Euler(0f, yRot, 0f), chunkParent);
+            Physics.SyncTransforms();
+
+            if (!ChunkSpawnUtility.TryGetVisualBounds(buildingObj, out footprint))
+                footprint = new Bounds(candidatePos,
+                    new Vector3(selected.clearanceRadius * 2f, 2f, selected.clearanceRadius * 2f));
+
+            if (ChunkSpawnUtility.Contains(chunkCoord, footprint.min.x, footprint.max.x,
+                    footprint.min.z, footprint.max.z, 0.5f) &&
+                ChunkSpawnUtility.HasGroundAcross(terrain, footprint, avoidWater) &&
+                HasEntranceGround(buildingObj, selected, chunkCoord, terrain) &&
+                !HasBlockingObject(buildingObj, footprint, chunkParent))
+                break;
+
+            buildingObj.SetActive(false);
+            Destroy(buildingObj);
+            buildingObj = null;
+        }
+
+        if (buildingObj == null) return null;
+
+        // Resources are the only objects removed to make room for a building.
+        float clearance = Mathf.Max(selected.clearanceRadius, footprint.extents.x, footprint.extents.z);
+        ClearOverlappingResources(candidatePos, clearance, chunkParent);
+        buildingObj.name = $"{selected.name}_Chunk_{chunkCoord.x}_{chunkCoord.y}";
+
+        // Configure entrance if this building has one
+        if (selected.hasSceneEntrance)
+        {
+            DungeonEntrance entrance = buildingObj.GetComponentInChildren<DungeonEntrance>();
+            if (entrance == null)
+            {
+                GameObject entranceObj = new GameObject("Entrance_InteractionPoint");
+                entranceObj.transform.SetParent(buildingObj.transform, false);
+                entranceObj.transform.localPosition = selected.entranceOffset;
+                entrance = entranceObj.AddComponent<DungeonEntrance>();
+            }
+            entrance.SetTargetScene(selected.targetSceneName, selected.promptText);
+        }
+
+        Debug.Log($"[BuildingSpawner] Spawned '{selected.name}' at {candidatePos} in Chunk {chunkCoord}");
+
+        // Spawn healing spot near this building if enabled
+        if (spawnHealingSpots && selected.spawnHealingSpot && (float)rng.NextDouble() <= healingSpotChance)
+        {
+            SpawnHealingSpotNearBuilding(candidatePos, selected, chunkCoord, rng, chunkParent, buildingObj);
+        }
+        return buildingObj;
+    }
+
+    bool HasEntranceGround(GameObject building, BuildingEntry entry, Vector2Int chunk, TerrainCollider[] terrain)
+    {
+        if (!entry.hasSceneEntrance) return true;
+        var existing = building.GetComponentInChildren<DungeonEntrance>();
+        Vector3 point = existing != null ? existing.transform.position : building.transform.TransformPoint(entry.entranceOffset);
+        return ChunkSpawnUtility.Contains(chunk, point.x, point.x, point.z, point.z, .5f) &&
+            ChunkSpawnUtility.TryGetGround(terrain, point.x, point.z, avoidWater, out _);
+    }
+
+    private static bool HasBlockingObject(GameObject building, Bounds footprint, Transform owningChunk)
+    {
+        Collider[] overlaps = Physics.OverlapBox(footprint.center, footprint.extents,
+            Quaternion.identity, ~0, QueryTriggerInteraction.Ignore);
+        foreach (Collider collider in overlaps)
+        {
+            if (!ChunkSpawnUtility.IsOwnedObstacle(collider, owningChunk) || collider.transform.IsChildOf(building.transform))
+                continue;
+            GeneratedResourceMarker resource = collider.GetComponentInParent<GeneratedResourceMarker>();
+            if (resource != null && resource.transform.parent == owningChunk)
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Backwards-compatible alias.</summary>
+    public void TrySpawnDungeon(Vector2Int chunkCoord, Vector3 chunkWorldCentre, int seed, Transform chunkParent = null)
+    {
+        TrySpawnBuilding(chunkCoord, chunkWorldCentre, seed, chunkParent);
+    }
+
+    private void SpawnHealingSpotNearBuilding(Vector3 buildingPos, BuildingEntry building, Vector2Int chunkCoord, System.Random rng, Transform parent, GameObject buildingObj = null)
+    {
+        GameObject prefabToSpawn = healingSpotPrefab;
+#if UNITY_EDITOR
+        if (prefabToSpawn == null)
+        {
+            prefabToSpawn = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/HealingSpot.prefab");
+        }
+#endif
+        if (prefabToSpawn == null) return;
+
+        float minDist = building.minHealingSpotDist > 0 ? building.minHealingSpotDist : 5f;
+        float maxDist = building.maxHealingSpotDist >= minDist ? building.maxHealingSpotDist : minDist + 4f;
+        TerrainCollider[] terrain = ChunkSpawnUtility.GetOwnedTerrain(parent);
+
+        // Try several candidate angles around the building to find valid ground
+        for (int attempt = 0; attempt < 12; attempt++)
+        {
+            float angle = (float)(rng.NextDouble() * Math.PI * 2.0);
+            float dist = Mathf.Lerp(minDist, maxDist, (float)rng.NextDouble());
+
+            Vector3 spotCandidate = new Vector3(
+                buildingPos.x + Mathf.Cos(angle) * dist,
+                0f,
+                buildingPos.z + Mathf.Sin(angle) * dist
+            );
+
+            if (!ChunkSpawnUtility.Contains(chunkCoord,
+                    spotCandidate.x - healingSpotClearanceRadius,
+                    spotCandidate.x + healingSpotClearanceRadius,
+                    spotCandidate.z - healingSpotClearanceRadius,
+                    spotCandidate.z + healingSpotClearanceRadius, 0.5f))
+                continue;
+
+            if (!ChunkSpawnUtility.TryGetGround(terrain, spotCandidate.x, spotCandidate.z,
+                    avoidWater, out Vector3 ground))
+                continue;
+
+            // Ensure the candidate spot does not collide directly with the building itself
+            if (buildingObj != null)
+            {
+                Collider[] hits = Physics.OverlapSphere(
+                    ground + Vector3.up * 0.5f, healingSpotClearanceRadius,
+                    ~0, QueryTriggerInteraction.Ignore);
+                bool overlapsBuilding = false;
+                foreach (Collider hit in hits)
+                {
+                    if (!ChunkSpawnUtility.IsOwnedObstacle(hit, parent)) continue;
+                    GeneratedResourceMarker resource = hit.GetComponentInParent<GeneratedResourceMarker>();
+                    if (resource != null && resource.transform.parent == parent) continue;
+                    if (hit.transform.IsChildOf(buildingObj.transform))
+                    {
+                        overlapsBuilding = true;
+                        break;
+                    }
+                    overlapsBuilding = true;
+                    break;
+                }
+                if (overlapsBuilding) continue;
+            }
+
+            // Found valid terrain position
+            spotCandidate.y = ground.y + healingSpotYOffset;
+
+            // Clear trees and rocks around the healing spot footprint, protecting the building
+            ClearOverlappingResources(spotCandidate, healingSpotClearanceRadius, parent, buildingObj);
+
+            float yRot = (float)(rng.NextDouble() * 360.0);
+            GameObject spotObj = Instantiate(
+                prefabToSpawn,
+                spotCandidate,
+                Quaternion.Euler(0f, yRot, 0f),
+                parent
+            );
+            spotObj.name = $"HealingSpot_{building.name}_Chunk_{chunkCoord.x}_{chunkCoord.y}";
+
+            // Ensure HealingSpot script is present
+            if (spotObj.GetComponent<HealingSpot>() == null)
+            {
+                spotObj.AddComponent<HealingSpot>();
+            }
+
+            Debug.Log($"[BuildingSpawner] Spawned Healing Spot near '{building.name}' at {spotCandidate} in Chunk {chunkCoord}");
+            break;
+        }
+    }
+
+    private BuildingEntry PickBuildingByWeight(System.Random rng, bool onlyDungeons = false)
+    {
+        float totalWeight = 0f;
+        foreach (var b in buildings)
+        {
+            if (b != null && b.prefab != null && (!onlyDungeons || IsDungeon(b)))
+                totalWeight += b.weight;
+        }
+
+        if (totalWeight <= 0f) return null;
+
+        double roll = rng.NextDouble() * totalWeight;
+        float cumulative = 0f;
+
+        foreach (var b in buildings)
+        {
+            if (b == null || b.prefab == null || (onlyDungeons && !IsDungeon(b))) continue;
+            cumulative += b.weight;
+            if (roll <= cumulative) return b;
+        }
+
+        return null;
+    }
+
+    private void ClearOverlappingResources(Vector3 centre, float radius, Transform owningChunk,
+        GameObject ignoreObject = null)
+    {
+        Collider[] colliders = Physics.OverlapSphere(centre, radius, ~0, QueryTriggerInteraction.Collide);
+        foreach (Collider col in colliders)
+        {
+            if (col == null ||
+                (ignoreObject != null && col.transform.IsChildOf(ignoreObject.transform)))
+                continue;
+
+            GeneratedResourceMarker resource = col.GetComponentInParent<GeneratedResourceMarker>();
+            if (resource == null || resource.transform.parent != owningChunk ||
+                !resource.gameObject.activeSelf) continue;
+            resource.gameObject.SetActive(false);
+            Destroy(resource.gameObject);
+        }
+        // Small decoration has no collider, but must also clear when a cheat spawns a building later.
+        foreach (var decoration in owningChunk.GetComponentsInChildren<GeneratedResourceMarker>())
+        {
+            if (!decoration.IsDecoration || decoration.transform.parent != owningChunk ||
+                !decoration.gameObject.activeSelf) continue;
+            Vector3 delta = decoration.transform.position - centre; delta.y = 0;
+            if (delta.sqrMagnitude > radius * radius) continue;
+            decoration.gameObject.SetActive(false); Destroy(decoration.gameObject);
+        }
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        // Visual debug — draws a wire cube at the BuildingSpawner origin for reference
+        Gizmos.color = Color.magenta;
+        Gizmos.DrawWireCube(transform.position + Vector3.up * 3f, new Vector3(16f, 6f, 16f));
+    }
+}

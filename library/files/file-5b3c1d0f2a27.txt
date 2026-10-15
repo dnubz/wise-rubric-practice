@@ -1,0 +1,676 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+public class WFCWorldManager : MonoBehaviour
+{
+    public static WFCWorldManager Instance { get; private set; }
+
+    public int ChunkSize => chunkSize;
+    public float TileSize => tileSize;
+    public int WorldSeed => seed;
+
+    [SerializeField] Transform player;
+    [SerializeField] GameObject[] tiles;
+    [SerializeField] ResourceSpawner resourceSpawner;
+    [SerializeField] NPCSpawner npcSpawner;
+    [SerializeField] BuildingSpawner buildingSpawner;
+    [SerializeField] OverworldDecorationSpawner decorationSpawner;
+
+    [SerializeField] int chunkSize = 10;
+    [SerializeField] float tileSize = 10f;
+    [SerializeField] int viewDistance = 2;
+    [Tooltip("Reproducible world seed when Randomize Seed On Play is disabled. Continue restores the saved seed.")]
+    [SerializeField] int seed = 12345;
+    [Tooltip("Choose a fresh seed for a new playthrough. Disable to reproduce a world with Seed.")]
+    [SerializeField] bool randomizeSeedOnPlay = true;
+
+    [Header("Water pools")]
+    [Tooltip("Chance per chunk of a 5x5 water pattern, with one sand ring and one grass/rock ring. Requires at least 9 tiles per chunk.")]
+    [SerializeField, Range(0f, 1f)] float waterPoolChance = 0.3f;
+    [SerializeField] Material waterSurfaceMaterial;
+    [SerializeField] float waterSurfaceHeight = 0.04f;
+    [SerializeField, Min(0.5f)] float waterDepth = 2f;
+    public const int WaterPoolWidth = 5;
+    public float WaterSurfaceHeight => waterSurfaceHeight;
+    public float WaterDepth => waterDepth;
+
+    [Header("Pool boat and chest")]
+    [SerializeField] GameObject poolBoatPrefab;
+    [SerializeField] GameObject poolChestPrefab;
+    [SerializeField, Min(0.2f)] float poolBoatScale = 1.5f;
+    [SerializeField] Vector3 poolChestDeckOffset = new Vector3(0f, 0f, -0.65f);
+
+    [Header("Terrain blending")]
+    [SerializeField] bool blendTerrain = true;
+    [SerializeField] Material blendedTerrainMaterial;
+    [SerializeField, Range(16, 128)] int terrainPaintResolution = 32;
+    [SerializeField, Min(1f)] float biomeScale = 65f;
+    [SerializeField, Range(0.05f, 1f)] float transitionWidth = 0.45f;
+    [SerializeField, Min(0f)] float edgeDistortion = 3f;
+
+    Dictionary<Vector2Int, GameObject> chunks =
+        new Dictionary<Vector2Int, GameObject>();
+    Dictionary<Vector2Int, int[,]> terrainByChunk =
+        new Dictionary<Vector2Int, int[,]>();
+    readonly HashSet<Vector2Int> forcedDungeonChunks = new HashSet<Vector2Int>();
+    readonly Dictionary<Vector2Int, Vector4> poolBoundsByChunk = new Dictionary<Vector2Int, Vector4>();
+    readonly Dictionary<Vector2Int, List<TerrainData>> generatedTerrainData = new Dictionary<Vector2Int, List<TerrainData>>();
+    BlendedChunkTerrain terrainPainter;
+    WaterSurfaceBuilder waterSurfaces;
+    PoolBoatContent poolContent;
+    Vector2Int[] savedOpenedPools;
+
+    public SavedWorldLayout CaptureLayout()
+    {
+        var forced = new Vector2Int[forcedDungeonChunks.Count]; forcedDungeonChunks.CopyTo(forced);
+        return new SavedWorldLayout { chunkSize = chunkSize, tileSize = tileSize, poolChance = waterPoolChance,
+            biomeScale = biomeScale, forcedDungeons = forced };
+    }
+
+    public void RestoreSavedWorld(int savedSeed, Vector2Int[] openedPools, SavedWorldLayout layout = null)
+    {
+        // Minimap queries can cache terrain before a continue save is restored.
+        if (seed != savedSeed)
+        {
+            GetComponent<ExplorationNavigation>()?.BeforeTerrainChanges();
+            foreach (var root in chunks.Values) { root.SetActive(false); Destroy(root); }
+            foreach (var list in generatedTerrainData.Values)
+                foreach (var data in list) if (data != null) Destroy(data);
+            chunks.Clear(); generatedTerrainData.Clear(); terrainByChunk.Clear(); poolBoundsByChunk.Clear();
+            forcedDungeonChunks.Clear(); hasLoadedWorld = false; poolContent = null;
+        }
+        seed = savedSeed; randomizeSeedOnPlay = false; savedOpenedPools = openedPools;
+        if (layout != null)
+        {
+            chunkSize = layout.chunkSize; tileSize = layout.tileSize; waterPoolChance = layout.poolChance;
+            biomeScale = layout.biomeScale; forcedDungeonChunks.Clear();
+            if (layout.forcedDungeons != null) foreach (var chunk in layout.forcedDungeons) forcedDungeonChunks.Add(chunk);
+        }
+        poolContent?.RestoreOpenedChests(openedPools);
+    }
+    public Vector2Int[] GetOpenedPoolChests() => poolContent != null ? poolContent.GetOpenedChests() : savedOpenedPools ?? new Vector2Int[0];
+
+    Vector2Int currentChunk;
+    bool readyToGenerate;
+    bool hasLoadedWorld;
+
+    const int GrassMask = 1 << 0;
+    const int WaterMask = 1 << 1;
+    const int SandMask = 1 << 2;
+    const int RockMask = 1 << 3;
+    const int DryMask = GrassMask | RockMask;
+    const int LandMask = DryMask | SandMask;
+    const int AllMask = LandMask | WaterMask;
+
+    // Water can touch water inside the 5x5 WFC pattern. The pattern's domains
+    // enforce a complete sand ring, followed by a grass/rock ring.
+    static readonly int[] immediateRules =
+    {
+        LandMask, WaterMask | SandMask, AllMask, LandMask
+    };
+
+    void Start()
+    {
+#if UNITY_EDITOR
+        if (poolBoatPrefab == null)
+            poolBoatPrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(
+                "Assets/EmaceArt - raft on the desert/Prefabs/Wehicule/Raft/EA04_Wehicule_Raft_01a_PRE.prefab");
+        if (poolChestPrefab == null)
+            poolChestPrefab = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Prefabs/Normal Chest.prefab");
+#endif
+        if (buildingSpawner == null)
+            buildingSpawner = FindFirstObjectByType<BuildingSpawner>();
+
+        readyToGenerate = true;
+        RefreshWorldAroundPlayer();
+    }
+
+    void Awake()
+    {
+        Instance = this;
+        if (GetComponent<ExplorationNavigation>() == null)
+            gameObject.AddComponent<ExplorationNavigation>().overworld = true;
+        if (randomizeSeedOnPlay)
+            seed = System.BitConverter.ToInt32(System.Guid.NewGuid().ToByteArray(), 0) & int.MaxValue;
+    }
+
+    void OnEnable()
+    {
+        CharacterSwitchManager.OnActiveCharacterChanged += SetActiveCharacter;
+
+        Transform activeCharacter = CharacterSwitchManager.CurrentCharacterTransform;
+        if (activeCharacter != null && activeCharacter.gameObject.activeInHierarchy)
+            SetActiveCharacter(activeCharacter);
+    }
+
+    void OnDisable()
+    {
+        CharacterSwitchManager.OnActiveCharacterChanged -= SetActiveCharacter;
+    }
+
+    void OnDestroy()
+    {
+        foreach (List<TerrainData> dataList in generatedTerrainData.Values)
+            foreach (TerrainData data in dataList)
+                if (data != null) Destroy(data);
+        terrainPainter?.Dispose();
+        waterSurfaces?.Dispose();
+        if (Instance == this)
+            Instance = null;
+    }
+
+    /// <summary>Returns the WFC tile type. Visual blending never changes gameplay terrain.</summary>
+    public int GetTerrainAt(Vector3 worldPosition)
+    {
+        return GetCellTerrain(worldPosition);
+    }
+
+    /// <summary>Places a missing cheat destination through the existing prefab spawner on loaded WFC terrain.</summary>
+    public bool TryEnsureDungeonNearPlayer()
+    {
+        if (!isActiveAndEnabled || player == null || buildingSpawner == null) return false;
+        float width = chunkSize * tileSize;
+        var nearestChunks = new List<Vector2Int>(chunks.Keys);
+        Vector3 origin = player.position;
+        nearestChunks.Sort((a, b) =>
+        {
+            Vector3 pa = new Vector3((a.x + .5f) * width, origin.y, (a.y + .5f) * width);
+            Vector3 pb = new Vector3((b.x + .5f) * width, origin.y, (b.y + .5f) * width);
+            return (pa - origin).sqrMagnitude.CompareTo((pb - origin).sqrMagnitude);
+        });
+        foreach (Vector2Int chunk in nearestChunks)
+        {
+            GameObject root = chunks[chunk];
+            if (root == null || !root.activeInHierarchy) continue;
+            Vector3 centre = new Vector3((chunk.x + .5f) * width, 0, (chunk.y + .5f) * width);
+            if (buildingSpawner.TryEnsureDungeon(chunk, centre, seed, root.transform) == null) continue;
+            forcedDungeonChunks.Add(chunk);
+            return true;
+        }
+        return false;
+    }
+
+    public bool TryGetWaterSurface(Vector3 position, out float height)
+    {
+        height = waterSurfaceHeight;
+        return GetTerrainAt(position) == 1;
+    }
+
+    public float GetWaterBedDepth(Vector3 position)
+    {
+        if (!TryGetPoolBounds(GetChunk(position), out Vector4 bounds)) return 0f;
+        float distance = Mathf.Min(position.x - bounds.x, bounds.z - position.x,
+            position.z - bounds.y, bounds.w - position.z);
+        float shoreWidth = Mathf.Max(1f, tileSize * 0.6f);
+        return waterDepth * Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(distance / shoreWidth));
+    }
+
+    bool TryGetPoolOrigin(Vector2Int chunk, out Vector2Int origin)
+    {
+        origin = default;
+        // Pattern choices are seeded independently of collapse retries and load order.
+        int placementCount = chunkSize - WaterPoolWidth - 3;
+        if (placementCount <= 0) return false;
+        System.Random random = new System.Random(ChunkSeed(chunk, 1337));
+        if (random.NextDouble() >= waterPoolChance) return false;
+        origin = new Vector2Int(2 + random.Next(placementCount), 2 + random.Next(placementCount));
+        return true;
+    }
+
+    bool TryGetPoolBounds(Vector2Int chunk, out Vector4 bounds)
+    {
+        if (poolBoundsByChunk.TryGetValue(chunk, out bounds)) return bounds.z > bounds.x;
+        bounds = default;
+        if (!TryGetPoolOrigin(chunk, out Vector2Int origin))
+        {
+            poolBoundsByChunk[chunk] = bounds;
+            return false;
+        }
+        float x = (chunk.x * chunkSize + origin.x) * tileSize;
+        float z = (chunk.y * chunkSize + origin.y) * tileSize;
+        bounds = new Vector4(x, z, x + WaterPoolWidth * tileSize, z + WaterPoolWidth * tileSize);
+        poolBoundsByChunk[chunk] = bounds;
+        return true;
+    }
+
+    /// <summary>Grass, water, sand and rock weights shared by terrain, spawning and minimap.</summary>
+    public Vector4 GetTerrainBlend(Vector3 worldPosition)
+    {
+        if (!blendTerrain)
+        {
+            Vector4 single = Vector4.zero;
+            single[GetCellTerrain(worldPosition)] = 1f;
+            return single;
+        }
+
+        // World-space noise keeps the same boundary on both sides of a chunk seam.
+        float offset = (seed & 0xffff) * 0.137f;
+        float frequency = 1f / Mathf.Max(1f, tileSize * 1.7f);
+        float x = worldPosition.x;
+        float z = worldPosition.z;
+        float distortion = Mathf.Clamp(edgeDistortion, 0f, tileSize * 0.3f);
+        float warpedX = x + (Mathf.PerlinNoise(x * frequency + offset, z * frequency + 31.7f) - 0.5f) * distortion * 2f;
+        float warpedZ = z + (Mathf.PerlinNoise(x * frequency + 83.1f, z * frequency + offset) - 0.5f) * distortion * 2f;
+        float gridX = warpedX / tileSize - 0.5f;
+        float gridZ = warpedZ / tileSize - 0.5f;
+        int cellX = Mathf.FloorToInt(gridX);
+        int cellZ = Mathf.FloorToInt(gridZ);
+        float width = Mathf.Clamp(transitionWidth, 0.05f, 1f);
+        float tx = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.5f - width * 0.5f, 0.5f + width * 0.5f, gridX - cellX));
+        float tz = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.5f - width * 0.5f, 0.5f + width * 0.5f, gridZ - cellZ));
+        Vector4 result = Vector4.zero;
+        AddCellWeight(ref result, cellX, cellZ, (1f - tx) * (1f - tz));
+        AddCellWeight(ref result, cellX + 1, cellZ, tx * (1f - tz));
+        AddCellWeight(ref result, cellX, cellZ + 1, (1f - tx) * tz);
+        AddCellWeight(ref result, cellX + 1, cellZ + 1, tx * tz);
+
+        // Keep a sandy shore even where diagonally touching cells meet water.
+        float shore = result.y * (1f - result.y);
+        float grassShore = result.x * shore;
+        float rockShore = result.w * shore;
+        result.x -= grassShore;
+        result.w -= rockShore;
+        result.z += grassShore + rockShore;
+        return result;
+    }
+
+    void AddCellWeight(ref Vector4 weights, int x, int z, float amount)
+    {
+        if (amount <= 0f) return;
+        int tile = GetCellTerrain(new Vector3((x + 0.5f) * tileSize, 0f, (z + 0.5f) * tileSize));
+        weights[tile] += amount;
+    }
+
+    int GetCellTerrain(Vector3 worldPosition)
+    {
+        int worldX = Mathf.FloorToInt(worldPosition.x / tileSize);
+        int worldZ = Mathf.FloorToInt(worldPosition.z / tileSize);
+        int chunkX = Mathf.FloorToInt((float)worldX / chunkSize);
+        int chunkZ = Mathf.FloorToInt((float)worldZ / chunkSize);
+        int localX = worldX - chunkX * chunkSize;
+        int localZ = worldZ - chunkZ * chunkSize;
+
+        Vector2Int chunk = new Vector2Int(chunkX, chunkZ);
+        if (!terrainByChunk.TryGetValue(chunk, out int[,] terrain))
+        {
+            terrain = CreateCollapsedChunk(chunk);
+            terrainByChunk[chunk] = terrain;
+        }
+
+        return terrain[localX, localZ];
+    }
+
+    void LateUpdate()
+    {
+        Transform activeCharacter = CharacterSwitchManager.CurrentCharacterTransform;
+        if (activeCharacter != null && activeCharacter.gameObject.activeInHierarchy &&
+            player != activeCharacter)
+            player = activeCharacter;
+
+        RefreshWorldAroundPlayer();
+    }
+
+    void SetActiveCharacter(Transform activeCharacter)
+    {
+        player = activeCharacter;
+        RefreshWorldAroundPlayer();
+    }
+
+    public void RefreshWorldAroundPlayer()
+    {
+        if (!readyToGenerate || player == null || !player.gameObject.activeInHierarchy)
+            return;
+
+        Vector2Int newChunk = GetChunk(player.position);
+        if (hasLoadedWorld && newChunk == currentChunk)
+            return;
+
+        currentChunk = newChunk;
+        UpdateWorld();
+        hasLoadedWorld = true;
+    }
+
+    Vector2Int GetChunk(Vector3 position)
+    {
+        float size = chunkSize * tileSize;
+
+        return new Vector2Int(
+            Mathf.FloorToInt(position.x / size),
+            Mathf.FloorToInt(position.z / size)
+        );
+    }
+
+    void UpdateWorld()
+    {
+        GetComponent<ExplorationNavigation>()?.BeforeTerrainChanges();
+        for (int x = -viewDistance; x <= viewDistance; x++)
+        {
+            for (int z = -viewDistance; z <= viewDistance; z++)
+            {
+                Vector2Int chunk =
+                    currentChunk + new Vector2Int(x, z);
+
+                if (!chunks.ContainsKey(chunk))
+                    GenerateChunk(chunk);
+            }
+        }
+
+        List<Vector2Int> remove =
+            new List<Vector2Int>();
+
+        foreach (var chunk in chunks)
+        {
+            if (Mathf.Abs(chunk.Key.x - currentChunk.x) > viewDistance ||
+                Mathf.Abs(chunk.Key.y - currentChunk.y) > viewDistance)
+            {
+                remove.Add(chunk.Key);
+            }
+        }
+
+        foreach (Vector2Int chunk in remove)
+        {
+            chunks[chunk].SetActive(false);
+            Destroy(chunks[chunk]);
+            if (generatedTerrainData.TryGetValue(chunk, out List<TerrainData> dataList))
+            {
+                foreach (TerrainData data in dataList) Destroy(data);
+                generatedTerrainData.Remove(chunk);
+            }
+            chunks.Remove(chunk);
+            terrainByChunk.Remove(chunk);
+            poolBoundsByChunk.Remove(chunk);
+        }
+
+        List<Vector2Int> removeTerrain = new List<Vector2Int>();
+        foreach (Vector2Int chunk in terrainByChunk.Keys)
+        {
+            if (Mathf.Abs(chunk.x - currentChunk.x) > viewDistance + 1 ||
+                Mathf.Abs(chunk.y - currentChunk.y) > viewDistance + 1)
+                removeTerrain.Add(chunk);
+        }
+
+        foreach (Vector2Int chunk in removeTerrain)
+        {
+            terrainByChunk.Remove(chunk);
+            poolBoundsByChunk.Remove(chunk);
+        }
+        GetComponent<ExplorationNavigation>()?.RequestRebuild();
+    }
+
+    void GenerateChunk(Vector2Int chunk)
+    {
+        if (!terrainByChunk.TryGetValue(chunk, out int[,] terrainCells))
+        {
+            terrainCells = CreateCollapsedChunk(chunk);
+            terrainByChunk[chunk] = terrainCells;
+        }
+        // Resource rolls are independent of whether the minimap pre-cached this chunk.
+        System.Random random = new System.Random(ChunkSeed(chunk, 7919));
+
+        GameObject chunkObject =
+            new GameObject("Chunk " + chunk);
+
+        chunkObject.transform.parent = transform;
+
+        if (blendTerrain || TryGetPoolOrigin(chunk, out _))
+        {
+            if (terrainPainter == null)
+                terrainPainter = new BlendedChunkTerrain(tiles, blendedTerrainMaterial, tileSize);
+            generatedTerrainData.Add(chunk, new List<TerrainData>(chunkSize * chunkSize));
+        }
+
+        for (int x = 0; x < chunkSize; x++)
+        {
+            for (int z = 0; z < chunkSize; z++)
+            {
+                int tile = terrainCells[x, z];
+
+                Vector3 position = new Vector3(
+                    (chunk.x * chunkSize + x) * tileSize,
+                    0,
+                    (chunk.y * chunkSize + z) * tileSize
+                );
+
+                // Always instantiate the assigned terrain prefab selected by WFC.
+                GameObject tileObject = Instantiate(tiles[tile], position, Quaternion.identity, chunkObject.transform);
+                if (tile == 1) ExplorationNavigation.ExcludeWater(tileObject);
+                if (blendTerrain || tile == 1)
+                    generatedTerrainData[chunk].Add(terrainPainter.Paint(this, tileObject.GetComponent<Terrain>(), terrainPaintResolution, tile, blendTerrain));
+            }
+        }
+
+        if (TryGetPoolBounds(chunk, out Vector4 pondBounds))
+        {
+            if (waterSurfaces == null) waterSurfaces = new WaterSurfaceBuilder(waterSurfaceMaterial);
+            waterSurfaces.Create(pondBounds, waterSurfaceHeight, chunkObject.transform);
+            if (poolContent == null)
+            {
+                poolContent = new PoolBoatContent(poolChestPrefab);
+                poolContent.RestoreOpenedChests(savedOpenedPools);
+            }
+            poolContent.Create(chunk, seed, pondBounds, waterSurfaceHeight, chunkObject.transform);
+        }
+
+        if (TryGetComponent<OverworldObstacleSpawner>(out var obstacles)) obstacles.SpawnChunk(chunk, seed, chunkObject.transform);
+
+        Physics.SyncTransforms();
+        for (int x = 0; x < chunkSize; x++)
+        {
+            for (int z = 0; z < chunkSize; z++)
+            {
+                int tile = terrainCells[x, z];
+                Vector3 position = new Vector3((chunk.x * chunkSize + x) * tileSize, 0f,
+                    (chunk.y * chunkSize + z) * tileSize);
+                if (tile == 0 || tile == 2)
+                {
+                    if (resourceSpawner != null)
+                    {
+                        resourceSpawner.Spawn(
+                            position,
+                            tileSize,
+                            random,
+                            chunkObject.transform,
+                            tile
+                        );
+                    }
+                }
+            }
+        }
+
+        chunks.Add(chunk, chunkObject);
+
+        // Both spawners use terrain colliders from this chunk only. Buildings go
+        // first so NPCs can avoid their footprints.
+        float halfChunk = (chunkSize * tileSize) / 2f;
+        Vector3 chunkCentre = new Vector3(
+            chunk.x * chunkSize * tileSize + halfChunk,
+            0f,
+            chunk.y * chunkSize * tileSize + halfChunk
+        );
+
+        if (buildingSpawner != null)
+        {
+            buildingSpawner.TrySpawnBuilding(chunk, chunkCentre, seed, chunkObject.transform, forcedDungeonChunks.Contains(chunk));
+        }
+
+        if (npcSpawner != null)
+        {
+            npcSpawner.TrySpawnNPCs(chunk, chunkCentre, seed, chunkObject.transform);
+        }
+        if (decorationSpawner != null)
+            decorationSpawner.SpawnChunk(chunk, terrainCells, seed, tileSize, chunkObject.transform);
+        if (TryGetComponent<EnemySpawner>(out var enemies)) enemies.SpawnChunk(chunk, chunkCentre, seed, chunkObject.transform);
+        foreach (var chest in chunkObject.GetComponentsInChildren<Chest>()) chest.ConfigureWorldLoot();
+    }
+
+    int ChunkSeed(Vector2Int chunk, int salt = 0)
+    {
+        return unchecked(seed ^ (chunk.x * 73856093) ^ (chunk.y * 19349663) ^ salt);
+    }
+
+    int[,] CreateCollapsedChunk(Vector2Int chunk)
+    {
+        bool hasPool = TryGetPoolOrigin(chunk, out Vector2Int poolOrigin);
+        // Deterministic retries handle contradictions; never silently replace an
+        // empty domain with grass, which could put grass directly beside water.
+        for (int attempt = 0; attempt < 16; attempt++)
+        {
+            System.Random random = new System.Random(ChunkSeed(chunk, attempt * 104729));
+            int[,] cells = new int[chunkSize, chunkSize];
+            for (int x = 0; x < chunkSize; x++)
+            {
+                for (int z = 0; z < chunkSize; z++)
+                {
+                    cells[x, z] = LandMask;
+                    if (!hasPool) continue;
+                    int dx = Mathf.Max(poolOrigin.x - x, x - (poolOrigin.x + WaterPoolWidth - 1), 0);
+                    int dz = Mathf.Max(poolOrigin.y - z, z - (poolOrigin.y + WaterPoolWidth - 1), 0);
+                    int ring = Mathf.Max(dx, dz);
+                    if (ring == 0) cells[x, z] = WaterMask;
+                    else if (ring == 1) cells[x, z] = SandMask;
+                    else if (ring == 2) cells[x, z] = DryMask;
+                }
+            }
+
+            bool valid = true;
+            Queue<Vector2Int> pending = new Queue<Vector2Int>();
+            // Propagate the full selected WFC pattern before collapsing the rest.
+            for (int x = 0; x < chunkSize; x++)
+                for (int z = 0; z < chunkSize; z++) pending.Enqueue(new Vector2Int(x, z));
+            if (!Propagate(cells, pending)) continue;
+            while (true)
+            {
+                Vector2Int cell = FindLowest(cells, random, chunk);
+                if (cell.x < 0) break;
+                cells[cell.x, cell.y] = 1 << PickTerrain(cells[cell.x, cell.y], random, chunk, cell);
+                pending.Enqueue(cell);
+                if (!Propagate(cells, pending))
+                {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if (!valid) continue;
+            int[,] terrain = new int[chunkSize, chunkSize];
+            for (int x = 0; x < chunkSize; x++)
+            {
+                for (int z = 0; z < chunkSize; z++)
+                {
+                    int mask = cells[x, z];
+                    if (mask == 0) { valid = false; break; }
+                    for (int tile = 0; tile < 4; tile++)
+                        if (mask == (1 << tile)) { terrain[x, z] = tile; break; }
+                }
+            }
+            if (valid) return terrain;
+        }
+
+        throw new System.InvalidOperationException("WFC could not generate a valid water/sand/grass-rock layout for chunk " + chunk);
+    }
+
+    int PickTerrain(int choices, System.Random random, Vector2Int chunk, Vector2Int cell)
+    {
+        Vector4 weights = TerrainWeights(chunk, cell);
+        float total = 0f;
+        for (int tile = 0; tile < 4; tile++)
+            if ((choices & (1 << tile)) != 0) total += weights[tile];
+        double roll = random.NextDouble() * total;
+        int lastAllowed = 0;
+        for (int tile = 0; tile < 4; tile++)
+        {
+            if ((choices & (1 << tile)) == 0) continue;
+            lastAllowed = tile;
+            roll -= weights[tile];
+            if (roll <= 0) return tile;
+        }
+        return lastAllowed;
+    }
+
+    Vector4 TerrainWeights(Vector2Int chunk, Vector2Int cell)
+    {
+        float scale = Mathf.Max(tileSize * 2f, biomeScale);
+        float offset = (seed & 0xffff) * 0.137f;
+        float x = (chunk.x * chunkSize + cell.x + 0.5f) * tileSize / scale;
+        float z = (chunk.y * chunkSize + cell.y + 0.5f) * tileSize / scale;
+        float noise = Mathf.PerlinNoise(x + offset, z + 19.3f) * 0.8f +
+                      Mathf.PerlinNoise(x * 2.1f + 47.2f, z * 2.1f + offset) * 0.2f;
+        return new Vector4(
+            BiomeWeight(noise, 0.57f), BiomeWeight(noise, 0.23f),
+            BiomeWeight(noise, 0.39f), BiomeWeight(noise, 0.79f));
+    }
+
+    static float BiomeWeight(float noise, float centre)
+    {
+        float distance = (noise - centre) / 0.055f;
+        return Mathf.Exp(-distance * distance * 0.5f) + 0.0001f;
+    }
+
+    static int CountOptions(int mask)
+    {
+        int count = 0;
+        while (mask != 0) { mask &= mask - 1; count++; }
+        return count;
+    }
+
+    Vector2Int FindLowest(int[,] cells, System.Random random, Vector2Int chunk)
+    {
+        float lowest = float.PositiveInfinity;
+        Vector2Int choice = new Vector2Int(-1, -1);
+        for (int x = 0; x < chunkSize; x++)
+        {
+            for (int z = 0; z < chunkSize; z++)
+            {
+                int count = CountOptions(cells[x, z]);
+                if (count <= 1) continue;
+                // Weighted Shannon entropy is the WFC selection criterion. Noise
+                // supplies preferences; only WFC's valid domains decide the result.
+                Vector4 weights = TerrainWeights(chunk, new Vector2Int(x, z));
+                float sum = 0f;
+                float weightedLog = 0f;
+                for (int tile = 0; tile < 4; tile++)
+                {
+                    if ((cells[x, z] & (1 << tile)) == 0) continue;
+                    sum += weights[tile];
+                    weightedLog += weights[tile] * Mathf.Log(weights[tile]);
+                }
+                float entropy = Mathf.Log(sum) - weightedLog / sum + (float)random.NextDouble() * 0.00001f;
+                if (entropy < lowest)
+                {
+                    lowest = entropy;
+                    choice = new Vector2Int(x, z);
+                }
+            }
+        }
+
+        return choice;
+    }
+
+    bool Propagate(int[,] cells, Queue<Vector2Int> pending)
+    {
+        while (pending.Count > 0)
+        {
+            Vector2Int source = pending.Dequeue();
+            int sourceMask = cells[source.x, source.y];
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                for (int dz = -1; dz <= 1; dz++)
+                {
+                    if (dx == 0 && dz == 0) continue;
+                    int x = source.x + dx;
+                    int z = source.y + dz;
+                    if (x < 0 || z < 0 || x >= chunkSize || z >= chunkSize) continue;
+                    int allowed = 0;
+                    for (int tile = 0; tile < 4; tile++)
+                        if ((sourceMask & (1 << tile)) != 0) allowed |= immediateRules[tile];
+                    int reduced = cells[x, z] & allowed;
+                    if (reduced == cells[x, z]) continue;
+                    if (reduced == 0) return false;
+                    cells[x, z] = reduced;
+                    pending.Enqueue(new Vector2Int(x, z));
+                }
+            }
+        }
+        return true;
+    }
+}

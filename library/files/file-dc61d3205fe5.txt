@@ -1,0 +1,69 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+public class Inventory : MonoBehaviour
+{
+    [SerializeField] private List<Item> startingItems = new List<Item>();
+    private List<InventorySlot> slots = new List<InventorySlot>();
+
+    public IReadOnlyList<InventorySlot> Slots => slots;
+    public event System.Action OnChanged;
+
+    private void Awake()
+    {
+        foreach (var item in startingItems)
+        {
+            // Equipment is acquired through gameplay or the equipment code, including with an old scene snapshot.
+            if (item != null && !(item is Equipment))
+            {
+                AddItem(item);
+            }
+        }
+    }
+
+    public void AddItem(Item item)
+    {
+        slots.Add(new InventorySlot(item));
+        OnChanged?.Invoke();
+    }
+
+    public bool RemoveItem(Item item)
+    {
+        for (int i = 0; i < slots.Count; i++)
+        {
+            if (slots[i].Item == item || (slots[i].Item != null && item != null && slots[i].Item.ItemName == item.ItemName))
+            {
+                slots.RemoveAt(i);
+                OnChanged?.Invoke();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // One transaction removes only the selected resource, leaving other items alone.
+    public int RemoveAll(Item item)
+    {
+        if (item == null) return 0;
+        int removed = 0;
+        for (int i = slots.Count - 1; i >= 0; i--)
+            if (slots[i].Item == item || (slots[i].Item != null && slots[i].Item.ItemName == item.ItemName))
+            { slots.RemoveAt(i); removed++; }
+        if (removed > 0) OnChanged?.Invoke();
+        return removed;
+    }
+
+    public int GetItemCount(Item item)
+    {
+        if (item == null) return 0;
+
+        int count = 0;
+        foreach (var slot in slots)
+        {
+            if (slot.Item == item || (slot.Item != null && slot.Item.ItemName == item.ItemName))
+                count++;
+        }
+        return count;
+    }
+}

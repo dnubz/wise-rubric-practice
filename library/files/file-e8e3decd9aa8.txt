@@ -1,0 +1,17 @@
+using UnityEngine;
+
+public sealed class BattleDragonVisual : MonoBehaviour
+{
+    public Transform leftWing, rightWing, mouth;
+    Animator flight;
+    void Awake() => flight = GetComponent<Animator>();
+    void Update()
+    {
+        if (flight != null) flight.speed = BattleSession.MenuOpen ? 0 : 1;
+        if (BattleSession.MenuOpen) return;
+        if (flight != null && flight.runtimeAnimatorController != null) return;
+        float flap = Mathf.Sin(Time.time * 8) * 25;
+        leftWing.localRotation = Quaternion.Euler(0, 0, flap);
+        rightWing.localRotation = Quaternion.Euler(0, 0, -flap);
+    }
+}

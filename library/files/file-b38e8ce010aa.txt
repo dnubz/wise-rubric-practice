@@ -1,0 +1,67 @@
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>Simple vector artwork for the metallic frame, key and count badge.</summary>
+[RequireComponent(typeof(CanvasRenderer))]
+public sealed class DungeonKeyGraphic : MaskableGraphic
+{
+    public enum Kind { Frame, Key, Badge }
+    public Kind kind;
+    protected override void Awake() { base.Awake(); raycastTarget = false; }
+    protected override void OnPopulateMesh(VertexHelper vh)
+    {
+        vh.Clear(); Rect r = rectTransform.rect;
+        if (kind == Kind.Frame)
+        {
+            Quad(vh, new Rect(0, 0, 1, 1), new Color(.85f, .86f, .88f), new Color(.15f, .16f, .18f), r);
+            Quad(vh, new Rect(.075f, .075f, .85f, .85f), new Color(.07f, .08f, .10f, .92f), new Color(.03f, .04f, .05f, .92f), r);
+            Quad(vh, new Rect(.085f, .9f, .83f, .035f), Color.white, new Color(.7f, .72f, .75f), r);
+            return;
+        }
+        if (kind == Kind.Badge)
+        {
+            Polygon(vh, 8, .5f, new Color(.73f, .78f, .8f), r);
+            Polygon(vh, 8, .4f, new Color(.17f, .3f, .23f), r); return;
+        }
+        // A hollow ring and two teeth make a readable key at any canvas resolution.
+        const int segments = 24;
+        for (int i = 0; i < segments; i++)
+        {
+            float a = i * Mathf.PI * 2 / segments, b = (i + 1) * Mathf.PI * 2 / segments;
+            KeyQuad(vh, Ring(a, .21f), Ring(b, .21f), Ring(b, .125f), Ring(a, .125f), r);
+        }
+        KeyQuad(vh, new Vector2(-.045f, -.34f), new Vector2(.045f, -.34f), new Vector2(.045f, .05f), new Vector2(-.045f, .05f), r);
+        KeyQuad(vh, new Vector2(.02f, -.32f), new Vector2(.17f, -.32f), new Vector2(.17f, -.24f), new Vector2(.02f, -.24f), r);
+        KeyQuad(vh, new Vector2(.02f, -.17f), new Vector2(.145f, -.17f), new Vector2(.145f, -.10f), new Vector2(.02f, -.10f), r);
+    }
+    static Vector2 Ring(float angle, float radius) => new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius + new Vector2(0, .16f);
+    void KeyQuad(VertexHelper vh, Vector2 a, Vector2 b, Vector2 c, Vector2 d, Rect r)
+    {
+        Quaternion tilt = Quaternion.Euler(0, 0, -35);
+        Vector2 Point(Vector2 p) => (Vector2)(tilt * p) + Vector2.one * .5f;
+        AddQuad(vh, Point(a), Point(b), Point(c), Point(d), color, color, r);
+    }
+    static void Quad(VertexHelper vh, Rect q, Color top, Color bottom, Rect r)
+    { AddQuad(vh, q.min, new Vector2(q.xMax, q.yMin), q.max, new Vector2(q.xMin, q.yMax), top, bottom, r); }
+    static void AddQuad(VertexHelper vh, Vector2 a, Vector2 b, Vector2 c, Vector2 d, Color top, Color bottom, Rect r)
+    {
+        int start = vh.currentVertCount;
+        Vertex(vh, a, bottom, r); Vertex(vh, b, bottom, r); Vertex(vh, c, top, r); Vertex(vh, d, top, r);
+        vh.AddTriangle(start, start + 1, start + 2); vh.AddTriangle(start, start + 2, start + 3);
+    }
+    static void Polygon(VertexHelper vh, int sides, float radius, Color colour, Rect r)
+    {
+        int start = vh.currentVertCount; Vertex(vh, Vector2.one * .5f, colour, r);
+        for (int i = 0; i < sides; i++)
+        {
+            float angle = (i + .5f) * Mathf.PI * 2 / sides;
+            Vertex(vh, Vector2.one * .5f + new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius, colour, r);
+        }
+        for (int i = 0; i < sides; i++) vh.AddTriangle(start, start + 1 + i, start + 1 + (i + 1) % sides);
+    }
+    static void Vertex(VertexHelper vh, Vector2 p, Color colour, Rect r)
+    {
+        var vertex = UIVertex.simpleVert; vertex.color = colour;
+        vertex.position = new Vector3(r.xMin + p.x * r.width, r.yMin + p.y * r.height, 0); vh.AddVert(vertex);
+    }
+}

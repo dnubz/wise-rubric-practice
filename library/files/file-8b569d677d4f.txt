@@ -1,0 +1,141 @@
+using System;
+using UnityEngine;
+
+/// <summary>Paints instantiated WFC terrain prefabs once, without modifying their source assets.</summary>
+internal sealed class BlendedChunkTerrain : IDisposable
+{
+    readonly TerrainLayer[] layers = new TerrainLayer[4];
+    readonly Terrain[] sources = new Terrain[4];
+    readonly Material material;
+    readonly bool ownsMaterial;
+    readonly float tileSize;
+
+    public BlendedChunkTerrain(GameObject[] prefabs, Material terrainMaterial, float worldTileSize)
+    {
+        tileSize = worldTileSize;
+        if (prefabs == null || prefabs.Length < 4)
+            throw new InvalidOperationException("Assign all four terrain prefabs on WFCWorldManager before enabling terrain blending.");
+        for (int i = 0; i < layers.Length; i++)
+        {
+            sources[i] = prefabs[i] != null ? prefabs[i].GetComponent<Terrain>() : null;
+            Terrain source = sources[i];
+            if (source == null || source.terrainData == null)
+                throw new InvalidOperationException("Blended terrain requires four terrain prefabs: grass, water, sand and rock.");
+
+            Material surface = source.materialTemplate;
+            TerrainLayer[] existing = source.terrainData.terrainLayers;
+            TerrainLayer original = existing.Length > 0 ? existing[0] : null;
+            Texture2D texture = surface != null && surface.HasProperty("_BaseMap")
+                ? surface.GetTexture("_BaseMap") as Texture2D : null;
+            if (texture == null && original != null) texture = original.diffuseTexture;
+            Color tint = surface != null && surface.HasProperty("_BaseColor")
+                ? surface.GetColor("_BaseColor") : Color.white;
+            Vector2 tiling = surface != null && surface.HasProperty("_BaseMap")
+                ? surface.GetTextureScale("_BaseMap") : Vector2.one;
+            Vector2 offset = surface != null && surface.HasProperty("_BaseMap")
+                ? surface.GetTextureOffset("_BaseMap") : Vector2.zero;
+
+            layers[i] = new TerrainLayer
+            {
+                name = "Generated " + prefabs[i].name + " Layer",
+                diffuseTexture = texture != null ? texture : Texture2D.whiteTexture,
+                tileSize = new Vector2(tileSize / Mathf.Max(0.01f, Mathf.Abs(tiling.x)),
+                    tileSize / Mathf.Max(0.01f, Mathf.Abs(tiling.y))),
+                tileOffset = offset * tileSize,
+                diffuseRemapMin = Vector4.zero,
+                // Alpha = 1 disables Terrain/Lit's texture-alpha density blending.
+                diffuseRemapMax = new Vector4(tint.r, tint.g, tint.b, 1f),
+                metallic = 0f,
+                smoothness = 0f
+            };
+        }
+
+        material = terrainMaterial;
+        if (material == null)
+        {
+            Shader shader = Shader.Find("Universal Render Pipeline/Terrain/Lit");
+            if (shader == null)
+                throw new InvalidOperationException("Assign the Blended World Terrain material on WFCWorldManager.");
+            material = new Material(shader) { name = "Generated Blended World Terrain", enableInstancing = true };
+            ownsMaterial = true;
+        }
+    }
+
+    public TerrainData Paint(WFCWorldManager world, Terrain terrain, int paintResolution, int terrainType, bool blend)
+    {
+        if (terrain == null || terrain.terrainData == null)
+            throw new InvalidOperationException("The instantiated WFC prefab must contain a Terrain component.");
+        TerrainData source = terrain.terrainData;
+        Vector3 origin = terrain.transform.position;
+        int resolution = Mathf.Clamp(Mathf.NextPowerOfTwo(paintResolution), 16, 128);
+        TerrainData data = new TerrainData
+        {
+            name = "Painted " + terrain.name,
+            heightmapResolution = 33,
+            alphamapResolution = resolution,
+            baseMapResolution = resolution,
+            size = new Vector3(source.size.x, Mathf.Max(source.size.y, world.WaterDepth + 1f), source.size.z),
+            terrainLayers = blend ? layers : source.terrainLayers
+        };
+
+        if (blend)
+        {
+            float[,,] paint = new float[resolution, resolution, 4];
+            for (int z = 0; z < resolution; z++)
+            {
+                for (int x = 0; x < resolution; x++)
+                {
+                    // World coordinates match at both tile and chunk borders.
+                    Vector3 position = origin + new Vector3(x * data.size.x / (resolution - 1), 0f, z * data.size.z / (resolution - 1));
+                    Vector4 weights = world.GetTerrainBlend(position);
+                    for (int layer = 0; layer < 4; layer++) paint[z, x, layer] = weights[layer];
+                }
+            }
+            data.SetAlphamaps(0, 0, paint);
+        }
+        else if (source.alphamapLayers > 0)
+        {
+            data.alphamapResolution = source.alphamapResolution;
+            data.SetAlphamaps(0, 0, source.GetAlphamaps(0, 0, source.alphamapWidth, source.alphamapHeight));
+        }
+
+        int heightResolution = data.heightmapResolution;
+        float[,] heights = new float[heightResolution, heightResolution];
+        for (int z = 0; z < heightResolution; z++)
+        {
+            for (int x = 0; x < heightResolution; x++)
+            {
+                float u = x / (float)(heightResolution - 1);
+                float v = z / (float)(heightResolution - 1);
+                float height = source.GetInterpolatedHeight(u, v);
+                if (terrainType == 1)
+                {
+                    Vector3 position = origin + new Vector3(u * data.size.x, 0f, v * data.size.z);
+                    height = world.WaterDepth - world.GetWaterBedDepth(position);
+                }
+                heights[z, x] = height / data.size.y;
+            }
+        }
+        data.SetHeights(0, 0, heights);
+
+        terrain.terrainData = data;
+        if (terrainType == 1) terrain.transform.position = origin - Vector3.up * world.WaterDepth;
+        if (blend) terrain.materialTemplate = material;
+        terrain.drawInstanced = blend;
+        terrain.heightmapPixelError = 5f;
+        terrain.basemapDistance = world.ChunkSize * tileSize * 4f;
+        terrain.allowAutoConnect = true;
+        terrain.groupingID = world.GetEntityId().GetHashCode() & int.MaxValue;
+        TerrainCollider collider = terrain.GetComponent<TerrainCollider>();
+        if (collider != null) collider.terrainData = data;
+        terrain.Flush();
+        return data;
+    }
+
+    public void Dispose()
+    {
+        foreach (TerrainLayer layer in layers)
+            if (layer != null) UnityEngine.Object.Destroy(layer);
+        if (ownsMaterial && material != null) UnityEngine.Object.Destroy(material);
+    }
+}

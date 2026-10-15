@@ -1,0 +1,272 @@
+using System.Collections.Generic;
+using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class ShopUI : MonoBehaviour
+{
+    static ShopUI activeShop;
+    static int closedFrame = -1;
+    public static bool BlocksGameplayInput => (activeShop != null && activeShop.IsOpen) || closedFrame == Time.frameCount;
+    [Header("Shop Data")]
+    [SerializeField] private ShopInventory defaultInventory;
+    [SerializeField] private GameObject shopPanel;
+    [SerializeField] private Button closeButton;
+
+    [Header("Scrollable Item Grid")]
+    [SerializeField] private Transform itemGridContent;
+    [SerializeField] private ShopItemButtonUI itemButtonPrefab;
+
+    [Header("Selected Item")]
+    [SerializeField] private TMP_Text selectedItemName;
+    [SerializeField] private TMP_Text selectedItemDescription;
+    [SerializeField] private TMP_Text quantityText;
+    [SerializeField] private Button decreaseQuantityButton;
+    [SerializeField] private Button increaseQuantityButton;
+    [SerializeField] private TMP_Text totalPriceText;
+    [SerializeField] private TMP_Text goldText;
+    [SerializeField] private TMP_Text statusText;
+    [SerializeField] private Button buyButton;
+    [SerializeField, Min(1)] private int maxQuantity = 99;
+
+    private readonly List<ShopItemButtonUI> spawnedButtons = new List<ShopItemButtonUI>();
+    private ShopInventory currentInventory;
+    private int selectedIndex = -1;
+    private int quantity = 1;
+
+    public bool IsOpen => shopPanel != null && shopPanel.activeInHierarchy;
+
+    private void Awake()
+    {
+        if (closeButton != null)
+            closeButton.onClick.AddListener(CloseShop);
+        if (decreaseQuantityButton != null)
+            decreaseQuantityButton.onClick.AddListener(DecreaseQuantity);
+        if (increaseQuantityButton != null)
+            increaseQuantityButton.onClick.AddListener(IncreaseQuantity);
+    }
+
+    private void OnEnable()
+    {
+        PlayerInventory.Instance.OnGoldChanged += UpdateGold;
+        UpdateGold(PlayerInventory.Instance.Gold);
+    }
+
+    private void Start()
+    {
+        if (defaultInventory != null)
+        {
+            currentInventory = defaultInventory;
+            RefreshItems();
+        }
+
+        if (shopPanel != null)
+            shopPanel.SetActive(false);
+    }
+
+    private void OnDisable()
+    {
+        if (activeShop == this) { activeShop = null; closedFrame = Time.frameCount; }
+        if (PlayerInventory.HasInstance)
+            PlayerInventory.Instance.OnGoldChanged -= UpdateGold;
+    }
+
+    private void OnDestroy()
+    {
+        if (closeButton != null)
+            closeButton.onClick.RemoveListener(CloseShop);
+        if (decreaseQuantityButton != null)
+            decreaseQuantityButton.onClick.RemoveListener(DecreaseQuantity);
+        if (increaseQuantityButton != null)
+            increaseQuantityButton.onClick.RemoveListener(IncreaseQuantity);
+    }
+
+    // Use this no-argument method for a UnityEvent in the Inspector.
+    public void OpenShop()
+    {
+        OpenShop(defaultInventory);
+    }
+
+    public void OpenShop(ShopInventory inventory)
+    {
+        if (inventory == null)
+        {
+            Debug.LogWarning("[ShopUI] Assign a ShopInventory before opening the shop.");
+            return;
+        }
+
+        currentInventory = inventory;
+        if (activeShop != null && activeShop != this) activeShop.CloseShop();
+        activeShop = this;
+        selectedIndex = -1;
+        quantity = 1;
+        if (shopPanel != null) shopPanel.SetActive(true);
+        RefreshItems();
+        UpdateGold(PlayerInventory.Instance.Gold);
+    }
+
+    public void CloseShop()
+    {
+        if (activeShop == this) { activeShop = null; closedFrame = Time.frameCount; }
+        if (shopPanel != null) shopPanel.SetActive(false);
+    }
+
+    private void Update()
+    {
+        if (IsOpen && UnityEngine.InputSystem.Keyboard.current != null && UnityEngine.InputSystem.Keyboard.current.escapeKey.wasPressedThisFrame)
+            CloseShop();
+    }
+
+    // Call this after changing the ShopInventory list while the shop is open.
+    public void RefreshItems()
+    {
+        foreach (ShopItemButtonUI button in spawnedButtons)
+        {
+            if (button == null) continue;
+            button.gameObject.SetActive(false);
+            Destroy(button.gameObject);
+        }
+        spawnedButtons.Clear();
+
+        if (currentInventory == null || currentInventory.items == null)
+        {
+            selectedIndex = -1;
+            UpdateSelectedItem();
+            return;
+        }
+
+        if (itemGridContent == null || itemButtonPrefab == null)
+        {
+            Debug.LogWarning("[ShopUI] Assign Item Grid Content and Item Button Prefab.");
+            selectedIndex = -1;
+            UpdateSelectedItem();
+            return;
+        }
+
+        int firstValidIndex = -1;
+        for (int i = 0; i < currentInventory.items.Count; i++)
+        {
+            ShopEntry entry = currentInventory.items[i];
+            if (!CanSell(entry)) continue;
+
+            if (firstValidIndex < 0) firstValidIndex = i;
+            int capturedIndex = i;
+            ShopItemButtonUI button = Instantiate(itemButtonPrefab, itemGridContent);
+            button.Bind(entry, () => SelectItem(capturedIndex));
+            spawnedButtons.Add(button);
+        }
+
+        if (GetEntry(selectedIndex) == null) selectedIndex = firstValidIndex;
+        quantity = 1;
+        UpdateSelectedItem();
+    }
+
+    public void SelectItem(int index)
+    {
+        if (GetEntry(index) == null) return;
+        selectedIndex = index;
+        quantity = 1;
+        UpdateSelectedItem();
+    }
+
+    public void IncreaseQuantity()
+    {
+        if (GetEntry(selectedIndex) == null) return;
+        quantity = Mathf.Min(quantity + 1, Mathf.Max(1, maxQuantity));
+        UpdateSelectedItem();
+    }
+
+    public void DecreaseQuantity()
+    {
+        if (GetEntry(selectedIndex) == null) return;
+        quantity = Mathf.Max(1, quantity - 1);
+        UpdateSelectedItem();
+    }
+
+    // Kept for any existing buttons that pass an item index.
+    public void BuyItem(int index)
+    {
+        if (GetEntry(index) == null) return;
+        SelectItem(index);
+        BuySelectedItem();
+    }
+
+    public void BuySelectedItem()
+    {
+        ShopEntry entry = GetEntry(selectedIndex);
+        if (entry == null) return;
+
+        long totalCost = (long)Mathf.Max(0, entry.GetPrice()) * quantity;
+        if (totalCost > int.MaxValue)
+        {
+            SetStatus("That quantity costs too much.");
+            return;
+        }
+
+        PlayerInventory inventory = PlayerInventory.Instance;
+        if (!inventory.SpendGold((int)totalCost))
+        {
+            SetStatus("Not enough gold.");
+            return;
+        }
+
+        for (int i = 0; i < quantity; i++)
+            inventory.AddItem(entry.item);
+
+        SetStatus($"Bought {entry.item.ItemName} x{quantity}.");
+        UpdateGold(inventory.Gold);
+    }
+
+    private ShopEntry GetEntry(int index)
+    {
+        if (currentInventory == null || currentInventory.items == null ||
+            index < 0 || index >= currentInventory.items.Count)
+            return null;
+
+        ShopEntry entry = currentInventory.items[index];
+        return CanSell(entry) ? entry : null;
+    }
+
+    // A consumable with zero cost is chest loot, never a free shop purchase.
+    private static bool CanSell(ShopEntry entry) => entry != null && entry.item != null &&
+        (!(entry.item is Consumable consumable) || consumable.Cost > 0);
+
+    private void UpdateSelectedItem()
+    {
+        ShopEntry entry = GetEntry(selectedIndex);
+        if (selectedItemName != null)
+            selectedItemName.text = entry != null ? entry.item.ItemName : "Select item";
+        if (selectedItemDescription != null)
+            selectedItemDescription.text = entry != null ? entry.item.Description : "The item effect will appear here.";
+        if (quantityText != null)
+            quantityText.text = entry != null ? quantity.ToString() : "0";
+        if (totalPriceText != null)
+            totalPriceText.text = entry != null
+                ? ((long)Mathf.Max(0, entry.GetPrice()) * quantity).ToString()
+                : "0";
+
+        SetStatus(string.Empty);
+        UpdateBuyButton();
+    }
+
+    private void UpdateGold(int gold)
+    {
+        if (goldText != null) goldText.text = gold.ToString();
+        UpdateBuyButton();
+    }
+
+    private void UpdateBuyButton()
+    {
+        if (buyButton == null) return;
+
+        ShopEntry entry = GetEntry(selectedIndex);
+        long totalCost = entry != null ? (long)Mathf.Max(0, entry.GetPrice()) * quantity : long.MaxValue;
+        buyButton.interactable = entry != null && totalCost <= int.MaxValue &&
+                                 PlayerInventory.Instance.CanAfford((int)totalCost);
+    }
+
+    private void SetStatus(string message)
+    {
+        if (statusText != null) statusText.text = message;
+    }
+}

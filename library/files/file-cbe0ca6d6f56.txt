@@ -1,0 +1,221 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
+
+/// <summary>Exercises the actual F interaction path and gate movement in an isolated editor scene.</summary>
+[InitializeOnLoad]
+public static class DungeonDoorInteractionChecks
+{
+    const string Folder = "Temp/DungeonInteractions";
+    static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static double nextCheck;
+    static DungeonDoorInteractionChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling ||
+            EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        File.Delete(Folder + "/check.request");
+        try { Run(); File.WriteAllText(Folder + "/check-result.txt", "PASS: F-only unlocking/travel, matching keys, gate lift, saved UI, yellow outline and overhead exclamation share the actual nearest-action checks; both clear on leaving range, travel, unavailable doors and opened chests."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/check-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Validate Dungeon Door Interactions")]
+    public static void Run()
+    {
+        DungeonGenerationChecks.Run();
+        Directory.CreateDirectory(Folder);
+        var settings = Resources.Load<DungeonSettings>("Dungeon/Settings");
+        Require(settings.doorLockUI != null, "Saved lock UI reference is missing.");
+        Scene original = SceneManager.GetActiveScene();
+        Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+        var owned = new GameObject("DoorInteractionCheck"); SceneManager.MoveGameObjectToScene(owned, scene);
+        FieldInfo currentPlayer = typeof(CharacterSwitchManager).GetField("<CurrentCharacterTransform>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
+        object savedPlayer = currentPlayer.GetValue(null);
+        RenderTexture target = null;
+        try
+        {
+            var generator = owned.AddComponent<DungeonGenerator>(); Set(generator, "settings", settings);
+            var keyHud = owned.AddComponent<DungeonKeyHud>(); keyHud.Initialize(owned.transform); Set(generator, "keyHud", keyHud);
+            Set(generator, "contentRandom", new System.Random(24681));
+            Set(generator, "doorMaterial", settings.doorMaterial);
+            var naming = new BerdlyChemistry(0, Table("alkane"), Table("alkyl"), Table("prefix"));
+            var layout = DungeonLayout.Generate(24681, 12, 36, 42, naming);
+            Set(generator, "<Layout>k__BackingField", layout); Set(generator, "<Exploring>k__BackingField", true);
+            var roots = (List<GameObject>)typeof(DungeonGenerator).GetField("roomRoots", Private).GetValue(generator);
+            for (int i = 0; i < layout.Rooms.Count; i++)
+            {
+                var room = new GameObject("Room_" + i); room.transform.SetParent(owned.transform);
+                room.transform.position = generator.RoomCentre(i); roots.Add(room);
+            }
+            var rig = new GameObject("TestCameraRig"); rig.transform.SetParent(owned.transform);
+            Set(generator, "cameraRig", rig.AddComponent<CameraController>());
+            var player = new GameObject("InteractionProbe"); player.transform.SetParent(owned.transform);
+            currentPlayer.SetValue(null, player.transform);
+            var uiPrefab = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/UI/DungeonInteractions/DungeonInteractionUI.prefab");
+            var uiObject = Object.Instantiate(uiPrefab, owned.transform); var indicator = uiObject.GetComponent<DungeonInteractionUI>();
+            Set(generator, "interactionUI", indicator);
+            var targetPrompt = WorldInteractionPrompt.Create(owned.transform);
+            Require(targetPrompt != null && targetPrompt.Bubble.sprite != null, "Saved F sprite prompt is missing.");
+            Set(generator, "targetPrompt", targetPrompt);
+
+            foreach (DungeonDoorData door in layout.Doors)
+                typeof(DungeonGenerator).GetMethod("BuildDoorways", Private).Invoke(generator, new object[] { door });
+            foreach (DungeonDoorData door in layout.Doors)
+                foreach (var end in new[] { (source: door.A, destination: door.B), (source: door.B, destination: door.A) })
+                {
+                    Vector3 direction = (generator.RoomCentre(end.destination) - generator.RoomCentre(end.source)).normalized;
+                    DungeonRoomData room = layout.Rooms[end.source];
+                    float halfSize = (Mathf.Abs(direction.x) > .5f ? room.Size.x : room.Size.y) / 2f;
+                    Transform doorway = roots[end.source].transform.Find("Exit_ToRoom_" + end.destination);
+                    float distanceFromCentre = Vector3.Dot(doorway.position - generator.RoomCentre(end.source), direction);
+                    Require(Mathf.Abs(halfSize - distanceFromCentre - .35f) < .01f, "Door is not just inside the room edge.");
+                }
+            DungeonDoorData yellow = layout.Doors.First(d => d.Lock == DungeonKeyKind.Original);
+            generator.VisitRoom(yellow.A);
+            DungeonRoomExit exit = roots[yellow.A].transform.Find("Exit_ToRoom_" + yellow.B).GetComponent<DungeonRoomExit>();
+            DungeonGateLift gate = exit.GetComponent<DungeonGateLift>();
+            player.transform.position = exit.transform.position - Vector3.up * 1.5f;
+            Require(!generator.CanOpenExit(yellow.A, yellow.B) && !generator.CanInteractNearby(), "Missing-key gate is actionable.");
+            RefreshFeedback(generator);
+            Transform outline = exit.transform.Find("SteelRoomGate/InteractionOutline");
+            Require(outline != null && !outline.gameObject.activeSelf && !uiObject.transform.Find("ExclamationMark").gameObject.activeSelf,
+                "Missing-key gate shows available feedback.");
+            Require(!targetPrompt.gameObject.activeSelf, "Missing-key gate shows F bubble.");
+            MoveGate(gate); Require(!gate.IsFullyRaised, "Missing-key gate rises.");
+            Set(generator, "<OriginalKeys>k__BackingField", 1);
+            MoveGate(gate); Require(!gate.IsFullyRaised && !generator.CanOpenExit(yellow.A, yellow.B), "Having a key automatically opens a locked gate.");
+            Require(generator.CanInteractNearby(), "Unlock interaction lacks a marker.");
+            RefreshFeedback(generator);
+            Require(outline.gameObject.activeSelf && uiObject.transform.Find("ExclamationMark").gameObject.activeSelf,
+                "Available gate lacks highlight or exclamation.");
+            Require(targetPrompt.gameObject.activeSelf, "Available gate lacks F sprite bubble.");
+            player.transform.position += Vector3.right * 10; RefreshFeedback(generator);
+            Require(!targetPrompt.gameObject.activeSelf, "F bubble remains outside gate range.");
+            Require(!outline.gameObject.activeSelf && !uiObject.transform.Find("ExclamationMark").gameObject.activeSelf,
+                "Feedback remains outside interaction range.");
+            player.transform.position -= Vector3.right * 10;
+            Require(generator.TryInteractNearest() && generator.CurrentRoom == yellow.A, "First F should unlock without travelling.");
+            Require(generator.OriginalKeys == 0 && owned.transform.Find("KeySlots/OriginalKeySlot/CountBadge/Count").GetComponent<TMPro.TMP_Text>().text == "0x",
+                "Unlocking a yellow gate must consume one key and refresh its HUD.");
+            Require(generator.TryUnlockExit(yellow.A, yellow.B) && generator.OriginalKeys == 0,
+                "An already unlocked gate charges another key.");
+            Require(generator.CanOpenExit(yellow.A, yellow.B) && generator.CanOpenExit(yellow.B, yellow.A), "Lock state is not shared.");
+            foreach (DungeonDoorUI ui in roots.SelectMany(r => r.GetComponentsInChildren<DungeonDoorUI>(true)))
+                if (ui.transform.parent.name == "Exit_ToRoom_" + yellow.B && ui.transform.parent.parent == roots[yellow.A].transform ||
+                    ui.transform.parent.name == "Exit_ToRoom_" + yellow.A && ui.transform.parent.parent == roots[yellow.B].transform)
+                    Require(!ui.transform.Find("LockIcon").gameObject.activeSelf, "Unlocked sign remains visible.");
+            MoveGate(gate); Require(gate.IsFullyRaised && generator.CurrentRoom == yellow.A, "Gate lift caused automatic travel.");
+            Require(generator.TryInteractNearest() && generator.CurrentRoom == yellow.B, "Second F did not travel.");
+            Require(!generator.CanInteractNearby(), "Landing point immediately offers another door interaction.");
+            RefreshFeedback(generator);
+            Require(!outline.gameObject.activeSelf && !uiObject.transform.Find("ExclamationMark").gameObject.activeSelf,
+                "Feedback remains after travelling.");
+            Require(generator.TryUnlockExit(yellow.B, yellow.A) && generator.OriginalKeys == 0,
+                "Reverse travel charges for the same yellow lock again.");
+            DungeonDoorData otherYellow = layout.Doors.First(d => d.Lock == DungeonKeyKind.Original && d != yellow);
+            generator.VisitRoom(otherYellow.A);
+            Require(!generator.TryUnlockExit(otherYellow.A, otherYellow.B) && generator.OriginalKeys == 0,
+                "A different yellow gate opens without a key or makes the count negative.");
+            Set(generator, "<OriginalKeys>k__BackingField", 2);
+            Require(generator.TryUnlockExit(otherYellow.A, otherYellow.B) && generator.OriginalKeys == 1,
+                "A new yellow gate must consume exactly one of the remaining keys.");
+
+            DungeonDoorData red = layout.Doors.First(d => d.Lock == DungeonKeyKind.Boss);
+            generator.VisitRoom(red.A); Set(generator, "transitionReadyAt", 0f);
+            exit = roots[red.A].transform.Find("Exit_ToRoom_" + red.B).GetComponent<DungeonRoomExit>();
+            player.transform.position = exit.transform.position - Vector3.up * 1.5f;
+            Require(!generator.TryInteractNearest() && !generator.CanInteractNearby(), "Yellow key opens the boss gate.");
+            Set(generator, "<BossKeys>k__BackingField", 1);
+            MoveGate(exit.GetComponent<DungeonGateLift>());
+            Require(!generator.CanOpenExit(red.A, red.B), "Boss key automatically unlocks gate.");
+            Require(generator.TryInteractNearest() && generator.CanOpenExit(red.A, red.B), "Boss key cannot unlock via F.");
+
+            DungeonDoorData ordinary = layout.Doors.First(d => d.Lock == DungeonKeyKind.None);
+            generator.VisitRoom(ordinary.A); Set(generator, "transitionReadyAt", 0f);
+            exit = roots[ordinary.A].transform.Find("Exit_ToRoom_" + ordinary.B).GetComponent<DungeonRoomExit>();
+            player.transform.position = exit.transform.position - Vector3.up * 1.5f;
+            MoveGate(exit.GetComponent<DungeonGateLift>());
+            Require(exit.IsReady && generator.CurrentRoom == ordinary.A, "Ordinary gate does not rise independently of travel.");
+            Require(generator.CanInteractNearby() && generator.TryInteractNearest() && generator.CurrentRoom == ordinary.B, "Ordinary gate does not enter on F.");
+
+            // Other nearby actions use the same overhead marker; completed chests no longer offer it.
+            player.transform.position = generator.RoomCentre(ordinary.B);
+            var createChest = typeof(DungeonGenerator).GetMethod("CreateChest", Private);
+            createChest.Invoke(generator, new object[] { ordinary.B, player.transform.position, DungeonKeyKind.None,
+                Enum.Parse(createChest.GetParameters()[3].ParameterType, "Treasure") });
+            RefreshFeedback(generator);
+            Require(uiObject.transform.Find("ExclamationMark").gameObject.activeSelf, "Nearby chest lacks the overhead marker.");
+            var actions = (System.Collections.IEnumerable)typeof(DungeonGenerator).GetField("interactions", Private).GetValue(generator);
+            foreach (object action in actions)
+                if (action.GetType().GetField("Kind").GetValue(action).ToString() == "Treasure")
+                    typeof(DungeonGenerator).GetMethod("OpenChest", Private).Invoke(generator, new[] { action });
+            RefreshFeedback(generator);
+            Require(!uiObject.transform.Find("ExclamationMark").gameObject.activeSelf && !targetPrompt.gameObject.activeSelf, "Opened chest still offers interaction.");
+            indicator.ShowFor(player.transform, false); Require(!uiObject.transform.Find("ExclamationMark").gameObject.activeSelf, "Marker visible without interaction.");
+            indicator.ShowFor(player.transform, true); Require(uiObject.transform.Find("ExclamationMark").gameObject.activeSelf, "Marker missing with interaction.");
+            Require(File.ReadAllText("Assets/Scenes/DungeonScene.unity").Contains(AssetDatabase.AssetPathToGUID("Assets/UI/DungeonInteractions/DungeonInteractionUI.prefab")), "Scene UI instance is not saved.");
+
+            // Render the actual saved UI so its dimensions and colours can be visually checked.
+            foreach (GameObject root in roots) root.SetActive(false);
+            var cameraObject = new GameObject("UIPreviewCamera"); cameraObject.transform.SetParent(owned.transform);
+            Camera camera = cameraObject.AddComponent<Camera>(); camera.orthographic = true; camera.orthographicSize = 2;
+            camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.08f, .1f, .14f);
+            camera.transform.position = new Vector3(0, 0, -10);
+            var lockObject = Object.Instantiate(settings.doorLockUI, owned.transform);
+            lockObject.transform.SetPositionAndRotation(new Vector3(-.8f, 0, 0), Quaternion.identity);
+            lockObject.SetLock(DungeonKeyKind.Original, true);
+            var redObject = Object.Instantiate(settings.doorLockUI, owned.transform);
+            redObject.transform.SetPositionAndRotation(new Vector3(.8f, 0, 0), Quaternion.identity);
+            redObject.SetLock(DungeonKeyKind.Boss, true);
+            uiObject.transform.SetPositionAndRotation(new Vector3(0, 1.3f, 0), Quaternion.identity);
+            foreach (Transform child in owned.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+            camera.cullingMask = 1 << 30; Canvas.ForceUpdateCanvases();
+            target = new RenderTexture(600, 600, 24); camera.targetTexture = target; camera.Render();
+            RenderTexture previous = RenderTexture.active; RenderTexture.active = target;
+            var image = new Texture2D(600, 600, TextureFormat.RGB24, false);
+            image.ReadPixels(new Rect(0, 0, 600, 600), 0, 0); image.Apply();
+            File.WriteAllBytes(Folder + "/interaction-ui.png", image.EncodeToPNG());
+            RenderTexture.active = previous; Object.DestroyImmediate(image);
+
+            lockObject.gameObject.SetActive(false); redObject.gameObject.SetActive(false);
+            GameObject gateModel = Object.Instantiate(settings.steelGateModel, owned.transform);
+            gateModel.transform.position = Vector3.zero;
+            gateModel.GetComponent<DungeonDoorHighlight>().SetHighlighted(true);
+            foreach (Transform child in gateModel.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 30;
+            var lamp = new GameObject("PreviewLight"); lamp.transform.SetParent(owned.transform);
+            var light = lamp.AddComponent<Light>(); light.type = LightType.Directional; light.intensity = 2; light.cullingMask = 1 << 30;
+            lamp.transform.rotation = Quaternion.Euler(45, -30, 0);
+            Bounds bounds = gateModel.GetComponent<Renderer>().bounds;
+            camera.orthographicSize = bounds.size.y;
+            camera.transform.position = bounds.center + new Vector3(4, 2, -6); camera.transform.LookAt(bounds.center);
+            uiObject.transform.SetPositionAndRotation(bounds.center + Vector3.left * 2, camera.transform.rotation);
+            Canvas.ForceUpdateCanvases(); camera.Render();
+            previous = RenderTexture.active; RenderTexture.active = target;
+            image = new Texture2D(600, 600, TextureFormat.RGB24, false);
+            image.ReadPixels(new Rect(0, 0, 600, 600), 0, 0); image.Apply();
+            File.WriteAllBytes(Folder + "/door-highlight.png", image.EncodeToPNG());
+            RenderTexture.active = previous; Object.DestroyImmediate(image);
+        }
+        finally
+        {
+            currentPlayer.SetValue(null, savedPlayer);
+            Object.DestroyImmediate(owned);
+            if (target != null) Object.DestroyImmediate(target);
+            SceneManager.SetActiveScene(original); EditorSceneManager.CloseScene(scene, true);
+        }
+    }
+    static string Table(string name) => Resources.Load<TextAsset>("BerdlyNaming/" + name).text;
+    static void Set(object target, string field, object value) => target.GetType().GetField(field, Private).SetValue(target, value);
+    static void MoveGate(DungeonGateLift gate) => typeof(DungeonGateLift).GetMethod("MoveGate", Private).Invoke(gate, new object[] { 1f });
+    static void RefreshFeedback(DungeonGenerator generator) => typeof(DungeonGenerator).GetMethod("RefreshInteractionFeedback", Private).Invoke(generator, null);
+    static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+}

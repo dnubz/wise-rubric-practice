@@ -1,0 +1,166 @@
+using UnityEngine;
+using UnityEngine.AI;
+
+public sealed class EncounterEnemy : MonoBehaviour
+{
+    public enum State { Idle, Patrol, Chase, Attack, OutOfSight }
+    public BattleEnemyData data;
+    public string identity;
+    public Vector3 home;
+    public float roamRadius = 12;
+    [Min(1)] public float detectionRange = 42;
+    [Min(1)] public float dungeonDetectionRange = 64;
+    public bool dungeon, IsBoss;
+    public State CurrentState { get; private set; }
+    Vector3 destination;
+    float timer, nextAttack;
+    float nextPath, nextBind;
+    NavMeshAgent agent;
+    bool defeated, dialogue;
+    System.Random patrolRandom;
+    float impactAt = -1;
+    Quaternion confusedFacing;
+    public void Configure(BattleEnemyData source, string id, bool inDungeon = false)
+    {
+        data = source; identity = id; home = transform.position; dungeon = inDungeon;
+        int seed = 17;
+        foreach (char c in id ?? "") seed = unchecked(seed * 31 + c);
+        patrolRandom = new System.Random(seed);
+        agent = GetComponent<NavMeshAgent>();
+        if (agent != null)
+        {
+            agent.speed = 2.5f; agent.acceleration = 12; agent.angularSpeed = 480;
+            agent.stoppingDistance = Mathf.Max(.8f, data.attackRange * .65f);
+            agent.autoRepath = true; agent.updatePosition = agent.updateRotation = true;
+        }
+    }
+    void OnEnable() { if (BattleSession.Instance != null && BattleSession.Instance.IsDefeated(identity)) gameObject.SetActive(false); }
+    void Update()
+    {
+        if (defeated || data == null || NPCChallengePrompt.BlocksGameplayInput || BattleSession.IsActive || CheatConsole.BlocksGameplayInput) { StopMoving(); impactAt = -1; return; }
+        Transform player = CharacterSwitchManager.CurrentCharacterTransform;
+        if (player == null) { StopMoving(); return; }
+        Vector3 delta = player.position - transform.position;
+        float heightDifference = Mathf.Abs(delta.y); delta.y = 0;
+        float distance = delta.magnitude; timer += Time.deltaTime;
+        if (IsBoss)
+        {
+            if (!dialogue && distance < 12) { dialogue = true; BattleController.OpenBossDialogue(this); }
+            return;
+        }
+        bool tracking = CurrentState == State.Chase || CurrentState == State.Attack;
+        float range = dungeon ? dungeonDetectionRange : detectionRange;
+        bool detected = heightDifference < 12 && distance <= range + (tracking ? 10 : 0);
+        if (detected && distance < data.attackRange && CanHit(player))
+        {
+            SetState(State.Attack); StopMoving();
+            if (delta.sqrMagnitude > .001f) transform.rotation = Quaternion.LookRotation(delta);
+            if (impactAt < 0)
+            {
+                if (Time.time < nextAttack) return;
+                nextAttack = Time.time + 2; impactAt = Time.time + .22f;
+                GetComponent<BattleEnemyMotion>()?.Strike();
+                var audio = BattleSession.Instance != null ? BattleSession.Instance.settings : null;
+                DungeonAudio.Play(data.kind == BattleEnemyKind.Minion ? audio?.laserSound : audio?.attackSound, transform.position, .4f);
+                return;
+            }
+            if (Time.time < impactAt) return;
+            impactAt = -1;
+            if (data.kind == BattleEnemyKind.Minion)
+            {
+                var settings = BattleSession.Instance != null ? BattleSession.Instance.settings : null;
+                if (settings == null || settings.laser == null) return;
+                var shot = Instantiate(settings.laser, transform.position + Vector3.up * 2, Quaternion.identity);
+                var projectile = shot.AddComponent<EncounterProjectile>(); projectile.owner = this;
+                projectile.destination = player.position + Vector3.up * 1.3f;
+            }
+            else
+            {
+                // Only an actual melee hit starts combat; merely approaching an enemy does not.
+                foreach (var hit in Physics.OverlapSphere(transform.position + transform.forward * 1.2f, 2f))
+                    if (hit.GetComponentInParent<CharacterBase>() == player.GetComponent<CharacterBase>())
+                    { BattleSession.Instance?.Begin(this); break; }
+            }
+        }
+        else if (detected) { SetState(State.Chase); MoveToward(player.position); }
+        else if (tracking) { SetState(State.OutOfSight); StopMoving(); }
+        else if (CurrentState == State.OutOfSight)
+        {
+            // A short left/right search communicates confusion while navigation stays stopped.
+            transform.rotation = confusedFacing * Quaternion.Euler(0, Mathf.Sin(timer * 6) * 35, 0);
+            if (timer > 1.5f) SetState(State.Idle);
+        }
+        else if (CurrentState == State.Idle && timer > 3)
+        { if (TryPatrolDestination(out destination)) SetState(State.Patrol); else timer = 0; }
+        else if (CurrentState == State.Patrol)
+        { MoveToward(destination); if (Vector3.Distance(transform.position, destination) < 1 || timer > 5) { SetState(State.Idle); StopMoving(); } }
+    }
+    void SetState(State value)
+    {
+        if (CurrentState == value) return;
+        CurrentState = value; timer = 0; nextPath = 0; impactAt = -1;
+        if (value == State.OutOfSight) confusedFacing = transform.rotation;
+        if (value == State.Idle || value == State.OutOfSight) StopMoving();
+    }
+    bool TryPatrolDestination(out Vector3 point)
+    {
+        point = home;
+        if (agent == null) agent = GetComponent<NavMeshAgent>();
+        if (agent == null) return false;
+        if (patrolRandom == null) patrolRandom = new System.Random(17);
+        var filter = new NavMeshQueryFilter { agentTypeID = agent.agentTypeID, areaMask = agent.areaMask };
+        var path = new NavMeshPath();
+        for (int i = 0; i < 12; i++)
+        {
+            float angle = (float)patrolRandom.NextDouble() * Mathf.PI * 2;
+            float radius = Mathf.Sqrt((float)patrolRandom.NextDouble()) * roamRadius;
+            Vector3 candidate = home + new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle)) * radius;
+            if (!NavMesh.SamplePosition(candidate, out var spot, 2, filter) ||
+                Vector3.ProjectOnPlane(spot.position - home, Vector3.up).magnitude > roamRadius ||
+                !NavMesh.CalculatePath(transform.position, spot.position, filter, path) || path.status != NavMeshPathStatus.PathComplete) continue;
+            point = spot.position; return true;
+        }
+        return false;
+    }
+    void MoveToward(Vector3 point)
+    {
+        if (agent == null) agent = GetComponent<NavMeshAgent>();
+        if (agent == null) return;
+        var filter = new NavMeshQueryFilter { agentTypeID = agent.agentTypeID, areaMask = agent.areaMask };
+        if (!agent.enabled || !agent.isOnNavMesh)
+        {
+            if (Time.time < nextBind) return;
+            nextBind = Time.time + .5f;
+            if (!NavMesh.SamplePosition(transform.position, out var spawn, 3, filter)) return;
+            // Place the disabled agent on valid ground before enabling it.
+            if (!agent.enabled) { transform.position = spawn.position; agent.enabled = true; }
+            else agent.Warp(spawn.position);
+            if (!agent.isOnNavMesh) return;
+        }
+        agent.isStopped = false;
+        if (Time.time < nextPath) return;
+        nextPath = Time.time + .2f;
+        if (NavMesh.SamplePosition(point, out var goal, 4, filter)) agent.SetDestination(goal.position);
+        else StopMoving();
+    }
+    bool CanHit(Transform player)
+    {
+        Vector3 from = transform.position + Vector3.up * 1.3f;
+        Vector3 to = player.position + Vector3.up * 1.3f;
+        foreach (RaycastHit hit in Physics.RaycastAll(from, to - from, Vector3.Distance(from, to), ~0, QueryTriggerInteraction.Ignore))
+        {
+            if (hit.collider.transform.IsChildOf(transform) || hit.collider.transform.IsChildOf(player)) continue;
+            return false;
+        }
+        return true;
+    }
+    void StopMoving()
+    {
+        if (agent != null && agent.enabled && agent.isOnNavMesh)
+        {
+            agent.ResetPath(); agent.isStopped = true; agent.velocity = Vector3.zero;
+        }
+    }
+    void OnDisable() { StopMoving(); if (agent != null) agent.enabled = false; }
+    public void Defeat() { defeated = true; gameObject.SetActive(false); }
+}

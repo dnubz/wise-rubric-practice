@@ -1,0 +1,247 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Linq;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
+using UnityEngine.Rendering;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattlePresentationChecks
+{
+    const string Folder = "Temp/BattlePresentation";
+    static IEnumerator routine;
+    static double resume;
+    static string error;
+    static bool previousBackground;
+    static bool audioOnly;
+    static BattlePresentationChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (BattleArenaSetup.IsApplying || BattlePresentationSetup.IsApplying || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < resume) return;
+        if (routine == null)
+        {
+            if (File.Exists(Folder + "/setup.request") || File.Exists(Folder + "/arena.request")) return;
+            if (!File.Exists(Folder + "/check.request") && !File.Exists(Folder + "/audio-check.request")) return;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 4) return;
+            audioOnly = File.Exists(Folder + "/audio-check.request");
+            File.Delete(Folder + (audioOnly ? "/audio-check.request" : "/check.request")); previousBackground = Application.runInBackground; Application.runInBackground = true;
+            error = null; Application.logMessageReceived += Log; routine = audioOnly ? RunAudio() : Run();
+        }
+        try
+        {
+            Require(!EditorApplication.isPaused, "Unity paused: " + error);
+            if (routine.MoveNext()) { resume = EditorApplication.timeSinceStartup + (routine.Current is float seconds ? seconds : .1f); return; }
+            Require(error == null, error);
+            File.WriteAllText(Folder + (audioOnly ? "/audio-check-result.txt" : "/check-result.txt"), audioOnly ? "PASS: short fireball SFX replaces the music-track effect; Mario ultimate plays Rainbow Road with its matching 70-note/18-second chart, stops its intro cue, pauses and restores battle music; repeated RandaL charges have one source, stop on release, pause with the menu, and stop at ultimate end." : "PASS: all three 66m layouts have navigable outer floor and connected spawns; upright movement at movement-circle and NavMesh edges; enlarged slots and matching 5m crescent preview/hit range; close selected-character follow; scroll zoom and pitch; hover/exit details for all 12 skills; looping dragon flight; RandaL ultimate first-person and third-person restoration.");
+        }
+        catch (Exception exception) { File.WriteAllText(Folder + (audioOnly ? "/audio-check-result.txt" : "/check-result.txt"), exception.ToString()); }
+        ((IDisposable)routine)?.Dispose(); routine = null; Application.logMessageReceived -= Log; Application.runInBackground = previousBackground; EditorApplication.isPlaying = false;
+    }
+    static void Log(string message, string stack, LogType type) { if (type == LogType.Exception || type == LogType.Error || type == LogType.Assert) error = message + "\n" + stack; }
+    static void Require(bool value, string message) { if (!value) throw new Exception(message); }
+    static IEnumerator RunAudio()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance; Require(session != null, "Missing battle session.");
+        if (session.menu != null) session.menu.SetActive(false); Time.timeScale = 1;
+        var encounter = Object.Instantiate(session.settings.enemies[0].prefab).GetComponent<EncounterEnemy>();
+        encounter.Configure(session.settings.enemies[0], "test:ultimate-audio"); encounter.enabled = false;
+        Require(session.Begin(encounter), "Battle entry failed.");
+        for (int i = 0; i < 40 && (BattleController.Instance == null || !BattleController.Instance.Ready); i++) yield return .2f;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Battle did not initialize.");
+        Require(battle.settings.magicSound.name == "fireball_launch_02" && battle.settings.magicSound.length < 1.1f, "Magic SFX is still a music track.");
+        foreach (var party in battle.Party) { party.character.RestoreBattleCooldowns(new int[4]); party.character.RestoreSP(party.character.GetMaxSP()); party.character.UnlockUltimate(); }
+        var rhythm = Object.FindAnyObjectByType<PinkRhythmController>(); var rhythmMusic = rhythm.GetComponent<AudioSource>();
+        var originalChart = new SerializedObject(rhythm).FindProperty("pinkBeatmap").objectReferenceValue;
+        var rainbow = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Imported Assets/Audio/Music/Wii Rainbow Road - Mario Kart 8 Deluxe Booster Course Pass Music.mp3");
+        battle.SelectCharacter(2); battle.SelectSkill(3); battle.ConfirmSkill();
+        for (int i = 0; i < 30 && !PinkRhythmController.IsOpen; i++) yield return .2f;
+        Require(PinkRhythmController.IsOpen && rhythmMusic.clip == rainbow, "Mario's ultimate did not select Rainbow Road.");
+        Require(rhythm.Session.Beatmap.AudioStartSeconds == 0 && rhythm.Session.Beatmap.Notes.Length == 70 && rhythm.Session.Beatmap.Notes.All(n => n.End <= 18), "Ultimate chart is not the matching Rainbow Road excerpt.");
+        yield return 3.7f;
+        Require(rhythmMusic.isPlaying && !battle.music.isPlaying, "Battle music overlaps the ultimate song.");
+        Require(!Object.FindObjectsByType<AudioSource>().Any(a => a.isPlaying && (a.clip == battle.settings.melodySound || a.clip != null && (a.clip.name == "Pink" || a.clip.name == "Cutie Mew Mew Magic"))), "Unrelated music or intro audio overlaps Rainbow Road.");
+        rhythm.ExitChallenge(); yield return .4f;
+        Require(battle.Phase == BattlePhase.Player && !rhythmMusic.isPlaying && battle.music.isPlaying && new SerializedObject(rhythm).FindProperty("pinkBeatmap").objectReferenceValue == originalChart, "Ultimate exit did not restore battle audio/chart.");
+        battle.SelectCharacter(1); battle.SelectSkill(3); battle.ConfirmSkill(); yield return .6f;
+        for (int i = 0; i < 3; i++)
+        {
+            InputSystem.QueueStateEvent(Mouse.current, new MouseState { buttons = 1 }); yield return .25f;
+            Require(Object.FindObjectsByType<AudioSource>().Count(a => a.isPlaying && a.clip == battle.settings.chargeSound) == 1, "Charge audio is missing or stacking.");
+            if (i == 0)
+            {
+                session.menu.SetActive(true); yield return .2f;
+                Require(!Object.FindObjectsByType<AudioSource>().Any(a => a.isPlaying && a.clip == battle.settings.chargeSound), "Charge sound continued through the menu.");
+                session.menu.SetActive(false); yield return .2f;
+            }
+            InputSystem.QueueStateEvent(Mouse.current, new MouseState()); yield return .2f;
+            Require(!Object.FindObjectsByType<AudioSource>().Any(a => a.isPlaying && a.clip == battle.settings.chargeSound), "Charge sound continues after firing.");
+        }
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState { buttons = 1 }); yield return 10f;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState()); yield return 1f;
+        Require(battle.Phase == BattlePhase.Player && !Object.FindObjectsByType<AudioSource>().Any(a => a.isPlaying && a.clip == battle.settings.chargeSound), "Ultimate left its charge audio playing.");
+    }
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = BattleSession.Instance; Require(session != null, "GameScene battle session missing.");
+        if (session.menu != null) session.menu.SetActive(false); Time.timeScale = 1;
+        var encounter = Object.Instantiate(session.settings.enemies[0].prefab).GetComponent<EncounterEnemy>();
+        encounter.Configure(session.settings.enemies[0], "test:presentation"); encounter.enabled = false;
+        Require(session.Begin(encounter), "Battle entry failed.");
+        for (int i = 0; i < 40 && (BattleController.Instance == null || !BattleController.Instance.Ready); i++) yield return .2f;
+        var battle = BattleController.Instance; Require(battle != null && battle.Ready, "Battle setup failed.");
+        yield return 1f;
+        var rig = battle.cameraRig; var hud = battle.hud;
+        CheckExpandedLayouts(battle);
+        CheckMovementEdges(battle.Current);
+        Require(hud.skillButtons.All(b => ((RectTransform)b.transform).rect.width >= 144), "Skill slots were not enlarged in the saved scene.");
+        Require(rig.focus == battle.Current.transform && rig.focusWeight == 1 && rig.distance <= 18, "Camera does not follow the selected character closely.");
+        Vector3 target = rig.focus.position + Vector3.up * 1.5f - Quaternion.Euler(rig.tilt, rig.yaw, 0) * Vector3.forward * rig.distance;
+        Require(Vector3.Distance(rig.view.transform.position, target) < .2f, "Camera did not settle behind the selected character.");
+        Capture(battle, "initial");
+        float distance = rig.distance, tilt = rig.tilt;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState { scroll = new Vector2(0, 120) }); yield return .2f;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState());
+        Require(rig.distance < distance && rig.tilt < tilt, "Scroll up must move closer and look slightly upward.");
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState { scroll = new Vector2(0, -120) }); yield return .2f;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState());
+        Require(Mathf.Abs(rig.distance - distance) < .01f && rig.tilt > tilt - .1f, "Scroll down must move farther and look downward.");
+        foreach (var party in battle.Party) { party.character.RestoreBattleCooldowns(new int[4]); party.character.RestoreSP(party.character.GetMaxSP()); party.character.UnlockUltimate(); }
+        for (int character = 0; character < 3; character++)
+        {
+            battle.SelectCharacter(character); Require(rig.focus == battle.Party[character].transform, "Camera target did not change with character.");
+            for (int slot = 0; slot < 4; slot++)
+            {
+                var hover = hud.skillButtons[slot].GetComponent<BattleSkillHover>();
+                ExecuteEvents.Execute(hover.gameObject, new PointerEventData(EventSystem.current), ExecuteEvents.pointerEnterHandler);
+                Require(hud.skillTooltip.activeSelf && hud.tooltipTitle.text == battle.Skill(character, slot).displayName && !string.IsNullOrEmpty(hud.tooltipDescription.text) && hud.tooltipCost.text.Contains(battle.Skill(character, slot).sp.ToString()), "Missing hover details.");
+                Require(!hud.skillNames[slot].gameObject.activeSelf && hud.cooldowns[slot].text == "", "Ready slots must display icons only.");
+                if (character == 0 && slot == 0) Capture(battle, "tooltip");
+                ExecuteEvents.Execute(hover.gameObject, new PointerEventData(EventSystem.current), ExecuteEvents.pointerExitHandler);
+                Require(!hud.skillTooltip.activeSelf, "Tooltip did not close on pointer exit.");
+            }
+        }
+        battle.SelectCharacter(0); battle.SelectSkill(0); yield return .3f;
+        Require(hud.skillButtons[0].transform.localScale.x > 1.1f && hud.message.text == "" && battle.skillArea.GetComponent<MeshRenderer>().enabled, "Selected slot or AoE preview is incorrect.");
+        Require(battle.Skill(0, 0).radius == 5 && battle.skillArea.GetComponent<MeshFilter>().sharedMesh.bounds.size.x > 9.9f, "Crescent preview does not match its expanded 5m radius.");
+        Require(hud.actionPointSlots.Length == 2 && !hud.actionPoints.gameObject.activeSelf, "Two visual action points are required.");
+        Capture(battle, "aiming"); battle.SelectSkill(0);
+        Require(!battle.skillArea.GetComponent<MeshRenderer>().enabled && hud.skillButtons[0].transform.localScale == Vector3.one, "Cancel did not reset skill presentation.");
+        var dragon = Object.Instantiate(battle.settings.dragon, battle.Current.transform.position + Vector3.up * 5, Quaternion.identity);
+        var dragonVisual = dragon.GetComponent<BattleDragonVisual>(); var animator = dragon.GetComponent<Animator>();
+        Require(animator != null && animator.runtimeAnimatorController != null && dragonVisual.mouth != null, "Dragon flight or fireball muzzle is missing.");
+        yield return .1f; Quaternion wing = dragonVisual.leftWing.localRotation; yield return .2f;
+        Require(Quaternion.Angle(wing, dragonVisual.leftWing.localRotation) > 3 && animator.GetCurrentAnimatorStateInfo(0).loop, "Dragon's saved animation is not flapping/looping.");
+        Capture(battle, "dragon"); Object.Destroy(dragon);
+        var actor = battle.Current;
+        Vector3 attackDirection = new[] { Vector3.forward, Vector3.right, Vector3.back, Vector3.left }
+            .First(d => !actor.Agent.Raycast(actor.transform.position + d * 6.5f, out _));
+        var inside = battle.SpawnEnemy(battle.settings.enemies[0], actor.transform.position + attackDirection * 4.5f, false);
+        var outside = battle.SpawnEnemy(battle.settings.enemies[0], actor.transform.position + attackDirection * 6, false);
+        inside.moveRange = outside.moveRange = 100;
+        Require(inside.Agent.Warp(actor.transform.position + attackDirection * 4.5f) && outside.Agent.Warp(actor.transform.position + attackDirection * 6), "Range test enemy placement failed.");
+        inside.ResetMovement(); outside.ResetMovement();
+        int insideHP = inside.CurrentHP, outsideHP = outside.CurrentHP;
+        actor.transform.rotation = Quaternion.LookRotation(attackDirection);
+        battle.SelectSkill(0); yield return .2f; battle.ConfirmSkill(); yield return 1f;
+        Require(inside.CurrentHP < insideHP && outside.CurrentHP == outsideHP && battle.Phase == BattlePhase.Player, "Expanded crescent must hit an enemy 4.5m away and exclude one 6m away.");
+        battle.SelectCharacter(1); yield return .5f;
+        battle.SelectSkill(3); battle.ConfirmSkill(); yield return .7f;
+        Require(rig.FirstPerson && hud.crosshair.activeSelf && Vector3.Distance(rig.view.transform.position, battle.Current.transform.position) < 3.5f, "RandaL's ultimate must be in first person.");
+        distance = rig.distance;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState { scroll = new Vector2(0, 120) }); yield return .1f;
+        InputSystem.QueueStateEvent(Mouse.current, new MouseState()); Require(rig.distance == distance, "Scroll changed third-person zoom during the ultimate.");
+        Capture(battle, "first-person"); yield return 10.5f;
+        Require(!rig.FirstPerson && !hud.crosshair.activeSelf && rig.focusWeight == 1 && battle.Phase == BattlePhase.Player, "The ultimate did not restore third-person follow.");
+    }
+    static void CheckExpandedLayouts(BattleController battle)
+    {
+        var units = battle.Party.Concat(battle.Enemies).ToArray();
+        var positions = units.Select(u => u.transform.position).ToArray();
+        foreach (var unit in units) { unit.HoldPosition(); unit.Agent.enabled = false; }
+        try
+        {
+            foreach (var layout in battle.layouts)
+            {
+                foreach (var other in battle.layouts) other.gameObject.SetActive(other == layout);
+                layout.surface.BuildNavMesh(); Physics.SyncTransforms();
+                var floor = layout.transform.Find("Floor").GetComponent<BoxCollider>();
+                Require(floor.size.x == 66 && floor.size.z == 66, "Arena ground collider is still small.");
+                foreach (float x in new[] { -30f, 0, 30f }) foreach (float z in new[] { -30f, 0, 30f })
+                {
+                    Vector3 ground = layout.transform.position + new Vector3(x, 0, z);
+                    Require(NavMesh.SamplePosition(ground, out var hit, .2f, NavMesh.AllAreas) && Mathf.Abs(hit.position.y - ground.y) < .1f, "Expanded floor is not navigable in " + layout.name + " at " + x + "," + z);
+                    Require(floor.Raycast(new Ray(ground + Vector3.up * 2, Vector3.down), out _, 3), "Expanded floor has no collision.");
+                }
+                foreach (var spawn in layout.partySpawns.Concat(layout.enemySpawns))
+                {
+                    Require(NavMesh.SamplePosition(spawn.position, out var hit, .2f, NavMesh.AllAreas), "Expanded spawn is off the NavMesh.");
+                    var path = new NavMeshPath();
+                    Require(NavMesh.CalculatePath(layout.partySpawns[0].position, hit.position, NavMesh.AllAreas, path) && path.status == NavMeshPathStatus.PathComplete, "Spawn cannot be reached across the expanded layout.");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var layout in battle.layouts) layout.gameObject.SetActive(layout == battle.Layout);
+            battle.Layout.surface.BuildNavMesh();
+            for (int i = 0; i < units.Length; i++) { units[i].Agent.enabled = true; units[i].Agent.Warp(positions[i]); units[i].HoldPosition(); }
+        }
+    }
+    static void CheckMovementEdges(BattleUnit unit)
+    {
+        Vector3 position = unit.transform.position, origin = unit.moveOrigin;
+        Quaternion rotation = unit.transform.rotation; float range = unit.moveRange;
+        try
+        {
+            // A small floor-height difference exposed the old vertical LookRotation at the movement limit.
+            unit.moveOrigin = position - Vector3.up * .25f; unit.moveRange = .5f;
+            for (int i = 0; i < 120; i++)
+            {
+                unit.Move(Vector3.forward * 8, 1f / 60);
+                Require(Vector3.Dot(unit.transform.up, Vector3.up) > .999f, "Movement-circle edge tipped the character.");
+                Require(BattleController.FlatDistance(unit.transform.position, unit.moveOrigin) <= .51f && Mathf.Abs(unit.transform.position.y - position.y) < .1f, "Movement-circle clamp changed floor height or exceeded its range.");
+            }
+            foreach (Vector3 direction in new[] { Vector3.forward, Vector3.back, Vector3.left, Vector3.right })
+            {
+                unit.Agent.Warp(position); unit.moveRange = 1000;
+                Require(unit.Agent.Raycast(position + direction * 100, out var edge), "No NavMesh boundary found for edge test.");
+                Vector3 start = edge.position - direction * .5f;
+                Require(NavMesh.SamplePosition(start, out var spot, 1, unit.Agent.areaMask), "Missing ground just inside arena edge.");
+                unit.Agent.Warp(spot.position); unit.ResetMovement();
+                float height = unit.transform.position.y;
+                for (int i = 0; i < 60; i++)
+                {
+                    unit.Move(direction * 8, 1f / 60);
+                    Require(unit.Agent.isOnNavMesh && Vector3.Dot(unit.transform.up, Vector3.up) > .999f, "Arena edge tipped the character or lost the NavMesh.");
+                    Require(Mathf.Abs(unit.transform.position.y - height) < .1f, "Arena edge clipped the character down.");
+                }
+            }
+        }
+        finally { unit.Agent.Warp(position); unit.transform.rotation = rotation; unit.moveOrigin = origin; unit.moveRange = range; unit.Animate("Idle", 0); }
+    }
+    static void Capture(BattleController battle, string name)
+    {
+        var camera = battle.cameraRig.view; var canvas = battle.hud.GetComponent<Canvas>(); var mode = canvas.renderMode; var previousCamera = canvas.worldCamera;
+        var target = new RenderTexture(1280, 720, 24); var texture = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = .4f; camera.targetTexture = target;
+            Canvas.ForceUpdateCanvases(); RenderPipeline.SubmitRenderRequest(camera, new RenderPipeline.StandardRequest { destination = target });
+            RenderTexture.active = target; texture.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); texture.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", texture.EncodeToPNG());
+        }
+        finally { camera.targetTexture = null; canvas.renderMode = mode; canvas.worldCamera = previousCamera; RenderTexture.active = previous; Object.DestroyImmediate(target); Object.DestroyImmediate(texture); }
+    }
+}

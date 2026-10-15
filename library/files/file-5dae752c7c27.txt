@@ -1,0 +1,11 @@
+using UnityEngine;
+
+[CreateAssetMenu(menuName = "WiSe/Battle/Skill")]
+public sealed class BattleSkill : ScriptableObject
+{
+    public string displayName;
+    [TextArea] public string description;
+    public Sprite icon;
+    public int character, slot, sp, cooldown;
+    public float range, radius;
+}

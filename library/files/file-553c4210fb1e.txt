@@ -1,0 +1,76 @@
+using UnityEngine;
+
+public class TreeCuttable : MonoBehaviour
+{
+    [System.Serializable]
+    public struct LootEntry
+    {
+        public Item item;
+        public int amount;
+    }
+
+    [SerializeField] LootEntry[] lootTable;
+
+    [SerializeField] float scatterRadius = 0.7f;
+    [SerializeField] float dropHeight = 0.3f;
+    [SerializeField] float bobAmplitude = 0.12f;
+    [SerializeField] float bobSpeed = 2.2f;
+    [SerializeField] float spriteScale = 0.6f;
+    bool cut;
+
+    public void Cut(Vector3 cutterPosition)
+    {
+        if (cut) return;
+        cut = true;
+        SpawnLoot();
+        foreach (Collider blocker in GetComponentsInChildren<Collider>()) blocker.enabled = false;
+        GetComponentInParent<ExplorationNavigation>()?.RequestRebuild();
+        Destroy(gameObject);
+    }
+
+    void SpawnLoot()
+    {
+        var random = WorldRandom.AtPosition(transform.position, 0x44524F50);
+        foreach (LootEntry loot in lootTable)
+        {
+            if (loot.item == null)
+                continue;
+
+            for (int i = 0; i < loot.amount; i++)
+            {
+                SpawnItem(loot.item, random);
+            }
+        }
+    }
+
+    void SpawnItem(Item item, System.Random random)
+    {
+        GameObject itemObject = new GameObject("Drop_" + item.ItemName);
+
+        float angle = (float)random.NextDouble() * Mathf.PI * 2;
+        float radius = Mathf.Sqrt((float)random.NextDouble()) * scatterRadius;
+        Vector2 randomPosition = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius;
+
+        itemObject.transform.position =
+            transform.position +
+            new Vector3(randomPosition.x, dropHeight, randomPosition.y);
+
+        SpriteRenderer sprite = itemObject.AddComponent<SpriteRenderer>();
+        sprite.sprite = item.Icon;
+        sprite.sortingOrder = 1;
+
+        itemObject.transform.localScale = Vector3.one * spriteScale;
+        itemObject.transform.rotation = Quaternion.Euler(90, 0, 0);
+
+        SphereCollider collider = itemObject.AddComponent<SphereCollider>();
+        collider.radius = 3f;
+        collider.isTrigger = true;
+
+        WorldItem worldItem = itemObject.AddComponent<WorldItem>();
+        worldItem.SetItem(item);
+
+        SpriteItemBobber bobber = itemObject.AddComponent<SpriteItemBobber>();
+        bobber.Initialize(bobAmplitude, bobSpeed, itemObject.transform.position.y,
+            (float)random.NextDouble() * Mathf.PI * 2, false, 0);
+    }
+}

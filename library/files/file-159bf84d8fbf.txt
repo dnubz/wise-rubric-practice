@@ -1,0 +1,130 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class DungeonJumpChecks
+{
+    const string Folder = "Temp/DungeonJump";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double next;
+    static int lastFrame = -1;
+    static DungeonJumpChecks() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+        if (routine != null)
+        {
+            if (!EditorApplication.isPlaying || lastFrame == Time.frameCount) return;
+            lastFrame = Time.frameCount;
+            try { if (!routine.MoveNext()) Finish("PASS: all three characters jump from actual dungeon floors and immediately after switching; landing input buffer, brief ground-loss grace, expiry/no midair extra jump, teleport reset and transition input lock."); }
+            catch (Exception e) { Finish("FAIL: " + e); Debug.LogException(e); }
+            return;
+        }
+        if (EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Folder + "/check.request")) return;
+        if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+        if (!EditorApplication.isPlaying) return;
+        Application.runInBackground = true; EditorApplication.isPaused = false;
+        if (Time.timeSinceLevelLoad < 3) return;
+        File.Delete(Folder + "/check.request"); routine = Run();
+    }
+    static void Finish(string result) { Time.captureDeltaTime = 0; File.WriteAllText(Folder + "/result.txt", result); routine = null; EditorApplication.isPlaying = false; }
+    static void Require(bool ok, string message) { if (!ok) throw new Exception(message); }
+    static T Get<T>(object target, string field) => (T)target.GetType().GetField(field, Private).GetValue(target);
+    static void Set(object target, string field, object value) => target.GetType().GetField(field, Private).SetValue(target, value);
+    static void Key(bool down) => InputSystem.QueueStateEvent(Keyboard.current, down ? new KeyboardState(UnityEngine.InputSystem.Key.Space) : new KeyboardState());
+    static IEnumerator Run()
+    {
+        // Keep input/physics timing stable even when the editor renders slowly.
+        Time.captureDeltaTime = 1f / 60;
+        foreach (var npc in Object.FindObjectsByType<NPCBase>()) npc.enabled = false;
+        foreach (var enemy in Object.FindObjectsByType<EncounterEnemy>()) enemy.enabled = false;
+        var session = Object.FindAnyObjectByType<DungeonSession>();
+        session.StartCoroutine((IEnumerator)typeof(DungeonSession).GetMethod("Enter", Private).Invoke(session, new object[] { "DungeonScene" }));
+        float deadline = Time.realtimeSinceStartup + 40;
+        while ((!DungeonSession.IsInside || DungeonSession.IsTransitioning) && Time.realtimeSinceStartup < deadline) yield return null;
+        Require(DungeonSession.IsInside && !DungeonSession.IsTransitioning, "Dungeon entry failed.");
+        yield return null;
+        var dungeon = DungeonSession.Generator;
+        foreach (var npc in dungeon.GetComponentsInChildren<NPCBase>(true)) npc.enabled = false;
+        foreach (var enemy in dungeon.GetComponentsInChildren<EncounterEnemy>(true)) enemy.enabled = false;
+        // Keep the real room floor; isolate timing from random props/enemies.
+        var root = Get<List<GameObject>>(dungeon, "roomRoots")[dungeon.CurrentRoom];
+        var floor = root.GetComponent<BoxCollider>();
+        foreach (var obstacle in root.GetComponentsInChildren<Collider>()) if (obstacle != floor) obstacle.enabled = false;
+        var switching = Object.FindAnyObjectByType<CharacterSwitchManager>();
+        Vector3 centre = dungeon.RoomCentre(dungeon.CurrentRoom);
+        for (int slot = 0; slot < 3; slot++)
+        {
+            Key(false); yield return null;
+            switching.SwitchToCharacter(slot);
+            var player = CharacterSwitchManager.CurrentCharacterTransform;
+            var movement = player.GetComponent<CharacterMovement>();
+            movement.Teleport(centre + Vector3.up * .02f, Quaternion.identity);
+            float start = player.position.y; Key(true);
+            float high = start; deadline = Time.time + .6f;
+            while (Time.time < deadline) { high = Mathf.Max(high, player.position.y); Key(false); yield return null; }
+            high = Mathf.Max(high, player.position.y);
+            Require(high > start + .5f, "Immediate jump after switching failed for slot " + slot + ": rise=" + (high - start));
+            // Repeated airborne presses cannot create a second upward impulse.
+            float vertical = Get<Vector3>(movement, "velocity").y;
+            Key(true); yield return null; Key(false); yield return null;
+            Require(Get<Vector3>(movement, "velocity").y <= vertical + .01f, "Airborne double jump in slot " + slot);
+            movement.Teleport(centre + Vector3.up * 2, Quaternion.identity);
+            Require(!Get<bool>(movement, "jumpRequested") && float.IsNegativeInfinity(Get<float>(movement, "lastGroundedAt")), "Teleport preserved a queued jump/old floor contact.");
+        }
+        switching.SwitchToCharacter(0);
+        var actor = CharacterSwitchManager.CurrentCharacterTransform;
+        var move = actor.GetComponent<CharacterMovement>();
+        var controller = actor.GetComponent<CharacterController>();
+        move.Teleport(centre + Vector3.up * .12f, Quaternion.identity);
+        // Press shortly before landing, while CharacterController.isGrounded is false.
+        Set(move, "velocity", Vector3.down * 3);
+        Require(!move.IsGrounded, "Buffered landing test starts grounded.");
+        Key(true); yield return null; Key(false);
+        deadline = Time.time + 1.2f; float peak = actor.position.y;
+        while (Time.time < deadline) { peak = Mathf.Max(peak, actor.position.y); yield return null; }
+        peak = Mathf.Max(peak, actor.position.y);
+        Require(peak > centre.y + .6f, "Press just before landing was dropped: peak=" + peak + ", floor=" + centre.y + ", velocity=" + Get<Vector3>(move, "velocity") + ", blocked=" + NPCChallengePrompt.BlocksGameplayInput);
+
+        // A press high in the air expires before landing instead of auto-jumping.
+        move.Teleport(centre + Vector3.up * 4, Quaternion.identity);
+        Key(true); yield return null; Key(false);
+        yield return null;
+        Require(Get<Vector3>(move, "velocity").y <= 0, "Teleport reused stale floor contact for a midair jump.");
+        deadline = Time.time + 5;
+        while ((!controller.isGrounded || Time.time <= Get<float>(move, "jumpExpiresAt")) && Time.time < deadline) yield return null;
+        Require(controller.isGrounded && !Get<bool>(move, "jumpRequested"), "Expiry/landing failed: grounded=" + controller.isGrounded + ", queued=" + Get<bool>(move, "jumpRequested") + ", position=" + actor.position + ", velocity=" + Get<Vector3>(move, "velocity"));
+        // The editor can observe contact between physics and the movement
+        // Update. Allow that Update to record the landing before testing grace.
+        yield return null; yield return null;
+        // Lose contact for one frame: grace should allow the press without a new landing.
+        float floorY = actor.position.y;
+        controller.Move(Vector3.up * .3f);
+        Require(!controller.isGrounded, "Grace test did not lose contact.");
+        Require(Time.time - Get<float>(move, "lastGroundedAt") <= .1f, "Grace fixture already expired: age=" + (Time.time - Get<float>(move, "lastGroundedAt")) + ", velocity=" + Get<Vector3>(move, "velocity"));
+        // Invoke the same input handler within the window, without relying on
+        // when the editor schedules a synthetic keyboard event.
+        typeof(CharacterMovement).GetMethod("OnJumpPerformed", Private).Invoke(move, new object[] { default(InputAction.CallbackContext) });
+        yield return null;
+        yield return null;
+        Require(Get<Vector3>(move, "velocity").y > 0, "Grace did not accept input: velocity=" + Get<Vector3>(move, "velocity") + ", age=" + (Time.time - Get<float>(move, "lastGroundedAt")) + ", queued=" + Get<bool>(move, "jumpRequested") + ", blocked=" + NPCChallengePrompt.BlocksGameplayInput);
+        deadline = Time.time + .35f; peak = actor.position.y;
+        while (Time.time < deadline) { peak = Mathf.Max(peak, actor.position.y); yield return null; }
+        Require(peak > floorY + .5f, "Brief contact loss still rejected jump.");
+        Set(dungeon, "<IsRoomTransitioning>k__BackingField", true);
+        Key(true); yield return null; Key(false); yield return null;
+        Require(!Get<bool>(move, "jumpRequested"), "Room transition accepted jump input.");
+        Set(dungeon, "<IsRoomTransitioning>k__BackingField", false);
+    }
+}

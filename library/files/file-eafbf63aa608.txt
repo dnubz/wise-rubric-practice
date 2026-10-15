@@ -1,0 +1,95 @@
+using System;
+using System.IO;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+/// <summary>Adds normal editable UI objects to GameScene once, without runtime construction.</summary>
+[InitializeOnLoad]
+public static class CheatConsoleSceneBuilder
+{
+    const string Request = "Temp/CheatPanel/create.request";
+    static double nextCheck;
+    static CheatConsoleSceneBuilder() { EditorApplication.update += CheckRequest; }
+
+    static void CheckRequest()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        if (!File.Exists(Request)) return;
+        File.Delete(Request);
+        try
+        {
+            CreatePanel();
+            File.WriteAllText("Temp/CheatPanel/result.txt", "Created and saved GameScene > GameplayCanvas > CheatPanel. UI references assigned.");
+        }
+        catch (Exception error)
+        {
+            File.WriteAllText("Temp/CheatPanel/result.txt", error.ToString());
+            Debug.LogException(error);
+        }
+    }
+
+    [MenuItem("WiSe/UI/Add Cheat Panel to GameScene")]
+    public static void CreatePanel()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode) throw new InvalidOperationException("Exit Play mode before adding scene UI.");
+        Scene scene = SceneManager.GetSceneByName("GameScene");
+        if (!scene.IsValid() || !scene.isLoaded) throw new InvalidOperationException("Open GameScene first.");
+        foreach (GameObject sceneRoot in scene.GetRootGameObjects())
+        {
+            CheatConsole existing = sceneRoot.GetComponentInChildren<CheatConsole>(true);
+            if (existing != null) { Selection.activeGameObject = existing.gameObject; return; }
+        }
+        Canvas mainCanvas = null;
+        foreach (GameObject sceneRoot in scene.GetRootGameObjects())
+            foreach (Canvas candidate in sceneRoot.GetComponentsInChildren<Canvas>(true))
+                if (candidate.name == "GameplayCanvas") mainCanvas = candidate;
+        if (mainCanvas == null) throw new InvalidOperationException("GameScene needs its GameplayCanvas.");
+        Directory.CreateDirectory("Temp/CheatPanel");
+        string backup = "Temp/CheatPanel/GameScene-before-cheat-panel.unity";
+        if (!File.Exists(backup)) File.Copy(scene.path, backup);
+        var root = new GameObject("CheatPanel", typeof(RectTransform));
+        Undo.RegisterCreatedObjectUndo(root, "Add Cheat Panel");
+        root.transform.SetParent(mainCanvas.transform, false);
+        var rootRect = (RectTransform)root.transform;
+        rootRect.anchorMin = Vector2.zero; rootRect.anchorMax = Vector2.one;
+        rootRect.offsetMin = rootRect.offsetMax = Vector2.zero;
+        var canvas = root.AddComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = 500;
+        canvas.overrideSorting = true;
+        root.AddComponent<GraphicRaycaster>();
+        var overlay = DungeonSession.UIBox("CheatOverlay", root.transform, Vector2.zero, Vector2.zero, new Color(.025f, .015f, .055f, .85f));
+        var rect = (RectTransform)overlay.transform; rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one; rect.offsetMin = rect.offsetMax = Vector2.zero;
+        var border = DungeonSession.UIBox("Border", overlay.transform, Vector2.zero, new Vector2(726, 366), new Color(.87f, .38f, .70f));
+        var card = DungeonSession.UIBox("ConsoleCard", border.transform, Vector2.zero, new Vector2(720, 360), new Color(.10f, .06f, .17f));
+        DungeonSession.UILabel("Title", card.transform, new Vector2(0, 127), new Vector2(640, 50), 34).text = "CHEAT CONSOLE";
+        var instruction = DungeonSession.UILabel("Instructions", card.transform, new Vector2(0, 80), new Vector2(640, 30), 18);
+        instruction.text = "VALID CODES RUN AUTOMATICALLY"; instruction.color = new Color(.81f, .63f, .85f);
+        var entry = DungeonSession.UIBox("CodeInput", card.transform, new Vector2(0, 26), new Vector2(620, 62), new Color(.20f, .13f, .29f));
+        var viewport = new GameObject("Viewport", typeof(RectTransform), typeof(RectMask2D)); viewport.transform.SetParent(entry.transform, false);
+        var viewRect = (RectTransform)viewport.transform; viewRect.anchorMin = Vector2.zero; viewRect.anchorMax = Vector2.one;
+        viewRect.offsetMin = new Vector2(18, 7); viewRect.offsetMax = new Vector2(-18, -7);
+        var text = DungeonSession.UILabel("Text", viewport.transform, Vector2.zero, new Vector2(584, 48), 26); text.alignment = TextAlignmentOptions.MidlineLeft; text.richText = false;
+        var hint = DungeonSession.UILabel("Placeholder", viewport.transform, Vector2.zero, new Vector2(584, 48), 26);
+        hint.text = "Type cheat code..."; hint.alignment = TextAlignmentOptions.MidlineLeft; hint.color = new Color(.65f, .56f, .70f);
+        var input = entry.AddComponent<TMP_InputField>(); input.textViewport = viewRect; input.textComponent = text; input.placeholder = hint;
+        input.targetGraphic = entry.GetComponent<Image>(); input.characterLimit = 32; input.lineType = TMP_InputField.LineType.SingleLine;
+        var feedback = DungeonSession.UILabel("Feedback", card.transform, new Vector2(0, -68), new Vector2(620, 105), 22);
+        feedback.enableAutoSizing = true; feedback.fontSizeMin = 17; feedback.fontSizeMax = 22;
+        DungeonSession.UILabel("CloseHint", card.transform, new Vector2(0, -143), new Vector2(620, 30), 18).text = "ESC / CTRL  CLOSE";
+        overlay.SetActive(true);
+        var controller = root.AddComponent<CheatConsole>();
+        var serialized = new SerializedObject(controller);
+        serialized.FindProperty("overlay").objectReferenceValue = overlay;
+        serialized.FindProperty("input").objectReferenceValue = input;
+        serialized.FindProperty("feedback").objectReferenceValue = feedback;
+        serialized.ApplyModifiedPropertiesWithoutUndo();
+        EditorSceneManager.MarkSceneDirty(scene);
+        if (!EditorSceneManager.SaveScene(scene)) throw new IOException("Could not save GameScene.");
+        Selection.activeGameObject = overlay;
+        EditorGUIUtility.PingObject(overlay);
+    }
+}

@@ -1,0 +1,455 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using Unity.AI.Navigation;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.InputSystem;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class BattleSetup
+{
+    const string Folder = "Temp/Battle", AssetsFolder = "Assets/Resources/Battle";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static TMP_Text fontTemplate;
+    static Button woodButton;
+    static Sprite rounded, outline;
+    static readonly Color Blue = new Color(.14f, .25f, .53f), Dark = new Color(.05f, .09f, .19f);
+    static BattleSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (!EditorApplication.isPlayingOrWillChangePlaymode && !EditorApplication.isCompiling && !EditorApplication.isUpdating && File.Exists(Folder + "/polish.request"))
+        {
+            File.Delete(Folder + "/polish.request");
+            try
+            {
+                var game = SceneManager.GetSceneByName("GameScene");
+                var session = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<BattleSession>(true)).Single();
+                var visibility = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<GameplayHudVisibility>(true)).FirstOrDefault();
+                if (visibility != null) session.explorationHUD = new[] { Field<GameObject>(visibility, "experienceHud"), Field<GameObject>(visibility, "minimap"), Field<GameObject>(visibility, "portraitHud") };
+                foreach (var character in session.party)
+                {
+                    AddAnimations(character.GetComponentInChildren<Animator>(true));
+                    character.GetComponent<BattleUnit>().FitBattleHitbox();
+                }
+                EditorSceneManager.MarkSceneDirty(game); EditorSceneManager.SaveScene(game);
+                var battle = EditorSceneManager.OpenScene("Assets/Scenes/BattleScene.unity", OpenSceneMode.Additive);
+                foreach (var volume in battle.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<Volume>())) volume.priority = 20;
+                var controller = battle.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<BattleController>(true)).Single();
+                controller.hud.GetComponent<CanvasScaler>().screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
+                foreach (var skill in controller.skills)
+                {
+                    string prefix = new[] { "Knight", "Wizard", "Healer" }[skill.character];
+                    string file = prefix + "_" + skill.displayName.Replace(" ", "");
+                    skill.icon = SpriteAsset("Assets/Imported Assets/UI/" + prefix + "/" + file + ".png");
+                    EditorUtility.SetDirty(skill);
+                }
+                foreach (var button in controller.hud.GetComponentsInChildren<Button>(true)) if (button.targetGraphic != null) button.targetGraphic.raycastTarget = true;
+                var boss = controller.bossGame;
+                boss.heart.GetComponent<Image>().sprite = SpriteAsset("Assets/Imported Assets/Jevil/Sprites/soul.png");
+                boss.jevil.GetComponent<Image>().sprite = SpriteAsset("Assets/Imported Assets/Jevil/Sprites/jevil.png");
+                boss.spadeTemplate.sprite = SpriteAsset("Assets/Imported Assets/Jevil/Bullets/Jevil Spade.png");
+                boss.heartTemplate.sprite = SpriteAsset("Assets/Imported Assets/Jevil/Bullets/Jevil Heart.png");
+                boss.scytheTemplate.sprite = SpriteAsset("Assets/Imported Assets/Jevil/Bullets/jevil_knife.png");
+                controller.settings.music = Audio("Assets/Imported Assets/Audio/Music/09 Lace.mp3") ?? Audio("Assets/Imported Assets/Audio/Music/Smart Race.mp3");
+                controller.settings.victorySound = FindAudio("positive");
+                controller.settings.dragon = Dragon();
+                controller.settings.laser = MinionProjectileSetup.BuildPrefab();
+                controller.settings.areaEffect = AreaEffect(); controller.settings.statusEffect = StatusEffect();
+                controller.settings.shieldSound = FindAudio("divine_shield"); controller.settings.portalSound = FindAudio("snd_dash_charge");
+                controller.settings.teleportSound = FindAudio("teleport_poof"); controller.settings.laserSound = FindAudio("laser_fire");
+                controller.settings.chargeSound = FindAudio("magic_charge"); controller.settings.melodySound = FindAudio("lullaby_tight");
+                foreach (var layout in controller.layouts)
+                {
+                    foreach (var renderer in layout.transform.Find("Floor").GetComponentsInChildren<Renderer>(true))
+                    {
+                        var materials = renderer.sharedMaterials;
+                        for (int i = 0; i < materials.Length; i++) materials[i] = Material("ArenaStone" + ((renderer.transform.GetSiblingIndex() + i) % 3), new Color(.43f + i * .025f, .47f + i * .025f, .5f + i * .025f));
+                        renderer.sharedMaterials = materials;
+                    }
+                    foreach (var cover in layout.cover) cover.shape.GetComponent<Renderer>().sharedMaterial = Material("ArenaCover", new Color(.19f, .23f, .29f));
+                }
+                foreach (var data in controller.settings.enemies.Concat(new[] { controller.settings.boss }))
+                {
+                    string path = AssetDatabase.GetAssetPath(data.prefab); var prefab = PrefabUtility.LoadPrefabContents(path);
+                    var highlight = new SerializedObject(prefab.GetComponent<ObjectHighlight>());
+                    highlight.FindProperty("outlineWidth").floatValue = .003f; highlight.ApplyModifiedPropertiesWithoutUndo();
+                    PrefabUtility.SaveAsPrefabAsset(prefab, path); PrefabUtility.UnloadPrefabContents(prefab);
+                }
+                EditorUtility.SetDirty(controller.settings); AssetDatabase.SaveAssets();
+                EditorSceneManager.MarkSceneDirty(battle); EditorSceneManager.SaveScene(battle); EditorSceneManager.CloseScene(battle, true);
+                File.WriteAllText(Folder + "/polish-result.txt", "PASS: exploration HUD suspended during battle; battle post-processing priority set.");
+            }
+            catch (Exception error) { File.WriteAllText(Folder + "/polish-result.txt", error.ToString()); }
+        }
+        if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling || EditorApplication.isUpdating || !File.Exists(Folder + "/setup.request")) return;
+        File.Delete(Folder + "/setup.request");
+        try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: BattleScene, three layouts, 12 skill assets, Skeleton/Minion/Jevil encounter prefabs, NavMesh surfaces, saved battle UI, transitions and scene wiring saved."); }
+        catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+    [MenuItem("WiSe/Battle/Set Up Battle")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder); Directory.CreateDirectory(AssetsFolder); AssetDatabase.Refresh();
+        var game = SceneManager.GetSceneByName("GameScene");
+        if (!game.IsValid() || !game.isLoaded) game = EditorSceneManager.OpenScene("Assets/Scenes/GameScene.unity", OpenSceneMode.Additive);
+        if (game.GetRootGameObjects().Any(r => r.GetComponent<BattleSession>() != null)) throw new InvalidOperationException("Battle is already set up. Edit the saved objects rather than replacing your UI.");
+        var inventoryUI = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<InventoryUI>(true)).Single();
+        fontTemplate = Field<TMP_Text>(inventoryUI, "titleText");
+        var toggle = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<MenuToggle>(true)).Single();
+        var tabs = Field<System.Collections.Generic.List<MenuTabManager.TabEntry>>(toggle.GetComponent<MenuTabManager>(), "tabs"); woodButton = tabs[0].tabButton;
+        rounded = Load<Sprite>("Assets/UI/DungeonEntry/Rounded.png"); outline = Load<Sprite>("Assets/UI/DungeonEntry/Outline.png");
+        var settings = Create<BattleSettings>(AssetsFolder + "/Settings.asset");
+        var dungeonSettings = Resources.Load<DungeonSettings>("Dungeon/Settings"); if (dungeonSettings == null) dungeonSettings = AssetDatabase.FindAssets("t:DungeonSettings").Select(g => Load<DungeonSettings>(AssetDatabase.GUIDToAssetPath(g))).First();
+        var skeleton = Create<BattleEnemyData>(AssetsFolder + "/Skeleton.asset"); skeleton.kind = BattleEnemyKind.Skeleton; skeleton.displayName = "Skeleton";
+        var minion = Create<BattleEnemyData>(AssetsFolder + "/Minion.asset"); minion.kind = BattleEnemyKind.Minion; minion.displayName = "Minion"; minion.hp = 110; minion.attack = 55; minion.defense = 8; minion.movementRange = 5; minion.attackRange = 13;
+        var boss = Create<BattleEnemyData>(AssetsFolder + "/Jevil.asset"); boss.kind = BattleEnemyKind.Jevil; boss.displayName = "Jevil"; boss.hp = 1200; boss.attack = 70; boss.defense = 18; boss.movementRange = 8; boss.attackRange = 20; boss.experience = 150;
+        skeleton.prefab = Enemy(skeleton); minion.prefab = Enemy(minion); boss.prefab = Enemy(boss);
+        settings.enemies = new[] { skeleton, minion }; settings.boss = boss;
+        settings.music = Audio("Assets/Imported Assets/Audio/Music/09 Lace.mp3"); settings.bossMusic = Audio("Assets/Imported Assets/Audio/Music/Smart Race.mp3");
+        settings.enterSound = Audio("Assets/Imported Assets/Audio/SFX/Dungeon/battle_enter.wav");
+        settings.attackSound = Audio("Assets/Imported Assets/Audio/SFX/Combat/sword_swing_01.wav");
+        settings.hitSound = Audio("Assets/Imported Assets/Audio/SFX/Combat/sword_hit_01.wav");
+        settings.magicSound = Audio("Assets/Imported Assets/Audio/SFX/Combat/fireball_launch_02.wav"); settings.healSound = FindAudio("heal", "positive");
+        settings.victorySound = FindAudio("victory", "win", "positive"); settings.gameOverSound = Audio("Assets/Imported Assets/Audio/SFX/Combat/gameover 1.mp3");
+        settings.pinkModel = Load<GameObject>("Assets/Prefabs/MarioN64Visual.prefab");
+        settings.projectile = Projectile(); settings.impact = Impact(); settings.worldUI = HealthUI(); settings.popup = Popup();
+        var characters = Field<CharacterBase[]>(inventoryUI, "characters");
+        foreach (var character in characters)
+        {
+            var unit = character.gameObject.AddComponent<BattleUnit>(); unit.character = character; unit.enabled = false;
+            var agent = character.GetComponent<NavMeshAgent>(); agent.enabled = false; agent.radius = .6f; agent.height = 3; agent.baseOffset = 0;
+            var hit = character.gameObject.AddComponent<CapsuleCollider>(); unit.FitBattleHitbox(); hit.enabled = false;
+            AddAnimations(character.GetComponentInChildren<Animator>(true));
+        }
+        var transition = Canvas("BattleTransitionCanvas", 500); SceneManager.MoveGameObjectToScene(transition.gameObject, game);
+        var black = Image("Fade", transition.transform, 0, 0, 1920, 1080, Color.black); Stretch(black.rectTransform); black.raycastTarget = true;
+        var fade = black.gameObject.AddComponent<CanvasGroup>(); fade.alpha = 0; fade.blocksRaycasts = false;
+        var bossDialogue = transition.gameObject.AddComponent<BattleBossDialogue>();
+        var speech = Box("BossDialoguePanel", transition.transform, 0, -260, 1150, 270, Blue); bossDialogue.panel = speech.gameObject;
+        bossDialogue.text = Text("Dialogue", speech, 0, 15, 1060, 160, "Jevil", 35);
+        Text("ContinueHint", speech, 0, -91, 1060, 45, "F · Continue", 24); speech.gameObject.SetActive(false);
+        var manager = new GameObject("BattleSession"); SceneManager.MoveGameObjectToScene(manager, game);
+        var session = manager.AddComponent<BattleSession>(); session.party = characters; session.settings = settings; session.fade = fade;
+        session.menu = Field<GameObject>(toggle, "menuUI"); session.switching = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<CharacterSwitchManager>(true)).Single();
+        session.cameraRig = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<CameraController>(true)).Single();
+        var world = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<WFCWorldManager>(true)).Single();
+        var spawner = world.gameObject.AddComponent<EnemySpawner>(); spawner.settings = settings;
+        var rhythm = game.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<PinkRhythmController>(true)).Single(); SetupHealer(rhythm);
+        var battle = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive); SceneManager.SetActiveScene(battle);
+        RenderSettings.ambientMode = AmbientMode.Flat; RenderSettings.ambientLight = new Color(.42f, .46f, .55f);
+        var root = new GameObject("BattleManager"); var controller = root.AddComponent<BattleController>(); controller.settings = settings;
+        controller.skills = Skills(); controller.controls = Input();
+        var cameraRoot = new GameObject("BattleCamera", typeof(Camera), typeof(AudioListener), typeof(BattleCamera));
+        var camera = cameraRoot.GetComponent<Camera>(); camera.tag = "MainCamera"; camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.025f, .035f, .07f); camera.fieldOfView = 55; camera.farClipPlane = 120;
+        camera.GetUniversalAdditionalCameraData().renderPostProcessing = true;
+        var rig = cameraRoot.GetComponent<BattleCamera>(); rig.view = camera; rig.centre = new Vector3(0, -1500, 0); controller.cameraRig = rig;
+        camera.transform.SetPositionAndRotation(rig.centre + new Vector3(-20, 26, -20), Quaternion.Euler(50, 45, 0));
+        var lightObject = new GameObject("BattleSun", typeof(Light)); var light = lightObject.GetComponent<Light>(); light.type = LightType.Directional; light.intensity = 1.15f; light.color = new Color(1, .87f, .7f); light.shadows = LightShadows.Soft; lightObject.transform.rotation = Quaternion.Euler(55, -30, 0);
+        var volumeObject = new GameObject("BattlePostProcessing", typeof(Volume)); var volume = volumeObject.GetComponent<Volume>(); volume.isGlobal = true;
+        var profile = Create<VolumeProfile>(AssetsFolder + "/PostProcessing.asset"); var bloom = profile.components.OfType<Bloom>().FirstOrDefault(); if (bloom == null) { bloom = profile.Add<Bloom>(true); AssetDatabase.AddObjectToAsset(bloom, profile); } bloom.intensity.Override(.25f); bloom.threshold.Override(1.1f); volume.sharedProfile = profile;
+        controller.layouts = new BattleLayout[3]; for (int i = 0; i < 3; i++) controller.layouts[i] = Layout(i, dungeonSettings);
+        controller.movementCircle = Line("MovementRange"); controller.aimCircle = Line("SkillTarget");
+        controller.music = root.AddComponent<AudioSource>(); controller.music.loop = true; controller.music.playOnAwake = false; controller.music.volume = .45f;
+        var canvas = Canvas("BattleCanvas", 100); var hud = canvas.gameObject.AddComponent<BattleHUD>(); controller.hud = hud;
+        BuildHUD(hud, characters); controller.bossGame = BuildBossGame(canvas.transform);
+        EditorSceneManager.SaveScene(battle, "Assets/Scenes/BattleScene.unity"); EditorSceneManager.CloseScene(battle, true); SceneManager.SetActiveScene(game);
+        EditorBuildSettings.scenes = EditorBuildSettings.scenes.Where(s => s.path != "Assets/Scenes/BattleScene.unity").Concat(new[] { new EditorBuildSettingsScene("Assets/Scenes/BattleScene.unity", true) }).ToArray();
+        foreach (var item in new Object[] { settings, skeleton, minion, boss, dungeonSettings, profile }) EditorUtility.SetDirty(item);
+        AssetDatabase.SaveAssets(); EditorSceneManager.MarkSceneDirty(game); EditorSceneManager.SaveScene(game);
+    }
+    static GameObject Enemy(BattleEnemyData data)
+    {
+        var root = new GameObject(data.displayName); root.layer = 11;
+        var visual = new GameObject("Visual"); visual.transform.SetParent(root.transform, false);
+        var motion = root.AddComponent<BattleEnemyMotion>(); motion.visual = visual.transform;
+        if (data.kind == BattleEnemyKind.Skeleton)
+        {
+            DungeonPolishSetup.AttachSkeleton(visual.transform);
+        }
+        else
+        {
+            var source = data.kind == BattleEnemyKind.Minion ? Load<GameObject>("Assets/Resources/Dungeon/FriendlyMinion.prefab") : Load<GameObject>("Assets/Imported Assets/Jevil/Model/Jevil.fbx");
+            var model = Object.Instantiate(source, visual.transform);
+            foreach (var canvas in model.GetComponentsInChildren<Canvas>(true)) if (canvas != null) Object.DestroyImmediate(canvas.gameObject);
+            foreach (var behaviour in model.GetComponentsInChildren<MonoBehaviour>(true)) if (behaviour != null) Object.DestroyImmediate(behaviour);
+            foreach (var col in model.GetComponentsInChildren<Collider>(true)) Object.DestroyImmediate(col);
+            foreach (var lamp in model.GetComponentsInChildren<Light>(true)) Object.DestroyImmediate(lamp.gameObject);
+            foreach (var camera in model.GetComponentsInChildren<Camera>(true)) Object.DestroyImmediate(camera.gameObject);
+            Fit(model, 2.8f);
+        }
+        foreach (Transform child in root.GetComponentsInChildren<Transform>(true)) child.gameObject.layer = 11;
+        foreach (var col in visual.GetComponentsInChildren<Collider>(true)) Object.DestroyImmediate(col);
+        var collider = root.AddComponent<CapsuleCollider>(); collider.center = Vector3.up * 1.4f; collider.height = 2.8f; collider.radius = .6f;
+        var unit = root.AddComponent<BattleUnit>(); unit.enemy = data; unit.enabled = false;
+        var agent = root.GetComponent<NavMeshAgent>(); agent.enabled = false; agent.radius = .6f; agent.height = 2.8f; agent.obstacleAvoidanceType = ObstacleAvoidanceType.HighQualityObstacleAvoidance;
+        if (data.kind == BattleEnemyKind.Skeleton) DungeonPolishSetup.FitSkeletonCollider(root);
+        var encounter = root.AddComponent<EncounterEnemy>(); encounter.data = data; encounter.IsBoss = data.kind == BattleEnemyKind.Jevil;
+        var highlight = root.AddComponent<ObjectHighlight>(); var fields = new SerializedObject(highlight); fields.FindProperty("outlineColor").colorValue = new Color(1, .12f, .14f); fields.ApplyModifiedPropertiesWithoutUndo();
+        try { return PrefabUtility.SaveAsPrefabAsset(root, AssetsFolder + "/" + data.displayName + ".prefab"); } finally { Object.DestroyImmediate(root); }
+    }
+    static BattleLayout Layout(int index, DungeonSettings settings)
+    {
+        var root = new GameObject("Layout" + (index + 1)); root.transform.position = new Vector3(0, -1500, 0);
+        var layout = root.AddComponent<BattleLayout>(); layout.surface = root.AddComponent<NavMeshSurface>(); layout.surface.collectObjects = CollectObjects.Children; layout.surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders; layout.surface.layerMask = 1;
+        var floor = new GameObject("Floor"); floor.transform.SetParent(root.transform, false); var collider = floor.AddComponent<BoxCollider>(); collider.center = Vector3.down * .3f; collider.size = new Vector3(66, .6f, 66);
+        for (int x = 0; x < 12; x++) for (int z = 0; z < 12; z++)
+        {
+            var tile = Object.Instantiate(settings.floorTiles[(x * 7 + z * 3 + index) % settings.floorTiles.Length], floor.transform); tile.name = "Tile_" + x + "_" + z;
+            tile.transform.localPosition = Vector3.zero; tile.transform.localRotation = Quaternion.identity;
+            var bounds = Bounds(tile); tile.transform.localScale *= 5.5f / Mathf.Max(bounds.size.x, bounds.size.z);
+            bounds = Bounds(tile); tile.transform.position += root.transform.position + new Vector3((x - 5.5f) * 5.5f, 0, (z - 5.5f) * 5.5f) - new Vector3(bounds.center.x, bounds.max.y, bounds.center.z);
+            foreach (var col in tile.GetComponentsInChildren<Collider>()) col.enabled = false;
+        }
+        layout.partySpawns = new Transform[3]; layout.enemySpawns = new Transform[7];
+        Vector3[][] party = { new[] { new Vector3(-7, 0, -10), new Vector3(0, 0, -12), new Vector3(7, 0, -10) }, new[] { new Vector3(-12, 0, -7), new Vector3(-13, 0, 0), new Vector3(-12, 0, 7) }, new[] { new Vector3(-10, 0, -8), new Vector3(0, 0, -13), new Vector3(10, 0, -8) } };
+        for (int i = 0; i < 3; i++) layout.partySpawns[i] = Joint("PartySpawn" + i, root.transform, party[index][i] * 1.5f);
+        for (int i = 0; i < 7; i++) layout.enemySpawns[i] = Joint("EnemySpawn" + i, root.transform, (index == 1 ? new Vector3(10 + i % 2 * 4, 0, (i - 3) * 4) : new Vector3((i - 3) * 4, 0, 8 + i % 2 * 5)) * 1.5f);
+        layout.cover = new BattleCover[5];
+        Vector3[][] cover = { new[] { new Vector3(-12, 0, 1), new Vector3(-4, 0, -3), new Vector3(4, 0, 2), new Vector3(12, 0, -2), new Vector3(0, 0, 14) }, new[] { new Vector3(-5, 0, -10), new Vector3(0, 0, -4), new Vector3(0, 0, 5), new Vector3(5, 0, 11), new Vector3(-9, 0, 13) }, new[] { new Vector3(-13, 0, -1), new Vector3(-5, 0, 3), new Vector3(5, 0, 3), new Vector3(13, 0, -1), new Vector3(0, 0, 12) } };
+        for (int i = 0; i < 5; i++)
+        {
+            var wall = new GameObject("Cover" + i); wall.transform.SetParent(root.transform, false); wall.transform.localPosition = cover[index][i] * 1.5f;
+            var stone = settings.wallMaterial != null ? settings.wallMaterial : Material("CoverStone", new Color(.27f, .31f, .4f));
+            var shape = Part("StoneBottom", wall.transform, Vector3.up * .75f, new Vector3(3.2f, 1.5f, 1.3f), stone);
+            var top = Part("StoneTop", wall.transform, Vector3.up * 2.25f, new Vector3(3.2f, 1.5f, 1.3f), stone);
+            Object.DestroyImmediate(shape.GetComponent<Collider>()); Object.DestroyImmediate(top.GetComponent<Collider>());
+            var box = wall.AddComponent<BoxCollider>(); box.center = Vector3.up * 1.5f; box.size = new Vector3(3.2f, 3, 1.3f);
+            var c = wall.AddComponent<BattleCover>(); c.shape = shape.transform; c.box = box; c.topHalf = top;
+            c.breakEffect = Load<GameObject>(AssetsFolder + "/CoverBreak.prefab"); layout.cover[i] = c;
+        }
+        root.SetActive(false); return layout;
+    }
+    static BattleSkill[] Skills()
+    {
+        string[][] names = { new[] { "Stone Crescent", "Guardian Ring", "Dragonfire", "Flurry Rush" }, new[] { "Fireball", "Celestial Codex", "Portal Rite", "Arcane Barrage" }, new[] { "Radiant Chorus", "Luring Melody", "Resonant Passage", "Grand Ensemble" } };
+        string[][] files = { new[] { "Knight_StoneCrescent", "Knight_GuardianRing", "Knight_Dragonfire", "Knight_FlurryRush" }, new[] { "Wizard_Fireball", "Wizard_CelestialCodex", "Wizard_PortalRite", "Wizard_ArcaneBarrage" }, new[] { "Healer_RadiantChorus", "Healer_LuringMelody", "Healer_ResonantPassage", "Healer_GrandEnsemble" } };
+        string[][] descriptions = { new[] { WiseSkillFeedbackSetup.CrescentDescription, "Shield allies within 8m. Up to 3 charges; one hit consumes a charge.", WiseSkillFeedbackSetup.DragonDescription, "Dodge stance for 2 turns. Space to dodge; perfect timing unlocks 5 right-click counters." }, new[] { "Nearest enemy within 13m. A/D change target. Cover blocks the fireball.", "Restore allies' SP within 6m and boost magic for 2 turns.", "Empower your next cast and reduce your cooldowns by one turn.", "Aim for 10s. Hold left click to charge for 1.5s; release to fire." }, new[] { "Choose a 4m circle within 10m. Damage enemies and heal living allies.", "Pull enemies within 12.5m toward you for 5 seconds.", "Teleport up to 12m onto clear ground. Damage/heal within 6m before and after.", "An 18-second rhythm performance. Accuracy determines each enemy's charm chance." } };
+        int[][] costs = { new[] { 0, 10, 20, 30 }, new[] { 0, 0, 15, 30 }, new[] { 0, 10, 20, 30 } };
+        int[][] cooldowns = { new[] { 1, 3, 3, 5 }, new[] { 1, 3, 2, 5 }, new[] { 1, 3, 1, 5 } };
+        float[][] ranges = { new[] { 0f, 0, 12, 0 }, new[] { 13f, 0, 0, 0 }, new[] { 10f, 0, 12, 0 } };
+        float[][] radii = { new[] { 5f, 8f, 5, 0 }, new[] { 0f, 6f, 0, 0 }, new[] { 4f, 12.5f, 6, 0 } };
+        var result = new BattleSkill[12];
+        for (int c = 0; c < 3; c++) for (int s = 0; s < 4; s++)
+        { var skill = Create<BattleSkill>(AssetsFolder + "/Skill_" + c + "_" + s + ".asset"); skill.character = c; skill.slot = s; skill.displayName = names[c][s]; skill.description = descriptions[c][s]; skill.sp = costs[c][s]; skill.cooldown = cooldowns[c][s]; skill.range = ranges[c][s]; skill.radius = radii[c][s]; skill.icon = AssetDatabase.FindAssets(files[c][s] + " t:Sprite").Select(g => Load<Sprite>(AssetDatabase.GUIDToAssetPath(g))).FirstOrDefault(); EditorUtility.SetDirty(skill); result[c * 4 + s] = skill; }
+        return result;
+    }
+    static InputActionAsset Input()
+    {
+        var asset = ScriptableObject.CreateInstance<InputActionAsset>(); var map = asset.AddActionMap("Battle");
+        map.AddAction("Move", InputActionType.Value).AddCompositeBinding("2DVector").With("Up", "<Keyboard>/w").With("Down", "<Keyboard>/s").With("Left", "<Keyboard>/a").With("Right", "<Keyboard>/d");
+        map.AddAction("ChangeCharacter", binding: "<Keyboard>/c"); map.AddAction("EndTurn", binding: "<Keyboard>/t");
+        for (int i = 1; i <= 4; i++) map.AddAction("Skill" + i, binding: "<Keyboard>/" + i);
+        map.AddAction("FastForward", binding: "<Keyboard>/5"); map.AddAction("Confirm", binding: "<Mouse>/rightButton"); map.AddAction("Charge", binding: "<Mouse>/leftButton"); map.AddAction("Dodge", binding: "<Keyboard>/space");
+        string path = AssetsFolder + "/Battle.inputactions"; File.WriteAllText(path, asset.ToJson()); Object.DestroyImmediate(asset); AssetDatabase.ImportAsset(path); return Load<InputActionAsset>(path);
+    }
+    static void BuildHUD(BattleHUD hud, CharacterBase[] characters)
+    {
+        var parent = hud.transform; hud.turn = Text("Turn", parent, 0, 478, 600, 70, "Your Turn", 42);
+        hud.portraits = new Button[3]; hud.hpBars = new Image[3]; hud.spBars = new Image[3]; hud.characterValues = new TMP_Text[3];
+        for (int i = 0; i < 3; i++)
+        {
+            var row = Box("Character" + i, parent, -740, -100 - i * 130, 380, 115, Blue);
+            var button = row.gameObject.AddComponent<Button>(); button.targetGraphic = row.GetComponent<Image>(); hud.portraits[i] = button;
+            var icon = Image("Portrait", row, -140, 0, 90, 90, Color.white); icon.sprite = characters[i].characterData.portrait; icon.preserveAspect = true;
+            hud.characterValues[i] = Text("Values", row, 30, 24, 250, 55, characters[i].characterData.displayName, 22);
+            hud.hpBars[i] = Bar("HP", row, 30, -16, 230, 15, Color.green); hud.spBars[i] = Bar("SP", row, 30, -38, 230, 15, Color.cyan);
+        }
+        hud.movement = Text("Movement", parent, -740, -475, 380, 43, "Move 8m", 26);
+        hud.actionPoints = Text("ActionPoints", parent, 0, -470, 720, 40, "AP 2/2", 26);
+        hud.message = Text("SkillDescription", parent, 0, -310, 1000, 70, "Choose a skill", 24);
+        hud.skillButtons = new Button[4]; hud.skillIcons = new Image[4]; hud.cooldowns = new TMP_Text[4]; hud.skillNames = new TMP_Text[4];
+        for (int i = 0; i < 4; i++)
+        {
+            var card = Box("Skill" + (i + 1), parent, (i - 1.5f) * 225, -405, 210, 112, Blue); var button = card.gameObject.AddComponent<Button>(); button.targetGraphic = card.GetComponent<Image>(); hud.skillButtons[i] = button;
+            hud.skillIcons[i] = Image("Icon", card, -67, 12, 59, 59, Color.white); hud.skillIcons[i].preserveAspect = true;
+            hud.skillNames[i] = Text("Name", card, 28, 16, 138, 67, "Skill", 23); hud.cooldowns[i] = Text("Cooldown", card, 0, -36, 195, 32, "0 SP", 22);
+        }
+        Text("CameraControls", parent, 695, -483, 490, 74, "Q/E Rotate · Scroll Tilt\n5 Fast forward · Esc Menu", 23);
+        hud.crosshair = Text("Crosshair", parent, 0, 0, 70, 70, "+", 50).gameObject;
+        hud.dodgePrompt = Box("DodgeTiming", parent, 0, 330, 600, 68, Dark).gameObject; Text("Prompt", hud.dodgePrompt.transform, 0, 0, 570, 60, "Space · Dodge", 30);
+        var result = Box("BattleResultPanel", parent, 0, 0, 1400, 790, Blue); hud.results = result.gameObject;
+        hud.resultTitle = Text("Title", result, 0, 280, 1280, 100, "Victory!", 62);
+        hud.resultValues = new TMP_Text[3]; hud.levelUp = new TMP_Text[3];
+        for (int i = 0; i < 3; i++)
+        {
+            var card = Box("CharacterResult" + i, result, (i - 1) * 420, 20, 375, 385, Dark);
+            var icon = Image("Portrait", card, 0, 96, 140, 140, Color.white); icon.sprite = characters[i].characterData.portrait; icon.preserveAspect = true;
+            hud.resultValues[i] = Text("Experience", card, 0, -50, 346, 160, "EXP", 29); hud.levelUp[i] = Text("LevelUpBadge", card, 0, -153, 330, 52, "LEVEL UP!", 30); hud.levelUp[i].color = Color.yellow;
+        }
+        hud.returnButton = Button("Return", result, 0, -280, 640, 100, "Return"); result.gameObject.SetActive(false);
+    }
+    static BattleBossGame BuildBossGame(Transform canvas)
+    {
+        var root = Box("JevilAttackPanel", canvas, 0, 20, 1250, 860, Dark); var game = root.gameObject.AddComponent<BattleBossGame>(); game.panel = root.gameObject;
+        var board = Box("MovementBox", root, 0, 0, 600, 600, Color.black); game.box = (RectTransform)board;
+        var square = board.gameObject.AddComponent<AspectRatioFitter>(); square.aspectMode = AspectRatioFitter.AspectMode.WidthControlsHeight; square.aspectRatio = 1;
+        game.heart = Image("PlayerHeart", board, 0, 0, 28, 28, Color.white).rectTransform; game.heart.GetComponent<Image>().sprite = Load<Sprite>("Assets/Imported Assets/Jevil/Sprites/soul.png");
+        game.jevil = Image("Jevil", root, 0, 350, 100, 100, Color.white).rectTransform; game.jevil.GetComponent<Image>().sprite = Load<Sprite>("Assets/Imported Assets/Jevil/Sprites/jevil.png"); game.jevil.GetComponent<Image>().preserveAspect = true;
+        game.spadeTemplate = Image("Spade", board, 0, 0, 28, 34, Color.white); game.spadeTemplate.sprite = Load<Sprite>("Assets/Imported Assets/Jevil/Bullets/Jevil Spade.png");
+        game.heartTemplate = Image("HeartBomb", board, 0, 0, 30, 30, Color.white); game.heartTemplate.sprite = Load<Sprite>("Assets/Imported Assets/Jevil/Bullets/Jevil Heart.png");
+        game.scytheTemplate = Image("Scythe", board, 0, 0, 120, 120, Color.white); game.scytheTemplate.sprite = Load<Sprite>("Assets/Imported Assets/Jevil/Bullets/jevil_knife.png"); game.scytheTemplate.preserveAspect = true;
+        game.caption = Text("Caption", root, 0, -360, 1000, 70, "WASD to dodge", 35); root.gameObject.SetActive(false); return game;
+    }
+    static void SetupHealer(PinkRhythmController rhythm)
+    {
+        string[] lines = File.ReadAllLines("Assets/Resources/Rhythm/RainbowRoad_Full.txt");
+        var notes = lines.Where(line => line.Contains(" t=") || line.Contains(" t_start=")).Where(line =>
+            System.Text.RegularExpressions.Regex.Matches(line, @"\d+").Cast<System.Text.RegularExpressions.Match>().Skip(1).All(m => int.Parse(m.Value) <= 18000)).ToArray();
+        string path = AssetsFolder + "/HealerBattle18.txt"; File.WriteAllText(path, lines[0] + "\nnotes=" + notes.Length + "\n\n" + string.Join("\n", notes)); AssetDatabase.ImportAsset(path);
+        var fields = new SerializedObject(rhythm); fields.FindProperty("healerBattleBeatmap").objectReferenceValue = Load<TextAsset>(path);
+        fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+    static void AddAnimations(Animator animator)
+    {
+        if (animator == null) return;
+        var asset = animator.runtimeAnimatorController;
+        if (asset is AnimatorOverrideController overrides) asset = overrides.runtimeAnimatorController;
+        if (!(asset is AnimatorController controller)) return;
+        var machine = controller.layers[0].stateMachine;
+        string[] names = { "BattleAttack", "BattleCast", "BattleRollBack", "BattleRollSide" };
+        string[] paths = { "Combat/MeeleeAttack_OneHanded.fbx", "Combat/SpellCast.fbx", "Movement/RollBackward.fbx", "Movement/RollLeft.fbx" };
+        for (int i = 0; i < names.Length; i++)
+        {
+            var state = machine.states.Select(s => s.state).FirstOrDefault(s => s.name == names[i]) ?? machine.AddState(names[i]);
+            state.motion = AssetDatabase.LoadAllAssetsAtPath("Assets/Blink/Art/Animations/" + paths[i]).OfType<AnimationClip>().FirstOrDefault(c => !c.name.StartsWith("__"));
+            if (state.transitions.Length == 0) { var exit = state.AddTransition(machine.states.Select(s => s.state).First(s => s.name == "Idle")); exit.hasExitTime = true; exit.exitTime = .9f; exit.duration = .1f; }
+        }
+        EditorUtility.SetDirty(controller);
+    }
+    static GameObject Projectile()
+    {
+        var obj = GameObject.CreatePrimitive(PrimitiveType.Sphere); obj.name = "Fireball"; obj.transform.localScale = Vector3.one * .35f; Object.DestroyImmediate(obj.GetComponent<Collider>());
+        var material = Material("Fireball", new Color(1, .35f, .06f)); material.EnableKeyword("_EMISSION"); material.SetColor("_EmissionColor", new Color(4, 1.4f, .2f)); obj.GetComponent<Renderer>().sharedMaterial = material;
+        try { return PrefabUtility.SaveAsPrefabAsset(obj, AssetsFolder + "/Projectile.prefab"); } finally { Object.DestroyImmediate(obj); }
+    }
+    static GameObject AreaEffect()
+    {
+        var root = new GameObject("SkillAreaEffect"); root.AddComponent<BattleEffectVisual>();
+        Ring(root.transform, "Ring", 1, Color.white); Ring(root.transform, "InnerRing", .9f, Color.white);
+        try { return PrefabUtility.SaveAsPrefabAsset(root, AssetsFolder + "/AreaEffect.prefab"); } finally { Object.DestroyImmediate(root); }
+    }
+    static GameObject StatusEffect()
+    {
+        var root = new GameObject("BattleStatusEffects"); var status = root.AddComponent<BattleStatusVisual>();
+        status.shield = new GameObject("Shield"); status.shield.transform.SetParent(root.transform, false);
+        for (int i = 0; i < 3; i++)
+        {
+            var ring = Ring(status.shield.transform, "ShieldRing" + i, 1.7f, Color.cyan);
+            ring.transform.localPosition = Vector3.up * 1.5f;
+            ring.transform.localRotation = Quaternion.Euler(90, i * 60, 0);
+        }
+        status.shield.AddComponent<BattleEffectVisual>().lifetime = 0;
+        status.portal = new GameObject("Portal"); status.portal.transform.SetParent(root.transform, false);
+        var portal = Ring(status.portal.transform, "PortalRing", 1.2f, new Color(.8f, .2f, 1));
+        portal.transform.localPosition = new Vector3(0, 1.6f, -.8f); portal.transform.localRotation = Quaternion.Euler(90, 0, 0);
+        status.buff = new GameObject("MagicBuff"); status.buff.transform.SetParent(root.transform, false);
+        status.buff.transform.localPosition = Vector3.up * .15f;
+        Ring(status.buff.transform, "BuffRing", 1.15f, new Color(1, .7f, .1f));
+        status.buff.AddComponent<BattleEffectVisual>().lifetime = 0;
+        status.shield.SetActive(false); status.portal.SetActive(false); status.buff.SetActive(false);
+        WiseSkillFeedbackSetup.AddDodgeAura(status);
+        try { return PrefabUtility.SaveAsPrefabAsset(root, AssetsFolder + "/StatusEffect.prefab"); } finally { Object.DestroyImmediate(root); }
+    }
+    static GameObject Ring(Transform parent, string name, float radius, Color color)
+    {
+        var root = new GameObject(name); root.transform.SetParent(parent, false); var line = root.AddComponent<LineRenderer>();
+        line.useWorldSpace = false; line.loop = true; line.positionCount = 64; line.widthMultiplier = .065f;
+        string path = AssetsFolder + "/EffectLine.mat"; var material = Load<Material>(path);
+        if (material == null) { material = new Material(Shader.Find("Sprites/Default")); AssetDatabase.CreateAsset(material, path); }
+        line.sharedMaterial = material; line.startColor = line.endColor = color;
+        for (int i = 0; i < 64; i++) line.SetPosition(i, new Vector3(Mathf.Sin(i * Mathf.PI / 32) * radius, 0, Mathf.Cos(i * Mathf.PI / 32) * radius));
+        return root;
+    }
+    static GameObject Dragon()
+    {
+        var root = new GameObject("DragonfireDragon"); var visual = root.AddComponent<BattleDragonVisual>();
+        var body = Material("DragonGold", new Color(1, .48f, .06f)); var wings = Material("DragonWings", new Color(.8f, .16f, .03f));
+        Part("Body", root.transform, Vector3.zero, new Vector3(.9f, .7f, 2), body);
+        Part("Neck", root.transform, new Vector3(0, .3f, 1.2f), new Vector3(.5f, .8f, .6f), body);
+        Part("Head", root.transform, new Vector3(0, .7f, 1.55f), new Vector3(.75f, .65f, .9f), body);
+        Part("Muzzle", root.transform, new Vector3(0, .5f, 2.05f), new Vector3(.6f, .3f, .6f), body);
+        for (int side = -1; side <= 1; side += 2)
+        {
+            var horn = Part("Horn", root.transform, new Vector3(side * .26f, 1.1f, 1.25f), new Vector3(.12f, .65f, .12f), wings); horn.transform.localRotation = Quaternion.Euler(-25, 0, side * -20);
+            Part("Eye", root.transform, new Vector3(side * .38f, .75f, 1.75f), new Vector3(.08f, .14f, .18f), Material("DragonEye", Color.cyan, true));
+            var joint = Joint(side < 0 ? "LeftWing" : "RightWing", root.transform, new Vector3(side * .45f, .1f, -.3f));
+            Part("Wing", joint, new Vector3(side * 1.2f, 0, -.35f), new Vector3(2.5f, .08f, 1.7f), wings);
+            if (side < 0) visual.leftWing = joint; else visual.rightWing = joint;
+        }
+        var tail = Part("Tail", root.transform, new Vector3(0, -.1f, -1.8f), new Vector3(.3f, .3f, 2), body); tail.transform.localRotation = Quaternion.Euler(15, 0, 0);
+        visual.mouth = Joint("Mouth", root.transform, new Vector3(0, .5f, 2.4f));
+        foreach (var collider in root.GetComponentsInChildren<Collider>()) Object.DestroyImmediate(collider);
+        try { return PrefabUtility.SaveAsPrefabAsset(root, AssetsFolder + "/Dragon.prefab"); } finally { Object.DestroyImmediate(root); }
+    }
+    static GameObject Impact()
+    {
+        var obj = new GameObject("Impact", typeof(ParticleSystem)); var particles = obj.GetComponent<ParticleSystem>(); var main = particles.main; main.duration = .35f; main.loop = false; main.startLifetime = .45f; main.startSpeed = 3; main.startSize = .15f; main.startColor = new Color(1, .66f, .2f); main.maxParticles = 18;
+        var emission = particles.emission; emission.rateOverTime = 0; emission.SetBursts(new[] { new ParticleSystem.Burst(0, 14) });
+        var renderer = obj.GetComponent<ParticleSystemRenderer>(); renderer.sharedMaterial = Material("Sparks", new Color(1, .65f, .2f));
+        try { return PrefabUtility.SaveAsPrefabAsset(obj, AssetsFolder + "/Impact.prefab"); } finally { Object.DestroyImmediate(obj); }
+    }
+    static BattleWorldUI HealthUI()
+    {
+        var canvas = Canvas("EnemyHealth", 0); canvas.renderMode = RenderMode.WorldSpace; canvas.GetComponent<CanvasScaler>().enabled = false; canvas.GetComponent<GraphicRaycaster>().enabled = false;
+        var rect = (RectTransform)canvas.transform; rect.sizeDelta = new Vector2(210, 54); rect.localScale = Vector3.one * .01f; rect.localPosition = Vector3.up * 3.8f;
+        var ui = canvas.gameObject.AddComponent<BattleWorldUI>(); ui.fill = Bar("HP", rect, 0, 0, 200, 38, new Color(.85f, .15f, .16f)); ui.value = Text("Value", rect, 0, 0, 200, 44, "100/100", 24);
+        try { return PrefabUtility.SaveAsPrefabAsset(canvas.gameObject, AssetsFolder + "/EnemyHealth.prefab").GetComponent<BattleWorldUI>(); } finally { Object.DestroyImmediate(canvas.gameObject); }
+    }
+    static BattlePopup Popup()
+    {
+        var canvas = Canvas("DamagePopup", 0); canvas.renderMode = RenderMode.WorldSpace; canvas.GetComponent<CanvasScaler>().enabled = false; canvas.GetComponent<GraphicRaycaster>().enabled = false;
+        var rect = (RectTransform)canvas.transform; rect.sizeDelta = new Vector2(300, 70); rect.localScale = Vector3.one * .01f;
+        var popup = canvas.gameObject.AddComponent<BattlePopup>(); popup.text = Text("Value", rect, 0, 0, 300, 70, "100", 38);
+        try { return PrefabUtility.SaveAsPrefabAsset(canvas.gameObject, AssetsFolder + "/DamagePopup.prefab").GetComponent<BattlePopup>(); } finally { Object.DestroyImmediate(canvas.gameObject); }
+    }
+    static LineRenderer Line(string name)
+    { var obj = new GameObject(name, typeof(LineRenderer)); var line = obj.GetComponent<LineRenderer>(); line.sharedMaterial = Material("RangeLine", Color.white, true); line.startWidth = line.endWidth = .06f; line.useWorldSpace = true; line.enabled = false; return line; }
+    static Material Material(string name, Color color, bool unlit = false)
+    { var path = AssetsFolder + "/" + name + ".mat"; var material = Load<Material>(path); if (material == null) { material = new Material(Shader.Find(unlit ? "Universal Render Pipeline/Unlit" : "Universal Render Pipeline/Lit")); AssetDatabase.CreateAsset(material, path); } material.color = color; EditorUtility.SetDirty(material); return material; }
+    static GameObject Part(string name, Transform parent, Vector3 position, Vector3 scale, Material material)
+    { var obj = GameObject.CreatePrimitive(PrimitiveType.Cube); obj.name = name; obj.transform.SetParent(parent, false); obj.transform.localPosition = position; obj.transform.localScale = scale; obj.GetComponent<Renderer>().sharedMaterial = material; return obj; }
+    static Transform Joint(string name, Transform parent, Vector3 position) { var obj = new GameObject(name); obj.transform.SetParent(parent, false); obj.transform.localPosition = position; return obj.transform; }
+    static Bounds Bounds(GameObject model)
+    { var renderers = model.GetComponentsInChildren<Renderer>(); var bounds = renderers[0].bounds; foreach (var r in renderers) bounds.Encapsulate(r.bounds); return bounds; }
+    static void Fit(GameObject model, float height) { model.transform.localPosition = Vector3.zero; var bounds = Bounds(model); model.transform.localScale *= height / bounds.size.y; bounds = Bounds(model); model.transform.position += Vector3.up * (model.transform.parent.position.y - bounds.min.y); }
+    static T Load<T>(string path) where T : Object => AssetDatabase.LoadAssetAtPath<T>(path);
+    static T Create<T>(string path) where T : ScriptableObject { var asset = Load<T>(path); if (asset != null) return asset; asset = ScriptableObject.CreateInstance<T>(); AssetDatabase.CreateAsset(asset, path); return asset; }
+    static AudioClip Audio(string path) => Load<AudioClip>(path);
+    static Sprite SpriteAsset(string path)
+    {
+        var sprite = Load<Sprite>(path);
+        if (sprite != null) return sprite;
+        var importer = AssetImporter.GetAtPath(path) as TextureImporter;
+        if (importer == null) throw new FileNotFoundException("Missing battle image", path);
+        importer.textureType = TextureImporterType.Sprite; importer.spriteImportMode = SpriteImportMode.Single;
+        importer.SaveAndReimport(); return Load<Sprite>(path) ?? throw new InvalidOperationException("Sprite import failed: " + path);
+    }
+    static AudioClip FindAudio(params string[] names) { foreach (string name in names) { var clip = AssetDatabase.FindAssets(name + " t:AudioClip", new[] { "Assets/Imported Assets/Audio" }).Select(g => Audio(AssetDatabase.GUIDToAssetPath(g))).FirstOrDefault(); if (clip != null) return clip; } return null; }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static Canvas Canvas(string name, int order)
+    { var root = new GameObject(name, typeof(RectTransform), typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster)); root.layer = 5; var canvas = root.GetComponent<Canvas>(); canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = order; var scaler = root.GetComponent<CanvasScaler>(); scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize; scaler.referenceResolution = new Vector2(1920, 1080); scaler.matchWidthOrHeight = .5f; return canvas; }
+    static RectTransform Rect(string name, Transform parent, float x, float y, float width, float height)
+    { var obj = new GameObject(name, typeof(RectTransform)); obj.layer = 5; obj.transform.SetParent(parent, false); var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = new Vector2(x, y); rect.sizeDelta = new Vector2(width, height); return rect; }
+    static Image Image(string name, Transform parent, float x, float y, float width, float height, Color color)
+    { var image = Rect(name, parent, x, y, width, height).gameObject.AddComponent<Image>(); image.color = color; image.raycastTarget = false; return image; }
+    static Transform Box(string name, Transform parent, float x, float y, float width, float height, Color color)
+    { var image = Image(name, parent, x, y, width, height, color); image.sprite = rounded; image.type = UnityEngine.UI.Image.Type.Sliced; var edge = Image("Border", image.transform, 0, 0, width, height, Color.white); edge.sprite = outline; edge.type = UnityEngine.UI.Image.Type.Sliced; return image.transform; }
+    static TMP_Text Text(string name, Transform parent, float x, float y, float width, float height, string value, float size)
+    { var label = Object.Instantiate(fontTemplate, parent); label.name = name; label.gameObject.SetActive(true); var rect = label.rectTransform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = new Vector2(x, y); rect.sizeDelta = new Vector2(width, height); label.text = value; label.fontSize = label.fontSizeMax = size; label.fontSizeMin = 16; label.enableAutoSizing = true; label.alignment = TextAlignmentOptions.Center; label.raycastTarget = false; label.color = Color.white; return label; }
+    static Image Bar(string name, Transform parent, float x, float y, float width, float height, Color color)
+    { var background = Box(name, parent, x, y, width, height, Dark); var fill = Image("Fill", background, 0, 0, width - 6, height - 6, color); fill.sprite = rounded; fill.type = UnityEngine.UI.Image.Type.Filled; fill.fillMethod = UnityEngine.UI.Image.FillMethod.Horizontal; return fill; }
+    static Button Button(string name, Transform parent, float x, float y, float width, float height, string value)
+    { var button = Object.Instantiate(woodButton, parent); button.name = name; button.gameObject.SetActive(true); var rect = (RectTransform)button.transform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = new Vector2(x, y); rect.sizeDelta = new Vector2(width, height); button.onClick = new Button.ButtonClickedEvent(); button.GetComponentInChildren<TMP_Text>(true).text = value; return button; }
+    static void Stretch(RectTransform rect) { rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one; rect.offsetMin = rect.offsetMax = Vector2.zero; }
+}

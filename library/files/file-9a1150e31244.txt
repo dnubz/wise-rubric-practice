@@ -1,0 +1,67 @@
+using UnityEngine;
+
+/// <summary>
+/// Soft ambient fill light that follows the camera direction,
+/// ensuring the NPC is always illuminated regardless of sun angle.
+/// Attach this to the Point Light child inside an NPC prefab.
+/// </summary>
+public class NPCAmbientLight : MonoBehaviour
+{
+    [Header("Light Fill Settings")]
+    [SerializeField] private float baseIntensity = 1.8f;
+    [SerializeField] private float nightBoostIntensity = 2.8f;
+    [SerializeField] private Light fillLight;
+
+    [Header("Camera Tracking")]
+    [Tooltip("If true, the light will orbit to always face the main camera (billboard effect).")]
+    [SerializeField] private bool trackCamera = true;
+    [SerializeField] private float trackRadius = 0f;       // 0 = light stays at center
+
+    private Light sunLight;
+    private Transform mainCam;
+
+    private void Start()
+    {
+        if (fillLight == null)
+            fillLight = GetComponent<Light>();
+
+        mainCam = Camera.main?.transform;
+
+        // Find directional light in scene (sun)
+        Light[] lights = FindObjectsByType<Light>(FindObjectsSortMode.None);
+        foreach (var l in lights)
+        {
+            if (l.type == LightType.Directional && l.gameObject != gameObject)
+            {
+                sunLight = l;
+                break;
+            }
+        }
+    }
+
+    private void LateUpdate()
+    {
+        if (fillLight == null) return;
+
+        // Boost intensity when sun is low (dusk / night / bad angle)
+        if (sunLight != null)
+        {
+            // sunLight.transform.forward.y > 0 means sun is pointing downward toward horizon
+            float sunDot = Vector3.Dot(sunLight.transform.forward, Vector3.down);
+            // sunDot close to 1.0 = overhead noon (bright), close to 0 = sunset or bad angle
+            float t = Mathf.Clamp01(sunDot);
+            fillLight.intensity = Mathf.Lerp(nightBoostIntensity, baseIntensity, t);
+        }
+
+        // Optionally orbit the fill light to always face camera (billboard fill)
+        if (trackCamera && mainCam != null && trackRadius > 0f)
+        {
+            Vector3 camDir = (mainCam.position - transform.parent.position).normalized;
+            camDir.y = 0f;
+            if (camDir.sqrMagnitude > 0.001f)
+            {
+                transform.localPosition = camDir * trackRadius + Vector3.up * 0.85f;
+            }
+        }
+    }
+}

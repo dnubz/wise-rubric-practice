@@ -1,0 +1,204 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using UnityEngine;
+
+// Explicit primitive schema: compact, versioned and independent of Unity scene references.
+// No BinaryFormatter/object deserialization. A checksum detects partial writes and corruption.
+public static class BinarySaveFile
+{
+    const int Magic = 0x45534957, Version = 3, MaxBytes = 16 * 1024 * 1024, MaxEntries = 100000;
+    static readonly Encoding Utf8 = new UTF8Encoding(false, true);
+
+    public static void Write(string path, GameSave.SaveData data)
+    {
+        Validate(data);
+        byte[] payload;
+        using (var stream = new MemoryStream())
+        {
+            using (var w = new BinaryWriter(stream, Utf8, true)) WriteData(w, data);
+            payload = stream.ToArray();
+        }
+        if (payload.Length > MaxBytes) throw new InvalidDataException("Save exceeds the supported size.");
+        string directory = Path.GetDirectoryName(Path.GetFullPath(path)); Directory.CreateDirectory(directory);
+        string temporary = path + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
+            using (var w = new BinaryWriter(stream, Utf8))
+            using (var sha = SHA256.Create())
+            {
+                w.Write(Magic); w.Write(Version); w.Write(payload.Length); w.Write(sha.ComputeHash(payload));
+                w.Write(payload); w.Flush(); stream.Flush(true);
+            }
+            if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
+    public static GameSave.SaveData Read(string path)
+    {
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var r = new BinaryReader(stream, Utf8))
+        {
+            if (stream.Length < 44 || stream.Length > MaxBytes + 44 || r.ReadInt32() != Magic)
+                throw new InvalidDataException("This save is incomplete or unsupported.");
+            int version = r.ReadInt32();
+            if (version != 2 && version != Version) throw new InvalidDataException("Unsupported save version.");
+            int length = r.ReadInt32();
+            if (length < 0 || length != stream.Length - 44) throw new InvalidDataException("Invalid save length.");
+            byte[] expected = r.ReadBytes(32), payload = r.ReadBytes(length);
+            using (var sha = SHA256.Create())
+            {
+                byte[] actual = sha.ComputeHash(payload);
+                for (int i = 0; i < actual.Length; i++) if (actual[i] != expected[i]) throw new InvalidDataException("Save checksum failed.");
+            }
+            using (var body = new MemoryStream(payload))
+            using (var reader = new BinaryReader(body, Utf8))
+            {
+                var data = ReadData(reader, version);
+                if (body.Position != body.Length) throw new InvalidDataException("Unexpected save content.");
+                Validate(data); return data;
+            }
+        }
+    }
+
+    static void WriteData(BinaryWriter w, GameSave.SaveData d, int version = Version)
+    {
+        w.Write(d.savedUtc); w.Write(d.lastPlayedUtc); w.Write(d.gold); w.Write(d.seed); w.Write(d.playSeconds);
+        Vector(w, d.position); w.Write(d.rotation.x); w.Write(d.rotation.y); w.Write(d.rotation.z); w.Write(d.rotation.w);
+        w.Write(d.activeCharacter); w.Write(d.inDungeon);
+        Array(w, d.party, (a, p) => { Text(a, p.name); a.Write(p.level); a.Write(p.exp); a.Write(p.hp); a.Write(p.sp);
+            a.Write(p.ultimate); Array(a, p.equipment, Text); Array(a, p.cooldowns, (b, v) => b.Write(v)); });
+        Array(w, d.items, Text); Array(w, d.openedPools, Grid); Array(w, d.openedPlatformChests, Grid); Array(w, d.defeatedEnemies, Text);
+        var s = d.settings; w.Write(s.music); w.Write(s.sfx); w.Write(s.fps); w.Write(s.width); w.Write(s.height); w.Write(s.fullscreen);
+        w.Write(d.world != null);
+        if (d.world != null) { w.Write(d.world.chunkSize); w.Write(d.world.tileSize); w.Write(d.world.poolChance);
+            w.Write(d.world.biomeScale); Array(w, d.world.forcedDungeons, Grid); }
+        w.Write(d.dungeon != null);
+        if (d.dungeon != null) WriteDungeon(w, d.dungeon, version);
+        if (version >= 3) Array(w, d.dungeons, (a, g) => WriteDungeon(a, g, version));
+    }
+
+    static void WriteDungeon(BinaryWriter w, SavedDungeon g, int version)
+    {
+        w.Write(g.seed); w.Write(g.spawn); w.Write(g.boss); w.Write(g.berdly); w.Write(g.maximumDegree);
+        Text(w, g.name); Text(w, g.scene); w.Write(g.spacing); w.Write(g.floorTileSize);
+        Array(w, g.rooms, (a, v) => { a.Write(v.Index); a.Write(v.Degree); a.Write(v.Number); a.Write(v.Chain);
+            Grid(a, v.Grid); Grid(a, v.Size); a.Write((int)v.Kind); a.Write((int)v.Key); });
+        Array(w, g.doors, (a, v) => { a.Write(v.A); a.Write(v.B); a.Write((int)v.Lock); });
+        Array(w, g.chains, (a, v) => Array(a, v, (b, n) => b.Write(n)));
+        w.Write(g.originalKeys); w.Write(g.bossKeys);
+        Array(w, g.openedChests, (a, v) => a.Write(v)); Array(w, g.unlockedDoors, (a, v) => a.Write(v));
+        Array(w, g.brokenProps, (a, v) => a.Write(v)); Array(w, g.remainingCoins, (a, v) => Array(a, v, Vector));
+        if (version >= 3) { w.Write(g.hasEntrance); Grid(w, g.entrance); }
+    }
+
+    static GameSave.SaveData ReadData(BinaryReader r, int version)
+    {
+        var d = new GameSave.SaveData { version = version, savedUtc = r.ReadInt64(), lastPlayedUtc = r.ReadInt64(), gold = r.ReadInt32(),
+            seed = r.ReadInt32(), playSeconds = r.ReadSingle(), position = Vector(r),
+            rotation = new Quaternion(r.ReadSingle(), r.ReadSingle(), r.ReadSingle(), r.ReadSingle()),
+            activeCharacter = r.ReadInt32(), inDungeon = r.ReadBoolean() };
+        d.party = Array(r, a => new GameSave.PartyState { name = Text(a), level = a.ReadInt32(), exp = a.ReadInt32(),
+            hp = a.ReadInt32(), sp = a.ReadInt32(), ultimate = a.ReadBoolean(), equipment = Array(a, Text, 2),
+            cooldowns = Array(a, b => b.ReadInt32(), 4) }, 3);
+        d.items = Array(r, Text); d.openedPools = Array(r, Grid); d.openedPlatformChests = Array(r, Grid); d.defeatedEnemies = Array(r, Text);
+        d.settings = new SaveGameSettings { music = r.ReadSingle(), sfx = r.ReadSingle(), fps = r.ReadInt32(),
+            width = r.ReadInt32(), height = r.ReadInt32(), fullscreen = r.ReadBoolean() };
+        if (r.ReadBoolean()) d.world = new SavedWorldLayout { chunkSize = r.ReadInt32(), tileSize = r.ReadSingle(),
+            poolChance = r.ReadSingle(), biomeScale = r.ReadSingle(), forcedDungeons = Array(r, Grid) };
+        if (r.ReadBoolean()) d.dungeon = ReadDungeon(r, version);
+        d.dungeons = version >= 3 ? Array(r, a => ReadDungeon(a, version), 4096) : System.Array.Empty<SavedDungeon>();
+        return d;
+    }
+
+    static SavedDungeon ReadDungeon(BinaryReader r, int version)
+    {
+        var g = new SavedDungeon { seed = r.ReadInt32(), spawn = r.ReadInt32(), boss = r.ReadInt32(), berdly = r.ReadInt32(),
+            maximumDegree = r.ReadInt32(), name = Text(r), scene = Text(r), spacing = r.ReadSingle(), floorTileSize = r.ReadSingle(),
+            rooms = Array(r, a => new DungeonRoomData { Index = a.ReadInt32(), Degree = a.ReadInt32(), Number = a.ReadInt32(),
+                Chain = a.ReadInt32(), Grid = Grid(a), Size = Grid(a), Kind = (DungeonRoomKind)a.ReadInt32(), Key = (DungeonKeyKind)a.ReadInt32() }, DungeonLayout.MaximumRooms),
+            doors = Array(r, a => new DungeonDoorData { A = a.ReadInt32(), B = a.ReadInt32(), Lock = (DungeonKeyKind)a.ReadInt32() }, DungeonLayout.MaximumRooms),
+            chains = Array(r, a => Array(a, b => b.ReadInt32(), DungeonLayout.MaximumRooms), DungeonLayout.MaximumRooms), originalKeys = r.ReadInt32(), bossKeys = r.ReadInt32(),
+            openedChests = Array(r, a => a.ReadInt32()), unlockedDoors = Array(r, a => a.ReadInt32()), brokenProps = Array(r, a => a.ReadInt32()),
+            remainingCoins = Array(r, a => Array(a, Vector), DungeonLayout.MaximumRooms) };
+        if (version >= 3) { g.hasEntrance = r.ReadBoolean(); g.entrance = Grid(r); }
+        return g;
+    }
+
+    static void Array<T>(BinaryWriter w, T[] values, Action<BinaryWriter, T> write)
+    { w.Write(values?.Length ?? 0); if (values != null) foreach (var value in values) write(w, value); }
+    static T[] Array<T>(BinaryReader r, Func<BinaryReader, T> read, int maximum = MaxEntries)
+    {
+        int count = r.ReadInt32();
+        if (count < 0 || count > maximum || count > r.BaseStream.Length - r.BaseStream.Position) throw new InvalidDataException("Invalid save array.");
+        var values = new T[count]; for (int i = 0; i < count; i++) values[i] = read(r); return values;
+    }
+    static void Text(BinaryWriter w, string value)
+    { byte[] bytes = Utf8.GetBytes(value ?? ""); if (bytes.Length > 4096) throw new InvalidDataException("Save text too long."); w.Write(bytes.Length); w.Write(bytes); }
+    static string Text(BinaryReader r)
+    {
+        int length = r.ReadInt32();
+        if (length < 0 || length > 4096 || length > r.BaseStream.Length - r.BaseStream.Position) throw new InvalidDataException("Invalid save text.");
+        return Utf8.GetString(r.ReadBytes(length));
+    }
+    static void Vector(BinaryWriter w, Vector3 v) { w.Write(v.x); w.Write(v.y); w.Write(v.z); }
+    static Vector3 Vector(BinaryReader r) => new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
+    static void Grid(BinaryWriter w, Vector2Int v) { w.Write(v.x); w.Write(v.y); }
+    static Vector2Int Grid(BinaryReader r) => new Vector2Int(r.ReadInt32(), r.ReadInt32());
+    static bool Finite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
+    public static void Validate(GameSave.SaveData d)
+    {
+        if (d == null || d.party == null || d.party.Length != 3 || d.items == null || d.settings == null ||
+            d.gold < 0 || !Finite(d.playSeconds) || d.playSeconds < 0 || d.activeCharacter < 0 || d.activeCharacter > 2 ||
+            !Finite(d.position.x) || !Finite(d.position.y) || !Finite(d.position.z) ||
+            !Finite(d.rotation.x) || !Finite(d.rotation.y) || !Finite(d.rotation.z) || !Finite(d.rotation.w) ||
+            d.savedUtc < 0 || d.lastPlayedUtc < 0 || d.savedUtc > DateTime.MaxValue.Ticks || d.lastPlayedUtc > DateTime.MaxValue.Ticks)
+            throw new InvalidDataException("Invalid saved player state.");
+        foreach (var p in d.party)
+            if (p == null || string.IsNullOrEmpty(p.name) || p.level < 1 || p.exp < 0 || p.exp >= 100 || p.hp < 0 || p.sp < 0 ||
+                p.equipment == null || p.equipment.Length != 2 || p.cooldowns == null || p.cooldowns.Length != 4 ||
+                System.Array.Exists(p.cooldowns, c => c < 0)) throw new InvalidDataException("Invalid saved character state.");
+        var s = d.settings;
+        if (!Finite(s.music) || s.music < 0 || s.music > 1 || !Finite(s.sfx) || s.sfx < 0 || s.sfx > 1 ||
+            s.fps != 30 && s.fps != 60 && s.fps != 120 ||
+            !(s.width == 1280 && s.height == 720 || s.width == 1920 && s.height == 1080 || s.width == 3840 && s.height == 2160))
+            throw new InvalidDataException("Invalid saved settings.");
+        var world = d.world;
+        if (world != null && (world.chunkSize < 9 || world.chunkSize > 128 || !Finite(world.tileSize) || world.tileSize <= 0 ||
+            !Finite(world.poolChance) || world.poolChance < 0 || world.poolChance > 1 || !Finite(world.biomeScale) || world.biomeScale < 1))
+            throw new InvalidDataException("Invalid saved overworld layout.");
+        var g = d.dungeon;
+        if (d.inDungeon && g == null) throw new InvalidDataException("Dungeon layout is missing.");
+        if (g != null) ValidateDungeon(g);
+        if (d.dungeons != null)
+        {
+            if (d.dungeons.Length > 4096) throw new InvalidDataException("Too many saved dungeons.");
+            var entrances = new System.Collections.Generic.HashSet<Vector2Int>();
+            foreach (var snapshot in d.dungeons)
+            {
+                if (snapshot == null || !snapshot.hasEntrance || !entrances.Add(snapshot.entrance))
+                    throw new InvalidDataException("Missing or duplicate dungeon entrance.");
+                ValidateDungeon(snapshot);
+            }
+        }
+    }
+    static void ValidateDungeon(SavedDungeon g)
+    {
+        if (g == null) return;
+        int n = g.rooms?.Length ?? 0;
+        if (n < 8 || n > DungeonLayout.MaximumRooms || g.spawn < 0 || g.spawn >= n || g.boss < 0 || g.boss >= n || g.berdly < 0 || g.berdly >= n ||
+            g.doors == null || g.doors.Length != n - 1 || g.chains == null || g.chains.Length == 0 ||
+            g.remainingCoins == null || g.remainingCoins.Length != n || g.originalKeys < 0 || g.bossKeys < 0 ||
+            g.scene != "DungeonScene" || !Finite(g.spacing) || g.spacing < 100 || !Finite(g.floorTileSize) || g.floorTileSize < 1 || g.floorTileSize > 8)
+            throw new InvalidDataException("Invalid saved dungeon layout.");
+        for (int i = 0; i < n; i++) if (g.rooms[i] == null || g.rooms[i].Index != i || g.rooms[i].Size.x < 20 || g.rooms[i].Size.x > 64 ||
+            g.rooms[i].Size.y < 20 || g.rooms[i].Size.y > 64 || !Enum.IsDefined(typeof(DungeonRoomKind), g.rooms[i].Kind) ||
+            !Enum.IsDefined(typeof(DungeonKeyKind), g.rooms[i].Key)) throw new InvalidDataException("Invalid saved dungeon room.");
+        foreach (var door in g.doors) if (door.A < 0 || door.A >= n || door.B < 0 || door.B >= n || door.A == door.B ||
+            !Enum.IsDefined(typeof(DungeonKeyKind), door.Lock)) throw new InvalidDataException("Invalid saved dungeon door.");
+        foreach (var chain in g.chains) foreach (int room in chain) if (room < 0 || room >= n) throw new InvalidDataException("Invalid saved dungeon chain.");
+    }
+}

@@ -1,0 +1,85 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+// Called once for each generated chunk. Decoration has its own seed, separate from WFC and loot.
+public sealed class OverworldDecorationSpawner : MonoBehaviour
+{
+    [SerializeField] GameObject[] grassPrefabs, sandPrefabs;
+    [SerializeField, Range(0, 1)] float grassPatchChance = .32f, sandPatchChance = .18f;
+    [SerializeField, Min(0)] int maxDecorationsPerChunk = 48;
+    [SerializeField] Vector2 scaleRange = new Vector2(.75f, 1.25f);
+
+    public void SpawnChunk(Vector2Int chunk, int[,] cells, int seed, float tileSize, Transform parent)
+    {
+        if (maxDecorationsPerChunk <= 0) return;
+        var random = new System.Random(unchecked(seed ^ chunk.x * 486187739 ^ chunk.y * 16777619 ^ 58471));
+        int size = cells.GetLength(0);
+        Vector3 origin = new Vector3(chunk.x * size * tileSize, 0, chunk.y * size * tileSize);
+        var ground = new Dictionary<Vector2Int, TerrainCollider>();
+        foreach (var terrain in ChunkSpawnUtility.GetOwnedTerrain(parent))
+        {
+            Vector3 p = terrain.transform.position - origin;
+            ground[new Vector2Int(Mathf.RoundToInt(p.x / tileSize), Mathf.RoundToInt(p.z / tileSize))] = terrain;
+        }
+        var occupied = new List<Bounds>();
+        foreach (var collider in parent.GetComponentsInChildren<Collider>())
+        {
+            if (collider is TerrainCollider || !collider.enabled) continue;
+            var bounds = collider.bounds; bounds.Expand(2);
+            occupied.Add(bounds);
+        }
+        // Keep an open area around conversations, healing spots and entrances, including triggers.
+        foreach (var npc in parent.GetComponentsInChildren<NPCBase>()) occupied.Add(new Bounds(npc.transform.position, Vector3.one * 6));
+        foreach (var entrance in parent.GetComponentsInChildren<DungeonEntrance>()) occupied.Add(new Bounds(entrance.transform.position, Vector3.one * 8));
+        foreach (var healing in parent.GetComponentsInChildren<HealingSpot>()) occupied.Add(new Bounds(healing.transform.position, Vector3.one * 6));
+
+        var order = new List<Vector2Int>();
+        for (int x = 0; x < size; x++) for (int z = 0; z < size; z++) order.Add(new Vector2Int(x, z));
+        for (int i = order.Count - 1; i > 0; i--)
+        { int j = random.Next(i + 1); var cell = order[i]; order[i] = order[j]; order[j] = cell; }
+
+        int spawned = 0;
+        var placed = new List<Vector3>();
+        float noiseOffset = (seed & 65535) * .013f;
+        foreach (var cell in order)
+        {
+            int type = cells[cell.x, cell.y];
+            var prefabs = type == 0 ? grassPrefabs : type == 2 ? sandPrefabs : null;
+            if (prefabs == null || prefabs.Length == 0) continue;
+            Vector3 centre = origin + new Vector3((cell.x + .5f) * tileSize, 0, (cell.y + .5f) * tileSize);
+            float noise = Mathf.PerlinNoise(centre.x * .025f + noiseOffset, centre.z * .025f + 37);
+            float chance = (type == 0 ? grassPatchChance : sandPatchChance) * Mathf.Lerp(.3f, 1.7f, noise);
+            if (random.NextDouble() >= chance) continue;
+            centre += new Vector3(Range(random, -tileSize * .25f, tileSize * .25f), 0, Range(random, -tileSize * .25f, tileSize * .25f));
+            int count = type == 0 ? random.Next(2, 5) : random.Next(1, 3);
+            for (int i = 0; i < count && spawned < maxDecorationsPerChunk; i++)
+            {
+                Vector3 position = centre + new Vector3(Range(random, -2, 2), 0, Range(random, -2, 2));
+                Vector3 local = position - origin;
+                if (local.x < 1 || local.z < 1 || local.x > size * tileSize - 1 || local.z > size * tileSize - 1) continue;
+                var at = new Vector2Int(Mathf.FloorToInt(local.x / tileSize), Mathf.FloorToInt(local.z / tileSize));
+                if (cells[at.x, at.y] != type || !ground.TryGetValue(at, out var terrain)) continue;
+                // The whole small patch must stay on its assigned terrain, including the shoreline edge.
+                int left = Mathf.FloorToInt((local.x - .9f) / tileSize), right = Mathf.FloorToInt((local.x + .9f) / tileSize);
+                int bottom = Mathf.FloorToInt((local.z - .9f) / tileSize), top = Mathf.FloorToInt((local.z + .9f) / tileSize);
+                if (cells[left, bottom] != type || cells[left, top] != type || cells[right, bottom] != type || cells[right, top] != type) continue;
+                var world = WFCWorldManager.Instance;
+                if (world != null && (world.GetTerrainAt(position) != type || world.GetTerrainBlend(position).y > .15f)) continue;
+                bool blocked = false;
+                foreach (var bounds in occupied)
+                    if (position.x >= bounds.min.x && position.x <= bounds.max.x && position.z >= bounds.min.z && position.z <= bounds.max.z) { blocked = true; break; }
+                foreach (var p in placed) if ((p - position).sqrMagnitude < .7f * .7f) { blocked = true; break; }
+                if (blocked || !terrain.Raycast(new Ray(position + Vector3.up * 1000, Vector3.down), out var hit, 2000) || hit.normal.y < .7f) continue;
+                var prefab = prefabs[random.Next(prefabs.Length)];
+                if (prefab == null) continue;
+                var rotation = Quaternion.FromToRotation(Vector3.up, hit.normal) * Quaternion.Euler(0, Range(random, 0, 360), 0);
+                var decoration = Instantiate(prefab, hit.point, rotation, parent);
+                decoration.transform.localScale *= Range(random, scaleRange.x, scaleRange.y);
+                var marker = decoration.AddComponent<GeneratedResourceMarker>(); marker.IsDecoration = true;
+                placed.Add(position); spawned++;
+            }
+            if (spawned >= maxDecorationsPerChunk) break;
+        }
+    }
+    static float Range(System.Random random, float min, float max) => Mathf.Lerp(min, max, (float)random.NextDouble());
+}

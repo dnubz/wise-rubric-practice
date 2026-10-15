@@ -1,0 +1,27 @@
+using UnityEngine;
+using TMPro;
+
+public class FPS : MonoBehaviour
+{
+    [SerializeField] private TMP_Text currentFPSText;
+
+    private void Start()
+    {
+        QualitySettings.vSyncCount = 0;
+        SetTargetFPS(PlayerPrefs.GetInt("TargetFPS", 60));
+    }
+
+    public void SetFPS30() => SetTargetFPS(30);
+    public void SetFPS60() => SetTargetFPS(60);
+    public void SetFPS120() => SetTargetFPS(120);
+
+    public void SetTargetFPS(int target)
+    {
+        Application.targetFrameRate = target;
+        QualitySettings.vSyncCount = 0;
+        PlayerPrefs.SetInt("TargetFPS", target); PlayerPrefs.Save();
+
+        if (currentFPSText != null)
+            currentFPSText.text = target.ToString();
+    }
+}

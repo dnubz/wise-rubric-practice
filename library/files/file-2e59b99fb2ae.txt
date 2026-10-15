@@ -1,0 +1,119 @@
+using System;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[InitializeOnLoad]
+public static class MarioIdleSetup
+{
+    const string ModelPath = "Assets/Imported Assets/MarioN64/MarioSmoothed.fbx";
+    const string ControllerPath = "Assets/Animations/MarioIdle.controller";
+    const string Folder = "Temp/PinkMario";
+    static double nextCheck;
+    static MarioIdleSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.timeSinceStartup < nextCheck || EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        nextCheck = EditorApplication.timeSinceStartup + 1;
+        string action = File.Exists(Folder + "/idle.request") ? "idle" : "idle-preview";
+        if (!File.Exists(Folder + "/" + action + ".request")) return;
+        File.Delete(Folder + "/" + action + ".request");
+        try
+        {
+            if (action == "idle") Build(); else Preview();
+            File.WriteAllText(Folder + "/" + action + "-result.txt", "PASS: Mario has a valid humanoid avatar and loops the existing Idle animation with root motion disabled.");
+        }
+        catch (Exception error) { File.WriteAllText(Folder + "/" + action + "-result.txt", error.ToString()); Debug.LogException(error); }
+    }
+
+    [MenuItem("WiSe/Set Up Mario Idle Animation")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder);
+        var importer = (ModelImporter)AssetImporter.GetAtPath(ModelPath);
+        var model = AssetDatabase.LoadAssetAtPath<GameObject>(ModelPath);
+        // Map Mario's existing bones so the project's humanoid animations can be reused.
+        string[,] mapping = {
+            { "Hips", "Hip" }, { "Spine", "SpineM" }, { "Neck", "Neck" }, { "Head", "HeadJoin" },
+            { "LeftUpperLeg", "L_Thigh" }, { "LeftLowerLeg", "L_Knee" }, { "LeftFoot", "L_Ankle" }, { "LeftToes", "L_Foot" },
+            { "RightUpperLeg", "R_Thigh" }, { "RightLowerLeg", "R_Knee" }, { "RightFoot", "R_Ankle" }, { "RightToes", "R_Foot" },
+            { "LeftShoulder", "L_clav" }, { "LeftUpperArm", "L_Shold" }, { "LeftLowerArm", "L_Elb" }, { "LeftHand", "L_Wrist" },
+            { "RightShoulder", "R_clav" }, { "RightUpperArm", "R_Shold" }, { "RightLowerArm", "R_Elb" }, { "RightHand", "R_Wrist" }
+        };
+        var transforms = model.GetComponentsInChildren<Transform>(true);
+        var human = new HumanBone[mapping.GetLength(0)];
+        for (int i = 0; i < human.Length; i++)
+        {
+            if (!transforms.Any(t => t.name == mapping[i, 1])) throw new InvalidOperationException("Missing Mario bone: " + mapping[i, 1]);
+            human[i] = new HumanBone { humanName = mapping[i, 0], boneName = mapping[i, 1], limit = new HumanLimit { useDefaultValues = true } };
+        }
+        var description = importer.humanDescription;
+        description.human = human;
+        description.skeleton = transforms.Select(t => new SkeletonBone { name = t.name, position = t.localPosition, rotation = t.localRotation, scale = t.localScale }).ToArray();
+        importer.animationType = ModelImporterAnimationType.Human;
+        importer.avatarSetup = ModelImporterAvatarSetup.CreateFromThisModel;
+        importer.humanDescription = description;
+        importer.importCameras = false; importer.importLights = false;
+        importer.SaveAndReimport();
+        var avatar = AssetDatabase.LoadAllAssetsAtPath(ModelPath).OfType<Avatar>().FirstOrDefault();
+        if (avatar == null || !avatar.isValid || !avatar.isHuman) throw new InvalidOperationException("Mario's humanoid avatar is invalid.");
+        var clip = AssetDatabase.LoadAllAssetsAtPath("Assets/Blink/Art/Animations/Movement/Idle.fbx").OfType<AnimationClip>().First(c => c.name == "Idle");
+        if (!clip.isHumanMotion) throw new InvalidOperationException("The existing Idle clip is not humanoid.");
+        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(ControllerPath);
+        if (controller == null) controller = AnimatorController.CreateAnimatorControllerAtPath(ControllerPath);
+        var machine = controller.layers[0].stateMachine;
+        var state = machine.states.Select(s => s.state).FirstOrDefault(s => s.name == "Idle") ?? machine.AddState("Idle");
+        state.motion = clip; machine.defaultState = state;
+        EditorUtility.SetDirty(controller); AssetDatabase.SaveAssets();
+        var prefab = PrefabUtility.LoadPrefabContents(PinkMarioSetup.MarioPath);
+        try { AssignAnimator(prefab); PrefabUtility.SaveAsPrefabAsset(prefab, PinkMarioSetup.MarioPath); }
+        finally { PrefabUtility.UnloadPrefabContents(prefab); }
+    }
+
+    public static void AssignAnimator(GameObject model)
+    {
+        var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(ControllerPath);
+        if (controller == null) return;
+        var animator = model.GetComponent<Animator>();
+        if (animator == null) animator = model.AddComponent<Animator>();
+        animator.avatar = AssetDatabase.LoadAllAssetsAtPath(ModelPath).OfType<Avatar>().First(a => a.isHuman && a.isValid);
+        animator.runtimeAnimatorController = controller;
+        animator.applyRootMotion = false;
+        animator.cullingMode = AnimatorCullingMode.CullUpdateTransforms;
+        animator.enabled = true;
+    }
+
+    static void Preview()
+    {
+        var scene = SceneManager.GetSceneByPath("Assets/Scenes/GameScene.unity");
+        var stage = scene.GetRootGameObjects().First(r => r.name == "PinkStage");
+        var model = stage.transform.Find("PinkModel").gameObject;
+        var animator = model.GetComponent<Animator>();
+        if (animator == null || !animator.enabled || animator.runtimeAnimatorController == null || animator.applyRootMotion)
+            throw new InvalidOperationException("The rhythm preview is missing Mario's idle animator.");
+        var clip = animator.runtimeAnimatorController.animationClips.First();
+        var camera = stage.GetComponentInChildren<Camera>(true);
+        bool active = stage.activeSelf;
+        var previous = RenderTexture.active;
+        var image = new Texture2D(camera.targetTexture.width, camera.targetTexture.height, TextureFormat.RGBA32, false);
+        try
+        {
+            stage.SetActive(true); AnimationMode.StartAnimationMode();
+            for (int i = 0; i < 3; i++)
+            {
+                AnimationMode.BeginSampling(); AnimationMode.SampleAnimationClip(model, clip, .2f + i * .5f); AnimationMode.EndSampling();
+                camera.Render(); RenderTexture.active = camera.targetTexture;
+                image.ReadPixels(new Rect(0, 0, image.width, image.height), 0, 0); image.Apply();
+                File.WriteAllBytes(Folder + "/mario-idle-" + i + ".png", image.EncodeToPNG());
+            }
+        }
+        finally
+        {
+            AnimationMode.StopAnimationMode(); stage.SetActive(active); RenderTexture.active = previous;
+            UnityEngine.Object.DestroyImmediate(image);
+        }
+    }
+}

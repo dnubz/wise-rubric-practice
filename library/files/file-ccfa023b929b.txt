@@ -1,0 +1,33 @@
+using UnityEngine;
+
+public sealed class EnemySpawner : MonoBehaviour
+{
+    public BattleSettings settings;
+    [Range(0, 1)] public float chance = .35f;
+    public void SpawnChunk(Vector2Int coord, Vector3 centre, int seed, Transform parent)
+    {
+        if (settings == null || settings.enemies == null || settings.enemies.Length < 2) return;
+        var random = new System.Random(unchecked(seed ^ coord.x * 15731 ^ coord.y * 789221 ^ 0x454E454D));
+        if (random.NextDouble() > chance) return;
+        string id = "world:" + seed + ":" + coord.x + ":" + coord.y;
+        if (BattleSession.Instance != null && BattleSession.Instance.IsDefeated(id)) return;
+        var terrain = ChunkSpawnUtility.GetOwnedTerrain(parent);
+        for (int attempt = 0; attempt < 24; attempt++)
+        {
+            float offset = ChunkSpawnUtility.ChunkWidth * .25f;
+            if (!ChunkSpawnUtility.TryGetGround(terrain, centre.x + ((float)random.NextDouble() * 2 - 1) * offset,
+                centre.z + ((float)random.NextDouble() * 2 - 1) * offset, true, out var point)) continue;
+            // Proximity to a moving player must not change enemy placement or species.
+            bool blocked = false;
+            foreach (var collider in Physics.OverlapCapsule(point + Vector3.up, point + Vector3.up * 2.2f,
+                         .6f, 1 << 0, QueryTriggerInteraction.Ignore))
+                if (ChunkSpawnUtility.IsOwnedObstacle(collider, parent)) { blocked = true; break; }
+            if (blocked) continue;
+            var source = settings.enemies[random.Next(settings.enemies.Length)];
+            var enemy = Instantiate(source.prefab, point, Quaternion.identity, parent);
+            var unit = enemy.GetComponent<BattleUnit>(); unit.enabled = false; enemy.GetComponent<UnityEngine.AI.NavMeshAgent>().enabled = false;
+            var encounter = enemy.GetComponent<EncounterEnemy>(); encounter.enabled = true; encounter.Configure(source, id);
+            return;
+        }
+    }
+}

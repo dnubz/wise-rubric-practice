@@ -1,0 +1,311 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+/// <summary>
+/// Lightweight, player-centered overworld minimap. It samples the same seeded WFC
+/// rules as the world generator and redraws only when the player enters another tile.
+/// </summary>
+[DisallowMultipleComponent]
+public sealed class OverworldMinimap : MonoBehaviour
+{
+    [Header("Display")]
+    [SerializeField, Min(3)] private int mapSize = 9;
+    [SerializeField, Min(1)] private int pixelsPerTile = 12;
+    [SerializeField] private Transform target;
+    [SerializeField] private InputActionReference toggleMap;
+    [SerializeField] private RawImage mapDisplay;
+    [SerializeField] private CanvasGroup mapPanel;
+    [SerializeField] private CameraController cameraController;
+    [SerializeField] private Transform rotationSource;
+    [SerializeField, Min(0.1f)] private float minMapZoom = 0.45f;
+    [SerializeField, Min(0.1f)] private float maxMapZoom = 2.5f;
+    [SerializeField, Min(0.01f)] private float zoomPerWheelStep = 0.15f;
+
+    [Header("Terrain colors")]
+    [SerializeField] private Color grassColor = new Color(0.31f, 0.56f, 0.28f);
+    [SerializeField] private Color waterColor = new Color(0.2f, 0.52f, 0.79f);
+    [SerializeField] private Color sandColor = new Color(0.83f, 0.72f, 0.43f);
+    [SerializeField] private Color rockColor = new Color(0.48f, 0.49f, 0.52f);
+    [SerializeField] private Color playerColor = new Color(1f, 0.25f, 0.18f);
+
+    private RawImage mapImage;
+    private Texture2D mapTexture;
+    private Color32[] pixels;
+    private InputSystem_Actions inputActions;
+    private Vector2Int lastTile = new Vector2Int(int.MinValue, int.MinValue);
+    private int lastSeed = int.MinValue;
+    private bool usingGeneratedToggle;
+    private RectTransform mapRectTransform;
+    private Canvas mapCanvas;
+    private float mapZoom = 1f;
+    private InputAction minimapZoomAction;
+    private float lastMapRotation = float.NaN;
+    private bool hasScrollFocus;
+
+    private void Awake()
+    {
+        mapImage = mapDisplay != null ? mapDisplay : GetComponent<RawImage>();
+        if (mapImage != null)
+        {
+            mapRectTransform = mapImage.rectTransform;
+            mapCanvas = mapImage.GetComponentInParent<Canvas>();
+        }
+        if (mapPanel == null)
+            mapPanel = GetComponent<CanvasGroup>();
+        if (cameraController == null)
+            cameraController = FindFirstObjectByType<CameraController>();
+        if (mapImage == null)
+            Debug.LogError("OverworldMinimap requires a RawImage to display the map.", this);
+        mapSize = Mathf.Max(3, mapSize);
+        pixelsPerTile = Mathf.Max(1, pixelsPerTile);
+
+        int textureSize = mapSize * pixelsPerTile;
+        mapTexture = new Texture2D(textureSize, textureSize, TextureFormat.RGBA32, false)
+        {
+            name = "Overworld Minimap",
+            filterMode = FilterMode.Bilinear,
+            wrapMode = TextureWrapMode.Clamp
+        };
+        pixels = new Color32[textureSize * textureSize];
+        if (mapImage != null)
+            mapImage.texture = mapTexture;
+
+        if (target == null)
+            target = CharacterSwitchManager.CurrentCharacterTransform;
+        if (target == null)
+            target = FindFirstObjectByType<CharacterMovement>()?.transform;
+    }
+
+    private void OnEnable()
+    {
+        CharacterSwitchManager.OnActiveCharacterChanged += SetTarget;
+        minimapZoomAction = new InputAction(
+            "Minimap Zoom", InputActionType.Value, "<Mouse>/scroll");
+        minimapZoomAction.performed += OnMinimapZoom;
+        minimapZoomAction.Enable();
+
+        if (toggleMap != null && toggleMap.action != null)
+        {
+            toggleMap.action.Enable();
+            toggleMap.action.performed += ToggleMap;
+        }
+        else
+        {
+            inputActions = new InputSystem_Actions();
+            InputAction mapAction = inputActions.Player.Map;
+            if (mapAction != null)
+                mapAction.performed += ToggleMap;
+            inputActions.Enable();
+            usingGeneratedToggle = true;
+        }
+    }
+
+    private void OnDisable()
+    {
+        CharacterSwitchManager.OnActiveCharacterChanged -= SetTarget;
+        SetScrollFocus(false);
+
+        if (minimapZoomAction != null)
+        {
+            minimapZoomAction.performed -= OnMinimapZoom;
+            minimapZoomAction.Disable();
+            minimapZoomAction.Dispose();
+            minimapZoomAction = null;
+        }
+
+        if (toggleMap != null && toggleMap.action != null)
+        {
+            toggleMap.action.performed -= ToggleMap;
+        }
+        else if (usingGeneratedToggle && inputActions != null)
+        {
+            InputAction mapAction = inputActions.Player.Map;
+            if (mapAction != null)
+                mapAction.performed -= ToggleMap;
+            inputActions.Disable();
+            inputActions.Dispose();
+            inputActions = null;
+            usingGeneratedToggle = false;
+        }
+    }
+
+    private void OnDestroy()
+    {
+        if (mapTexture != null)
+            Destroy(mapTexture);
+    }
+
+    private void LateUpdate()
+    {
+        UpdateMapRotation();
+        UpdateScrollFocus();
+
+        if (target == null)
+            target = CharacterSwitchManager.CurrentCharacterTransform;
+
+        WFCWorldManager world = WFCWorldManager.Instance;
+        if (target == null || world == null)
+            return;
+
+        float tileSize = Mathf.Max(0.01f, world.TileSize);
+        Vector2Int currentTile = new Vector2Int(
+            Mathf.FloorToInt(target.position.x / tileSize),
+            Mathf.FloorToInt(target.position.z / tileSize));
+
+        if (currentTile == lastTile && world.WorldSeed == lastSeed)
+            return;
+
+        lastTile = currentTile;
+        lastSeed = world.WorldSeed;
+        Redraw(world, currentTile);
+    }
+
+    private void UpdateScrollFocus()
+    {
+        bool overMap = false;
+        Mouse mouse = Mouse.current;
+        bool visible = mapPanel == null || mapPanel.alpha > 0f;
+
+        if (visible && mouse != null && mapRectTransform != null && mapImage.enabled)
+        {
+            Camera canvasCamera = mapCanvas != null &&
+                mapCanvas.renderMode != RenderMode.ScreenSpaceOverlay
+                ? mapCanvas.worldCamera
+                : null;
+            overMap = RectTransformUtility.RectangleContainsScreenPoint(
+                mapRectTransform, mouse.position.ReadValue(), canvasCamera);
+        }
+
+        SetScrollFocus(overMap);
+    }
+
+    private void SetScrollFocus(bool focused)
+    {
+        if (hasScrollFocus == focused)
+            return;
+
+        hasScrollFocus = focused;
+        if (cameraController != null)
+            cameraController.SetMinimapScrollFocus(focused);
+    }
+
+    private void OnMinimapZoom(InputAction.CallbackContext context)
+    {
+        if (CheatConsole.BlocksGameplayInput) return;
+        if (!hasScrollFocus || mapRectTransform == null)
+            return;
+
+        float scroll = context.ReadValue<Vector2>().y;
+        if (Mathf.Approximately(scroll, 0f))
+            return;
+
+        float zoomFactor = 1f + zoomPerWheelStep;
+        mapZoom = Mathf.Clamp(
+            mapZoom * Mathf.Pow(zoomFactor, Mathf.Sign(scroll)),
+            minMapZoom,
+            maxMapZoom);
+
+        // A higher zoom factor shows fewer terrain tiles while the UI image
+        // retains its layout size and scale.
+        lastTile = new Vector2Int(int.MinValue, int.MinValue);
+    }
+
+    private void UpdateMapRotation()
+    {
+        if (mapRectTransform == null)
+            return;
+
+        Transform source = rotationSource;
+        if (source == null && cameraController != null)
+            source = cameraController.ActiveCamera != null
+                ? cameraController.ActiveCamera.transform
+                : null;
+        if (source == null)
+            return;
+
+        Vector3 forward = source.forward;
+        forward.y = 0f;
+        if (forward.sqrMagnitude < 0.0001f)
+            return;
+
+        forward.Normalize();
+        float cameraYaw = Mathf.Atan2(forward.x, forward.z) * Mathf.Rad2Deg;
+        if (Mathf.Abs(Mathf.DeltaAngle(lastMapRotation, cameraYaw)) < 0.1f)
+            return;
+
+        lastMapRotation = cameraYaw;
+        mapRectTransform.localRotation = Quaternion.Euler(0f, 0f, cameraYaw);
+    }
+
+    private void Redraw(WFCWorldManager world, Vector2Int playerTile)
+    {
+        int pixelWidth = mapSize * pixelsPerTile;
+        int visibleTileCount = GetVisibleTileCount();
+        float worldWidth = visibleTileCount * world.TileSize;
+        float centreX = (playerTile.x + 0.5f) * world.TileSize;
+        float centreZ = (playerTile.y + 0.5f) * world.TileSize;
+
+        for (int z = 0; z < pixelWidth; z++)
+        {
+            for (int x = 0; x < pixelWidth; x++)
+            {
+                Vector4 blend = world.GetTerrainBlend(new Vector3(
+                    centreX + ((x + 0.5f) / pixelWidth - 0.5f) * worldWidth,
+                    0f,
+                    centreZ + ((z + 0.5f) / pixelWidth - 0.5f) * worldWidth));
+                pixels[z * pixelWidth + x] = grassColor * blend.x + waterColor * blend.y +
+                    sandColor * blend.z + rockColor * blend.w;
+            }
+        }
+
+        // Draw the player's position as a compact diamond at the center of the map.
+        int center = pixelWidth / 2;
+        Color32 marker = playerColor;
+        SetPixel(center, center, marker, pixelWidth);
+        SetPixel(center - 1, center, marker, pixelWidth);
+        SetPixel(center + 1, center, marker, pixelWidth);
+        SetPixel(center, center - 1, marker, pixelWidth);
+        SetPixel(center, center + 1, marker, pixelWidth);
+
+        mapTexture.SetPixels32(pixels);
+        mapTexture.Apply(false, false);
+    }
+
+    private int GetVisibleTileCount()
+    {
+        int visibleTiles = Mathf.Max(3, Mathf.RoundToInt(mapSize / mapZoom));
+        if ((visibleTiles & 1) == 0)
+            visibleTiles += mapZoom < 1f ? 1 : -1;
+
+        return Mathf.Max(3, visibleTiles);
+    }
+
+    private void SetPixel(int x, int y, Color32 color, int width)
+    {
+        if (x >= 0 && x < width && y >= 0 && y < width)
+            pixels[y * width + x] = color;
+    }
+
+    private void ToggleMap(InputAction.CallbackContext context)
+    {
+        if (CheatConsole.BlocksGameplayInput) return;
+        if (mapPanel != null)
+        {
+            bool visible = mapPanel.alpha <= 0f;
+            mapPanel.alpha = visible ? 1f : 0f;
+            mapPanel.interactable = visible;
+            mapPanel.blocksRaycasts = visible;
+        }
+        else if (mapImage != null)
+        {
+            mapImage.enabled = !mapImage.enabled;
+        }
+    }
+
+    private void SetTarget(Transform newTarget)
+    {
+        target = newTarget;
+        lastTile = new Vector2Int(int.MinValue, int.MinValue);
+    }
+}

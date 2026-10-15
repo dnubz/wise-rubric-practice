@@ -1,0 +1,27 @@
+using UnityEngine;
+
+public class InventoryTest : MonoBehaviour
+{
+    [SerializeField] private Consumable healthPotion;
+
+    // Test items are only added manually from this component's context menu.
+    [ContextMenu("Add 5 Health Potions (Debug)")]
+    private void AddTestPotions()
+    {
+        Inventory inventory = GetComponent<Inventory>();
+        if (inventory == null || healthPotion == null) return;
+
+        inventory.AddItem(healthPotion);
+        inventory.AddItem(healthPotion);
+        inventory.AddItem(healthPotion);
+        inventory.AddItem(healthPotion);
+        inventory.AddItem(healthPotion);
+
+        Debug.Log("Added 5 Health Potions.");
+
+        foreach (InventorySlot slot in inventory.Slots)
+        {
+            Debug.Log($"Item: {slot.Item.ItemName}");
+        }
+    }
+}

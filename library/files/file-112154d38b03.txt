@@ -1,0 +1,201 @@
+using System;
+using System.IO;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class InteractionPromptSetup
+{
+    const string Folder = "Temp/InteractionPrompts";
+    static double next;
+    static InteractionPromptSetup() => EditorApplication.update += Check;
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < next) return;
+        next = EditorApplication.timeSinceStartup + 1;
+        bool cliffOnly = File.Exists(Folder + "/cliff.request");
+        bool overlayOnly = File.Exists(Folder + "/overlay.request");
+        if (!cliffOnly && !overlayOnly && !File.Exists(Folder + "/build.request")) return;
+        if (EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = false; return; }
+        File.Delete(Folder + "/build.request");
+        if (cliffOnly) File.Delete(Folder + "/cliff.request");
+        if (overlayOnly) File.Delete(Folder + "/overlay.request");
+        try { if (cliffOnly) { AssetDatabase.Refresh(); BuildCliff(); } else if (overlayOnly) { AssetDatabase.Refresh(); BuildOverlay(); } else Build(); File.WriteAllText(Folder + "/build-result.txt", "PASS: saved interaction prompt assets."); }
+        catch (Exception e) { File.WriteAllText(Folder + "/build-result.txt", "FAIL: " + e); Debug.LogException(e); }
+    }
+    [MenuItem("WiSe/UI/Set Up Sprite Interaction Prompts")]
+    public static void Build()
+    {
+        Directory.CreateDirectory("Assets/Resources/Interaction");
+        AssetDatabase.Refresh();
+        const string art = "Assets/UI/Interaction/InteractF.png";
+        var importer = (TextureImporter)AssetImporter.GetAtPath(art);
+        importer.textureType = TextureImporterType.Sprite;
+        importer.spriteImportMode = SpriteImportMode.Single;
+        importer.alphaIsTransparency = true; importer.mipmapEnabled = false;
+        importer.filterMode = FilterMode.Point;
+        importer.textureCompression = TextureImporterCompression.Uncompressed;
+        importer.spritePixelsPerUnit = 100; importer.maxTextureSize = 2048;
+        importer.SaveAndReimport();
+        Sprite sprite = AssetDatabase.LoadAssetAtPath<Sprite>(art);
+        var root = new GameObject("WorldInteractionPrompt", typeof(RectTransform), typeof(Canvas));
+        try
+        {
+            root.layer = 5;
+            var rect = (RectTransform)root.transform; rect.sizeDelta = new Vector2(100, 100);
+            var canvas = root.GetComponent<Canvas>(); canvas.renderMode = RenderMode.WorldSpace;
+            canvas.overrideSorting = true; canvas.sortingOrder = 45;
+            var controller = root.AddComponent<WorldInteractionPrompt>();
+            var icon = Rect("F Bubble Sprite", root.transform, new Vector2(100, 100), Vector2.zero).gameObject.AddComponent<Image>();
+            icon.sprite = sprite; icon.preserveAspect = true; icon.raycastTarget = false;
+            var text = Rect("Action", root.transform, new Vector2(240, 32), new Vector2(0, -57)).gameObject.AddComponent<TextMeshProUGUI>();
+            text.font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>("Assets/Fonts/MedievalSharp/MedievalSharp-Regular SDF.asset");
+            text.text = "Open chest"; text.fontSize = 20; text.color = Color.white;
+            text.alignment = TextAlignmentOptions.Center; text.raycastTarget = false;
+            text.enableAutoSizing = true; text.fontSizeMin = 14; text.fontSizeMax = 20;
+            text.outlineWidth = .18f; text.outlineColor = Color.black;
+            Set(controller, "bubble", icon); Set(controller, "caption", text);
+            PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Interaction/WorldInteractionPrompt.prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+        BuildOverlay();
+        BuildCliff();
+        foreach (string path in new[] { "Assets/Prefabs/UI/SpeechBubbleCanvas.prefab", "Assets/Prefabs/Berdly.prefab", "Assets/Prefabs/Pink.prefab", "Assets/Prefabs/MARI2.prefab", "Assets/Prefabs/character_rogue.prefab", "Assets/Resources/Dungeon/DungeonGuideNPC.prefab", "Assets/Resources/Dungeon/DungeonFriendlyNPC.prefab" })
+        {
+            if (!File.Exists(path)) continue;
+            var npc = PrefabUtility.LoadPrefabContents(path);
+            try
+            {
+                foreach (var bubble in npc.GetComponentsInChildren<NPCSpeechBubble>(true))
+                {
+                    var fields = new SerializedObject(bubble);
+                    var prompt = fields.FindProperty("interactPrompt").objectReferenceValue as GameObject;
+                    if (prompt == null) continue;
+                    foreach (var label in prompt.GetComponentsInChildren<TextMeshProUGUI>(true)) label.gameObject.SetActive(false);
+                    var icon = prompt.GetComponent<Image>() ?? prompt.AddComponent<Image>();
+                    icon.sprite = sprite; icon.color = Color.white; icon.type = Image.Type.Simple;
+                    icon.preserveAspect = true; icon.raycastTarget = false;
+                    var rect = (RectTransform)prompt.transform;
+                    rect.sizeDelta = new Vector2(72, 72); rect.anchoredPosition = new Vector2(155, -110);
+                }
+                PrefabUtility.SaveAsPrefabAsset(npc, path);
+            }
+            finally { PrefabUtility.UnloadPrefabContents(npc); }
+        }
+        AssetDatabase.SaveAssets();
+    }
+    static RectTransform Rect(string name, Transform parent, Vector2 size, Vector2 position)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.layer = 5;
+        var rect = (RectTransform)obj.transform; rect.SetParent(parent, false);
+        rect.sizeDelta = size; rect.anchoredPosition = position; return rect;
+    }
+    static void Set(Object component, string field, Object value)
+    {
+        var data = new SerializedObject(component); data.FindProperty(field).objectReferenceValue = value;
+        data.ApplyModifiedPropertiesWithoutUndo();
+    }
+    static void BuildOverlay()
+    {
+        var source = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/Resources/Interaction/WorldInteractionPrompt.prefab");
+        var root = Object.Instantiate(source); root.name = "WorldInteractionPromptOverlay";
+        try
+        {
+            var canvas = root.GetComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay; canvas.sortingOrder = 60;
+            var marker = Rect("Doorway Marker", root.transform, new Vector2(100, 100), Vector2.zero);
+            var controller = root.GetComponent<WorldInteractionPrompt>();
+            foreach (var graphic in root.GetComponentsInChildren<Graphic>(true)) graphic.transform.SetParent(marker, false);
+            Set(controller, "overlayAnchor", marker);
+            var data = new SerializedObject(controller); data.FindProperty("screenHeight").floatValue = 64f;
+            data.ApplyModifiedPropertiesWithoutUndo();
+            PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Interaction/WorldInteractionPromptOverlay.prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static void BuildCliff()
+    {
+        var rock = AssetDatabase.LoadAssetAtPath<GameObject>("Assets/GameReady3D/Stylized_Rocks_and Cactus/Built-in/Prefabs/SM_Rock_3.prefab");
+        if (rock == null) throw new Exception("Existing rock prefab missing.");
+        var root = new GameObject("PoolGlideCliff");
+        try
+        {
+            var cliff = root.AddComponent<PoolGlideCliff>();
+            var material = AssetDatabase.LoadAssetAtPath<Material>("Assets/Resources/Interaction/CliffStone.mat");
+            if (material == null)
+            {
+                material = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+                material.SetColor("_BaseColor", new Color(.24f, .28f, .29f));
+                material.SetFloat("_Smoothness", .08f);
+                AssetDatabase.CreateAsset(material, "Assets/Resources/Interaction/CliffStone.mat");
+            }
+            // 4.6 m is below Druid's 5 m jump apex. The narrow summit and
+            // 25 m water gap prevent the other characters' normal jump reaching it.
+            var island = Cube("Central Rock Ledge", root.transform, new Vector3(0, .8f, 0), new Vector3(4.2f, 7.6f, 4.2f), material);
+            var landing = island.GetComponent<BoxCollider>();
+            island.GetComponent<Renderer>().enabled = false;
+            var summit = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            summit.name = "Flat Stone Summit"; summit.transform.SetParent(root.transform, false);
+            summit.transform.localPosition = new Vector3(0, 4.45f, 0);
+            summit.transform.localScale = new Vector3(6, .15f, 6);
+            summit.GetComponent<Renderer>().sharedMaterial = material;
+            Object.DestroyImmediate(summit.GetComponent<Collider>());
+            var solidTop = summit.AddComponent<MeshCollider>();
+            solidTop.sharedMesh = summit.GetComponent<MeshFilter>().sharedMesh; solidTop.convex = true;
+            // Existing authored rocks conceal the support; no shore ramp or raft.
+            for (int i = 0; i < 4; i++)
+            {
+                Vector3 desired = Quaternion.Euler(0, i * 90, 0) * new Vector3(0, 0, 1.4f);
+                desired.y = .65f;
+                var model = AddRock(rock, root.transform, desired, 5, 7.6f, material);
+                model.transform.Rotate(0, i * 90, 0, Space.World);
+            }
+            Set(cliff, "landing", landing);
+            PrefabUtility.SaveAsPrefabAsset(root, "Assets/Resources/Interaction/PoolGlideCliff.prefab");
+        }
+        finally { Object.DestroyImmediate(root); }
+    }
+    static GameObject AddRock(GameObject rock, Transform parent, Vector3 centre, float width, float height, Material material)
+    {
+        var model = (GameObject)PrefabUtility.InstantiatePrefab(rock);
+        PrefabUtility.UnpackPrefabInstance(model, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
+        model.transform.SetParent(parent, false);
+        foreach (var collider in model.GetComponentsInChildren<Collider>(true)) Object.DestroyImmediate(collider);
+        foreach (var lod in model.GetComponentsInChildren<LODGroup>(true)) Object.DestroyImmediate(lod);
+        var renderers = model.GetComponentsInChildren<MeshRenderer>(true);
+        foreach (var renderer in renderers)
+        {
+            renderer.gameObject.SetActive(renderer == renderers[0]);
+            renderer.enabled = true;
+            var materials = renderer.sharedMaterials;
+            for (int i = 0; i < materials.Length; i++) materials[i] = material;
+            renderer.sharedMaterials = materials;
+        }
+        if (!BoundsFor(model, out Bounds b)) throw new Exception("Rock mesh has no visible bounds.");
+        float factor = width / Mathf.Max(.01f, Mathf.Max(b.size.x, b.size.z));
+        model.transform.localScale *= factor;
+        var scale = model.transform.localScale; scale.y *= height / Mathf.Max(.01f, b.size.y * factor); model.transform.localScale = scale;
+        BoundsFor(model, out b);
+        model.transform.position += parent.TransformPoint(centre) - b.center;
+        return model;
+    }
+    static bool BoundsFor(GameObject obj, out Bounds bounds)
+    {
+        bounds = default; bool found = false;
+        foreach (var renderer in obj.GetComponentsInChildren<Renderer>())
+        {
+            if (!(renderer is MeshRenderer || renderer is SkinnedMeshRenderer)) continue;
+            if (!found) { bounds = renderer.bounds; found = true; } else bounds.Encapsulate(renderer.bounds);
+        }
+        return found;
+    }
+    static GameObject Cube(string name, Transform parent, Vector3 position, Vector3 size, Material material)
+    {
+        var obj = GameObject.CreatePrimitive(PrimitiveType.Cube); obj.name = name;
+        obj.transform.SetParent(parent, false); obj.transform.localPosition = position; obj.transform.localScale = size;
+        obj.GetComponent<Renderer>().sharedMaterial = material; return obj;
+    }
+}

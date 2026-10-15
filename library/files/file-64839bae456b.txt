@@ -1,0 +1,182 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using TMPro;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+[InitializeOnLoad]
+public static class ConsumableMenuChecks
+{
+    const string Folder = "Temp/ConsumableMenu";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static IEnumerator routine;
+    static double resume;
+    static string relevantError;
+    static ConsumableMenuChecks() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.timeSinceStartup < resume) return;
+        if (routine == null)
+        {
+            if (!File.Exists(Folder + "/check.request")) return;
+            if (!EditorApplication.isPlayingOrWillChangePlaymode) { EditorApplication.isPlaying = true; return; }
+            if (!EditorApplication.isPlaying || Time.timeSinceLevelLoad < 3) return;
+            File.Delete(Folder + "/check.request"); relevantError = null;
+            Application.logMessageReceived += CaptureError; routine = Run();
+        }
+        try
+        {
+            if (routine.MoveNext()) { resume = EditorApplication.timeSinceStartup + (routine.Current is float seconds ? seconds : .1f); return; }
+            ((IDisposable)routine).Dispose(); routine = null;
+            Require(relevantError == null, relevantError);
+            File.WriteAllText(Folder + "/check-result.txt", "PASS: 0/1/3/5 owned types produce exactly 0/1/3/5 centered buttons with accurate quantities, including nonadjacent potion types. Regular potions heal/consume once and do not revive. Diamond fully revives HP/SP, is not wasted on full characters, disappears after its last use, and is never purchasable even if added to a shop. Overworld weighted loot has a rare Diamond entry; dungeon chests award the rare item once and honor the configured chance. Saved UI renders captured for 1/3/5 types.");
+        }
+        catch (Exception error)
+        {
+            ((IDisposable)routine)?.Dispose(); routine = null;
+            File.WriteAllText(Folder + "/check-result.txt", error.ToString());
+        }
+        if (routine == null) { Application.logMessageReceived -= CaptureError; EditorApplication.isPlaying = false; }
+    }
+
+    static IEnumerator Run()
+    {
+        foreach (var npc in Object.FindObjectsByType<NPCBase>(FindObjectsSortMode.None)) npc.enabled = false;
+        var ui = Object.FindAnyObjectByType<InventoryUI>(FindObjectsInactive.Include);
+        var inventory = Field<Inventory>(ui, "playerInventory");
+        var originals = inventory.Slots.Select(s => s.Item).ToArray();
+        var characters = Field<CharacterBase[]>(ui, "characters");
+        var hp = characters.Select(c => c.GetCurrHP()).ToArray(); var sp = characters.Select(c => c.GetCurrSP()).ToArray();
+        var wallet = PlayerInventory.Instance; int gold = wallet.Gold;
+        var owned = new GameObject("ConsumableChecks"); owned.transform.position = Vector3.one * 10000;
+        var settings = Object.Instantiate(Resources.Load<DungeonSettings>("Dungeon/Settings"));
+        var shopFixture = ScriptableObject.CreateInstance<ShopInventory>();
+        var chestFixture = ScriptableObject.CreateInstance<LootTable>();
+        try
+        {
+            var toggle = Object.FindAnyObjectByType<MenuToggle>(); var menu = Field<GameObject>(toggle, "menuUI");
+            menu.SetActive(true); var tabs = toggle.GetComponent<MenuTabManager>();
+            int itemsTab = Field<List<MenuTabManager.TabEntry>>(tabs, "tabs").FindIndex(t => t.panel != null && ui.transform.IsChildOf(t.panel.transform));
+            Require(itemsTab >= 0, "Items panel is not in the menu tabs."); tabs.SwitchToTab(itemsTab); yield return .2f;
+            var slots = Field<ItemSlotUI[]>(ui, "itemSlots");
+            Require(slots.Length == 5 && slots.All(s => s != null && s.Item is Consumable), "Five saved consumable buttons are required.");
+            var items = slots.Select(s => (Consumable)s.Item).ToArray(); var diamond = items.Single(c => c.RevivesAndFullRestore);
+            Require(diamond.Cost == 0 && diamond.Icon != null, "Diamond needs its icon, revive effect and zero shop cost.");
+            var row = (RectTransform)slots[0].transform.parent;
+            Require(row.GetComponent<HorizontalLayoutGroup>() != null, "Saved layout group is missing.");
+            ClearConsumables(inventory);
+            foreach (int count in new[] { 0, 1, 3, 5 })
+            {
+                ClearConsumables(inventory);
+                int[] indices = count == 3 ? new[] { 0, 2, 4 } : Enumerable.Range(0, count).ToArray();
+                foreach (int i in indices) for (int q = 0; q <= i; q++) inventory.AddItem(items[i]);
+                yield return .15f;
+                Require(slots.Count(s => s.gameObject.activeSelf) == count, "Owned type count is not reflected immediately: " + count);
+                Canvas.ForceUpdateCanvases(); LayoutRebuilder.ForceRebuildLayoutImmediate(row);
+                var visible = slots.Where(s => s.gameObject.activeSelf).ToArray();
+                foreach (var slot in visible) Require(slot.GetComponentInChildren<TMP_Text>().text == inventory.GetItemCount(slot.Item).ToString(), "Wrong item quantity.");
+                if (count > 0)
+                {
+                    var first = (RectTransform)visible.First().transform; var last = (RectTransform)visible.Last().transform;
+                    Require(Mathf.Abs(first.localPosition.x + first.rect.xMin + last.localPosition.x + last.rect.xMax) < 1, "Item row is not centered.");
+                    for (int i = 1; i < visible.Length; i++) Require(visible[i].transform.localPosition.x > visible[i - 1].transform.localPosition.x, "Item order overlaps.");
+                    Capture(ui.GetComponentInParent<Canvas>(), count + "-types");
+                }
+            }
+            var target = characters[0]; var potion = items.First(c => c.HealAmount > 0 && !c.RevivesAndFullRestore);
+            target.SetCurrentHP(0); ui.ShowItemDetails(potion); int potions = inventory.GetItemCount(potion); ui.UseOnCharacter(0);
+            Require(target.IsDead() && inventory.GetItemCount(potion) == potions, "A regular potion revives or is wasted on a dead character.");
+            target.SetCurrentHP(target.GetMaxHP() - potion.HealAmount); ui.UseOnCharacter(0);
+            Require(target.GetCurrHP() == target.GetMaxHP() && inventory.GetItemCount(potion) == potions - 1, "Potion use did not heal and consume exactly one.");
+            target.Heal(target.GetMaxHP()); target.RestoreSP(target.GetMaxSP()); ui.ShowItemDetails(diamond);
+            int diamonds = inventory.GetItemCount(diamond); ui.UseOnCharacter(0);
+            Require(inventory.GetItemCount(diamond) == diamonds, "Diamond is wasted on a fully restored character.");
+            inventory.RemoveAll(diamond); inventory.AddItem(diamond);
+            slots.Single(s => s.Item == diamond).GetComponent<Button>().onClick.Invoke();
+            target.SetCurrentHP(0); typeof(CharacterBase).GetField("currSP", Private).SetValue(target, 0);
+            ui.UseOnCharacter(0);
+            Require(!target.IsDead() && target.GetCurrHP() == target.GetMaxHP() && target.GetCurrSP() == target.GetMaxSP(), "Diamond did not fully revive HP and SP.");
+            Require(inventory.GetItemCount(diamond) == 0 && !slots.Single(s => s.Item == diamond).gameObject.activeSelf && Field<TMP_Text>(ui, "titleText").text == "-", "Last Diamond remains visible or selected.");
+            menu.SetActive(false); menu.SetActive(true); tabs.SwitchToTab(itemsTab); yield return .1f;
+            Require(!slots.Single(s => s.Item == diamond).gameObject.activeSelf, "Used Diamond reappears when opening the menu.");
+
+            var shop = Object.FindAnyObjectByType<ShopUI>(FindObjectsInactive.Include);
+            shopFixture.items.Add(new ShopEntry { item = diamond }); shop.OpenShop(shopFixture);
+            shop.BuyItem(0); shop.BuySelectedItem();
+            Require(wallet.Gold == gold && inventory.GetItemCount(diamond) == 0 && Field<List<ShopItemButtonUI>>(shop, "spawnedButtons").Count == 0, "Diamond can be purchased or appears in shops.");
+            shop.CloseShop();
+            foreach (string guid in AssetDatabase.FindAssets("t:ShopInventory")) Require(AssetDatabase.LoadAssetAtPath<ShopInventory>(AssetDatabase.GUIDToAssetPath(guid)).items.All(e => e == null || e.item != diamond), "Diamond is assigned to a shop asset.");
+
+            var table = AssetDatabase.LoadAssetAtPath<LootTable>("Assets/OverworldChestLootTable.asset");
+            float chance = (float)table.Entries.Single(e => e.Item == diamond).Weight / table.Entries.Sum(e => e.Weight);
+            Require(chance > 0 && chance < .03f && Mathf.Approximately(settings.diamondChestChance, .025f) && settings.diamondChestLoot == diamond, "Diamond is not configured as rare chest loot.");
+            // A forced Diamond roll tests the existing chest path and repeat-open protection.
+            typeof(LootTable).GetField("entries", Private).SetValue(chestFixture, new List<LootEntry> { new LootEntry(diamond, 1) });
+            var chestObject = new GameObject("Overworld chest fixture"); chestObject.transform.SetParent(owned.transform); var chest = chestObject.AddComponent<Chest>();
+            typeof(Chest).GetField("lootTable", Private).SetValue(chest, chestFixture); chest.OpenChest(); chest.OpenChest();
+            Require(inventory.GetItemCount(diamond) == 1, "Overworld chest does not award Diamond exactly once."); inventory.RemoveAll(diamond);
+            var dungeon = owned.AddComponent<DungeonGenerator>(); dungeon.enabled = false;
+            typeof(DungeonGenerator).GetField("settings", Private).SetValue(dungeon, settings);
+            typeof(DungeonGenerator).GetField("contentRandom", Private).SetValue(dungeon, new System.Random(12));
+            var interactionType = typeof(DungeonGenerator).GetNestedType("Interaction", BindingFlags.NonPublic);
+            var kind = typeof(DungeonGenerator).GetNestedType("InteractionKind", BindingFlags.NonPublic);
+            settings.diamondChestChance = 1;
+            object interaction = Activator.CreateInstance(interactionType);
+            interactionType.GetField("Kind").SetValue(interaction, Enum.Parse(kind, "Treasure"));
+            interactionType.GetField("Lid").SetValue(interaction, owned.transform);
+            var interact = typeof(DungeonGenerator).GetMethod("Interact", Private); interact.Invoke(dungeon, new[] { interaction }); interact.Invoke(dungeon, new[] { interaction });
+            Require(inventory.GetItemCount(diamond) == 1 && wallet.Gold == gold + 50, "Dungeon chest awards repeatedly or misses Diamond."); inventory.RemoveAll(diamond);
+            settings.diamondChestChance = 0; interaction = Activator.CreateInstance(interactionType);
+            interactionType.GetField("Kind").SetValue(interaction, Enum.Parse(kind, "Treasure")); interactionType.GetField("Lid").SetValue(interaction, owned.transform);
+            interact.Invoke(dungeon, new[] { interaction }); Require(inventory.GetItemCount(diamond) == 0, "Dungeon ignores zero drop chance.");
+            yield return .1f;
+        }
+        finally
+        {
+            foreach (var item in inventory.Slots.Select(s => s.Item).Distinct().ToArray()) inventory.RemoveAll(item);
+            foreach (var item in originals) inventory.AddItem(item);
+            for (int i = 0; i < characters.Length; i++) { characters[i].SetCurrentHP(hp[i]); typeof(CharacterBase).GetField("currSP", Private).SetValue(characters[i], sp[i]); }
+            wallet.SetGold(gold); Object.Destroy(owned); Object.Destroy(settings); Object.Destroy(shopFixture); Object.Destroy(chestFixture);
+        }
+    }
+
+    static void ClearConsumables(Inventory inventory)
+    {
+        foreach (var item in inventory.Slots.Select(s => s.Item).OfType<Consumable>().Distinct().ToArray()) inventory.RemoveAll(item);
+    }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static void CaptureError(string message, string stack, LogType type)
+    {
+        if ((type == LogType.Exception || type == LogType.Error || type == LogType.Assert) && (stack.Contains("InventoryUI") || stack.Contains("ItemSlotUI") || stack.Contains("Consumable") || stack.Contains("DungeonGenerator"))) relevantError = message + "\n" + stack;
+    }
+    static void Capture(Canvas canvas, string name)
+    {
+        var root = canvas.transform; var parent = root.parent; int sibling = root.GetSiblingIndex();
+        var mode = canvas.renderMode; var worldCamera = canvas.worldCamera;
+        var transforms = root.GetComponentsInChildren<Transform>(true); var layers = transforms.Select(t => t.gameObject.layer).ToArray();
+        var owned = new GameObject("ConsumablePreviewCamera"); var camera = owned.AddComponent<Camera>(); var target = new RenderTexture(1280, 720, 24);
+        var pixels = new Texture2D(1280, 720, TextureFormat.RGB24, false); var previous = RenderTexture.active;
+        try
+        {
+            root.SetParent(null, false); camera.targetTexture = target; camera.cullingMask = 1 << 30;
+            camera.clearFlags = CameraClearFlags.SolidColor; camera.backgroundColor = new Color(.015f, .035f, .08f);
+            canvas.renderMode = RenderMode.ScreenSpaceCamera; canvas.worldCamera = camera; canvas.planeDistance = 1;
+            foreach (var child in transforms) child.gameObject.layer = 30;
+            Canvas.ForceUpdateCanvases(); camera.Render(); RenderTexture.active = target;
+            pixels.ReadPixels(new Rect(0, 0, 1280, 720), 0, 0); pixels.Apply(); File.WriteAllBytes(Folder + "/" + name + ".png", pixels.EncodeToPNG());
+        }
+        finally
+        {
+            root.SetParent(parent, false); root.SetSiblingIndex(sibling); canvas.renderMode = mode; canvas.worldCamera = worldCamera;
+            for (int i = 0; i < transforms.Length; i++) transforms[i].gameObject.layer = layers[i];
+            RenderTexture.active = previous; Object.DestroyImmediate(owned); Object.DestroyImmediate(target); Object.DestroyImmediate(pixels);
+        }
+    }
+    static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
+}

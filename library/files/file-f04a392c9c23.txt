@@ -1,0 +1,223 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// Singleton that holds the player's shared gold and consumable item bag.
+/// Persists across scene loads (DontDestroyOnLoad).
+///
+/// Usage from any script:
+///   PlayerInventory.Instance.AddGold(50);
+///   PlayerInventory.Instance.SpendGold(10);
+///   PlayerInventory.Instance.AddItem(myConsumable);
+///   PlayerInventory.Instance.UseConsumable(myConsumable, activeCharacter);
+/// </summary>
+public class PlayerInventory : MonoBehaviour
+{
+    // ── Singleton ─────────────────────────────────────────────────────────────
+    private static PlayerInventory instance;
+    private static bool isQuitting = false;
+
+    /// <summary>Checks whether a valid instance currently exists without creating a new one.</summary>
+    public static bool HasInstance => instance != null && !isQuitting;
+
+    public static PlayerInventory Instance
+    {
+        get
+        {
+            if (isQuitting) return null;
+
+            if (instance == null)
+            {
+                instance = FindFirstObjectByType<PlayerInventory>();
+                if (instance == null && !isQuitting)
+                {
+                    GameObject go = new GameObject("PlayerInventory");
+                    instance = go.AddComponent<PlayerInventory>();
+                }
+            }
+            return instance;
+        }
+    }
+
+    // ── Gold ──────────────────────────────────────────────────────────────────
+    [Header("Currency")]
+    [Tooltip("Starting gold amount.")]
+    [SerializeField] private int startingGold = 0;
+
+    private int gold;
+
+    /// <summary>Current gold the player holds.</summary>
+    public int Gold => gold;
+
+    // ── Item Bag (Consumables only) ───────────────────────────────────────────
+    // Equipment is managed separately via CharacterBase.Equip().
+    private readonly List<Consumable> consumables = new List<Consumable>();
+
+    /// <summary>Read-only view of consumables in the bag.</summary>
+    public IReadOnlyList<Consumable> Consumables => consumables;
+
+    // ── Events (UI can subscribe to these) ───────────────────────────────────
+    public event System.Action<int> OnGoldChanged;        // passes new gold amount
+    public event System.Action OnInventoryChanged;   // bag contents changed
+
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private void Awake()
+    {
+        isQuitting = false;
+
+        // Enforce singleton
+        if (instance != null && instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+
+        instance = this;
+        DontDestroyOnLoad(gameObject);
+
+        gold = startingGold;
+    }
+
+    private void OnApplicationQuit()
+    {
+        isQuitting = true;
+    }
+
+    private void OnDestroy()
+    {
+        if (instance == this)
+        {
+            instance = null;
+        }
+    }
+
+    // ── Gold Methods ──────────────────────────────────────────────────────────
+
+    /// <summary>Adds gold to the wallet. Amount must be positive.</summary>
+    public void AddGold(int amount)
+    {
+        if (amount <= 0) return;
+        gold += amount;
+        OnGoldChanged?.Invoke(gold);
+        Debug.Log($"[PlayerInventory] +{amount} Gold → Total: {gold}");
+    }
+
+    /// <summary>
+    /// Attempts to spend gold. Returns true and deducts if the player can afford it.
+    /// Returns false and does nothing if insufficient funds.
+    /// </summary>
+    public bool SpendGold(int amount)
+    {
+        if (amount <= 0) return true;
+
+        if (gold < amount)
+        {
+            Debug.Log($"[PlayerInventory] Not enough gold! Need {amount}, have {gold}.");
+            return false;
+        }
+
+        gold -= amount;
+        OnGoldChanged?.Invoke(gold);
+        Debug.Log($"[PlayerInventory] -{amount} Gold → Total: {gold}");
+        return true;
+    }
+
+    /// <summary>Returns true if the player can afford the given cost.</summary>
+    public bool CanAfford(int cost) => gold >= cost;
+
+    /// <summary>Sets the gold amount directly (e.g. from saved player data).</summary>
+    public void SetGold(int amount)
+    {
+        gold = Mathf.Max(0, amount);
+        OnGoldChanged?.Invoke(gold);
+        Debug.Log($"[PlayerInventory] Gold set to: {gold}");
+    }
+
+    // ── Item Methods ──────────────────────────────────────────────────────────
+
+    /// <summary>Adds an item to the bag and syncs with scene Inventory for UI display.</summary>
+    public void AddItem(Item item)
+    {
+        if (item == null) return;
+
+        if (item is Consumable consumable)
+        {
+            consumables.Add(consumable);
+            OnInventoryChanged?.Invoke();
+        }
+
+        // Also add to active scene Inventory so InventoryUI / EquipmentUI automatically reflect it
+        Inventory sceneInventory = FindFirstObjectByType<Inventory>();
+        if (sceneInventory != null)
+        {
+            sceneInventory.AddItem(item);
+        }
+
+        // Immediately update any active InventoryUI
+        InventoryUI invUI = FindFirstObjectByType<InventoryUI>(FindObjectsInactive.Include);
+        if (invUI != null)
+        {
+            invUI.RefreshUI();
+        }
+
+        Debug.Log($"[PlayerInventory] Added '{item.ItemName}' to inventory. Total in scene: {(sceneInventory != null ? sceneInventory.GetItemCount(item) : 0)}");
+    }
+
+    /// <summary>Adds a consumable to the bag (forwards to AddItem(Item)).</summary>
+    public void AddItem(Consumable item) => AddItem((Item)item);
+
+    /// <summary>
+    /// Uses a consumable on the given character, then removes it from the bag.
+    /// Returns false if the item is not in the bag or character is null.
+    /// </summary>
+    public bool UseConsumable(Consumable item, CharacterBase character)
+    {
+        if (item == null || character == null) return false;
+
+        int idx = consumables.IndexOf(item);
+        if (idx < 0)
+        {
+            Debug.LogWarning($"[PlayerInventory] Tried to use '{item.ItemName}' but it's not in the bag.");
+            return false;
+        }
+
+        item.Use(character);
+        consumables.RemoveAt(idx);
+        OnInventoryChanged?.Invoke();
+        return true;
+    }
+
+    /// <summary>Returns how many of a specific consumable are in the bag.</summary>
+    public int CountOf(Consumable item)
+    {
+        if (item == null) return 0;
+        int count = 0;
+        foreach (var c in consumables)
+        {
+            if (c == item || (c != null && c.ItemName == item.ItemName))
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>Returns true if the bag contains at least one of this item.</summary>
+    public bool HasItem(Consumable item) => CountOf(item) > 0;
+
+    public void ClearItems() { consumables.Clear(); OnInventoryChanged?.Invoke(); }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
+    [ContextMenu("Debug: Print Inventory")]
+    private void DebugPrint()
+    {
+        Debug.Log($"[PlayerInventory] Gold: {gold}");
+        if (consumables.Count == 0)
+        {
+            Debug.Log("[PlayerInventory] Bag is empty.");
+            return;
+        }
+        for (int i = 0; i < consumables.Count; i++)
+            Debug.Log($"  [{i}] {consumables[i]?.ItemName ?? "null"}");
+    }
+}

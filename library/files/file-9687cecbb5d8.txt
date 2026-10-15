@@ -1,0 +1,8 @@
+using UnityEngine;
+
+/// <summary>
+/// Legacy wrapper for backwards compatibility. Please use BuildingSpawner instead.
+/// </summary>
+public class DungeonSpawner : BuildingSpawner
+{
+}

@@ -1,0 +1,18 @@
+using UnityEngine;
+
+public sealed class GameplayHudVisibility : MonoBehaviour
+{
+    [SerializeField] private GameObject experienceHud;
+    [SerializeField] private GameObject minimap;
+    [SerializeField] private GameObject portraitHud;
+
+    private void Awake()
+    {
+        if (experienceHud != null)
+            experienceHud.SetActive(true);
+        if (minimap != null)
+            minimap.SetActive(true);
+        if (portraitHud != null)
+            portraitHud.SetActive(true);
+    }
+}

@@ -1,0 +1,348 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using TMPro;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+
+[InitializeOnLoad]
+public static class GameMenuSetup
+{
+    const string Folder = "Temp/GameMenu";
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    static TextMeshProUGUI textTemplate;
+    static Button buttonTemplate;
+    static Sprite rounded, outline;
+    static readonly Color Blue = new Color(.14f, .25f, .53f), Gold = new Color(1, .69f, .13f);
+    static GameMenuSetup() { EditorApplication.update += Check; }
+    static void Check()
+    {
+        if (EditorApplication.isCompiling || EditorApplication.isUpdating || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        if (File.Exists(Folder + "/polish.request"))
+        {
+            File.Delete(Folder + "/polish.request");
+            try { Polish(); File.WriteAllText(Folder + "/polish-result.txt", "PASS: saved tab fonts match Items; resource rows have no missing-icon placeholders; slider handles fit their rows."); }
+            catch (Exception error) { File.WriteAllText(Folder + "/polish-result.txt", error.ToString()); }
+        }
+        if (File.Exists(Folder + "/setup.request"))
+        {
+            File.Delete(Folder + "/setup.request");
+            try { Build(); File.WriteAllText(Folder + "/setup-result.txt", "PASS: six menu tabs wired; Resources/Stats/Settings/Quit saved in the hierarchy using the existing menu style; music/SFX mixer and save/continue references assigned."); }
+            catch (Exception error) { File.WriteAllText(Folder + "/setup-result.txt", error.ToString()); }
+        }
+        if (File.Exists(Folder + "/audio.request"))
+        {
+            File.Delete(Folder + "/audio.request");
+            try
+            {
+                const string path = "Assets/Resources/Audio/GameAudio.mixer";
+                var mixer = AssetDatabase.LoadAssetAtPath<UnityEngine.Audio.AudioMixer>(path);
+                var type = typeof(Editor).Assembly.GetType("UnityEditor.Audio.AudioMixerController");
+                if (mixer == null) mixer = (UnityEngine.Audio.AudioMixer)type.GetMethod("CreateMixerControllerAtPath", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic).Invoke(null, new object[] { path });
+                var group = type.GetProperty("masterGroup").GetValue(mixer);
+                var text = new StringBuilder();
+                foreach (var method in group.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(m => m.Name.Contains("GUID") || m.Name.Contains("children"))) text.AppendLine(method.ToString());
+                foreach (var prop in type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(p => p.Name.Contains("exposed") || p.Name.Contains("master"))) text.AppendLine(prop.ToString());
+                var fields = new SerializedObject(mixer); var iterator = fields.GetIterator();
+                while (iterator.Next(true)) text.AppendLine(iterator.propertyPath + " " + iterator.propertyType);
+                fields = new SerializedObject((UnityEngine.Object)group); iterator = fields.GetIterator();
+                while (iterator.Next(true)) text.AppendLine("GROUP " + iterator.propertyPath + " " + iterator.propertyType);
+                AssetDatabase.SaveAssets(); File.WriteAllText(Folder + "/audio-result.txt", text.ToString());
+            }
+            catch (Exception error) { File.WriteAllText(Folder + "/audio-result.txt", error.ToString()); }
+        }
+        if (File.Exists(Folder + "/inspect.request"))
+        {
+            File.Delete(Folder + "/inspect.request");
+            try
+            {
+                var scene = SceneManager.GetSceneByName("GameScene");
+                var ui = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<InventoryUI>(true)).Single();
+                var toggle = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<MenuToggle>(true)).Single();
+                var menu = (GameObject)typeof(MenuToggle).GetField("menuUI", Private).GetValue(toggle);
+                var text = new StringBuilder();
+                foreach (var t in menu.GetComponentsInChildren<RectTransform>(true))
+                {
+                    string path = t.name; for (var p = t.parent; p != menu.transform && p != null; p = p.parent) path = p.name + "/" + path;
+                    text.AppendLine(path + " size=" + t.rect.size + " position=" + t.anchoredPosition + " components=" + string.Join(",", t.GetComponents<Component>().Select(c => c.GetType().Name)));
+                }
+                var avatarButtons = (Button[])typeof(InventoryUI).GetField("avatarButtons", Private).GetValue(ui);
+                text.AppendLine("Avatars: " + string.Join(",", avatarButtons.Select(b => b.name + " parent=" + b.transform.parent.name)));
+                var type = typeof(Editor).Assembly.GetType("UnityEditor.Audio.AudioMixerController");
+                text.AppendLine("Mixer type: " + type);
+                if (type != null) foreach (var m in type.GetMethods(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(m => m.Name.Contains("Create") || m.Name.Contains("Expose"))) text.AppendLine(m.ToString());
+                File.WriteAllText(Folder + "/inspect-result.txt", text.ToString());
+            }
+            catch (Exception error) { File.WriteAllText(Folder + "/inspect-result.txt", error.ToString()); }
+        }
+    }
+
+    [MenuItem("WiSe/UI/Set Up Other Game Menu Tabs")]
+    public static void Build()
+    {
+        Directory.CreateDirectory(Folder); SetupMixer();
+        var scene = SceneManager.GetSceneByName("GameScene");
+        var ui = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<InventoryUI>(true)).Single();
+        var toggle = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<MenuToggle>(true)).Single();
+        var tabs = toggle.GetComponent<MenuTabManager>(); var menu = Field<GameObject>(toggle, "menuUI");
+        textTemplate = Field<TextMeshProUGUI>(ui, "titleText");
+        var oldTabs = Field<System.Collections.Generic.List<MenuTabManager.TabEntry>>(tabs, "tabs");
+        buttonTemplate = oldTabs[0].tabButton;
+        var navigation = buttonTemplate.transform.parent.GetComponentsInChildren<Button>(true).OrderByDescending(b => ((RectTransform)b.transform).anchoredPosition.y).ToArray();
+        if (navigation.Length != 6) throw new InvalidOperationException("Expected the six existing navigation buttons.");
+        rounded = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Rounded.png");
+        outline = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/Outline.png");
+        var sourcePanel = (RectTransform)ui.transform.Find("Panel");
+        string[] names = { "Items", "Equipment", "Resources", "Stats", "Settings", "Quit" };
+        var panels = new GameObject[6]; panels[0] = ui.gameObject; panels[1] = oldTabs[1].panel;
+        for (int i = 2; i < 6; i++)
+        {
+            var existing = ui.transform.parent.Find(names[i] + "Panel");
+            if (existing != null) throw new InvalidOperationException(names[i] + "Panel already exists; edit its saved UI directly.");
+            var body = UnityEngine.Object.Instantiate(sourcePanel, ui.transform.parent); body.name = names[i] + "Panel";
+            foreach (Transform child in body.Cast<Transform>().ToArray()) if (child.name != "Border") UnityEngine.Object.DestroyImmediate(child.gameObject);
+            panels[i] = body.gameObject;
+        }
+        var inventory = Field<Inventory>(ui, "playerInventory"); var characters = Field<CharacterBase[]>(ui, "characters");
+        var saveObject = new GameObject("GameSaveManager"); SceneManager.MoveGameObjectToScene(saveObject, scene);
+        var save = saveObject.AddComponent<GameSave>(); var saveFields = new SerializedObject(save);
+        var catalog = AssetDatabase.LoadAssetAtPath<SaveItemCatalog>("Assets/Resources/Save/ItemCatalog.asset");
+        if (catalog == null) { Directory.CreateDirectory("Assets/Resources/Save"); catalog = ScriptableObject.CreateInstance<SaveItemCatalog>(); AssetDatabase.CreateAsset(catalog, "Assets/Resources/Save/ItemCatalog.asset"); }
+        catalog.items = AssetDatabase.FindAssets("t:Item").Select(g => AssetDatabase.LoadAssetAtPath<Item>(AssetDatabase.GUIDToAssetPath(g))).Where(item => item != null)
+            .OrderBy(item => AssetDatabase.GetAssetPath(item).StartsWith("Assets/Scripts/Inventory/Items/") ? 0 : 1).ToArray();
+        EditorUtility.SetDirty(catalog);
+        Assign(saveFields, "inventory", inventory); AssignArray(saveFields, "characters", characters);
+        Assign(saveFields, "switchManager", scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<CharacterSwitchManager>(true)).Single());
+        Assign(saveFields, "world", scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<WFCWorldManager>(true)).Single());
+        Assign(saveFields, "catalog", catalog); saveFields.ApplyModifiedPropertiesWithoutUndo();
+
+        BuildResources(panels[2], inventory); BuildStats(panels[3], ui, characters);
+        BuildSettings(panels[4]); BuildQuit(panels[5], menu, save);
+        var tabFields = new SerializedObject(tabs); var array = tabFields.FindProperty("tabs"); array.arraySize = 6;
+        for (int i = 0; i < 6; i++)
+        {
+            navigation[i].name = names[i] + "_Button";
+            var label = navigation[i].GetComponentInChildren<TextMeshProUGUI>(true); label.text = names[i];
+            if (i >= 2) CopyButtonFont(navigation[0].GetComponentInChildren<TextMeshProUGUI>(true), label);
+            var tab = array.GetArrayElementAtIndex(i); tab.FindPropertyRelative("tabName").stringValue = names[i];
+            tab.FindPropertyRelative("panel").objectReferenceValue = panels[i]; tab.FindPropertyRelative("tabButton").objectReferenceValue = navigation[i];
+            tab.FindPropertyRelative("tabButtonText").objectReferenceValue = label;
+            panels[i].SetActive(i == 0);
+        }
+        var coin = menu.GetComponentsInChildren<CoinUI>(true).FirstOrDefault(c => c.GetComponentInChildren<TextMeshProUGUI>(true) != null);
+        if (coin != null) tabFields.FindProperty("coinText").objectReferenceValue = coin.GetComponentInChildren<TextMeshProUGUI>(true);
+        tabFields.ApplyModifiedPropertiesWithoutUndo();
+        SaveFileSetup.FitNavigation(tabs);
+        BuildContinueButton(); AssetDatabase.SaveAssets(); EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+    }
+
+    static void BuildResources(GameObject root, Inventory inventory)
+    {
+        Label("Title", root.transform, 0, 335, 980, 64, "Field Resources", 46);
+        Label("Subtitle", root.transform, 0, 268, 960, 50, "Materials gathered by the whole party", 27);
+        string[] names = { "Wood", "Rock", "Cactus", "Mushroom" };
+        Color[] colors = { new Color(.85f, .52f, .26f), new Color(.73f, .83f, .87f), new Color(.35f, .83f, .47f), new Color(1, .49f, .74f) };
+        var resources = new ResourceItem[4]; var counts = new TMP_Text[4];
+        for (int i = 0; i < 4; i++)
+        {
+            float y = 148 - i * 133; var row = Box(names[i] + "Row", root.transform, 0, y, 950, 104, Blue, colors[i]);
+            resources[i] = AssetDatabase.LoadAssetAtPath<ResourceItem>("Assets/Scripts/Inventory/Items/Resource/" + names[i] + ".asset");
+            var label = Label("Name", row, -26, 0, 780, 76, names[i], 38); label.alignment = TextAlignmentOptions.MidlineLeft;
+            counts[i] = Label("Quantity", row, 391, 0, 104, 76, "0", 42); counts[i].color = colors[i];
+        }
+        var fields = new SerializedObject(root.AddComponent<ResourceMenuPanelUI>()); Assign(fields, "inventory", inventory);
+        AssignArray(fields, "resources", resources); AssignArray(fields, "quantities", counts); fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+
+    static void BuildStats(GameObject root, InventoryUI original, CharacterBase[] characters)
+    {
+        var buttons = new Button[3]; var hp = new Image[3]; var sp = new Image[3]; var hpText = new TMP_Text[3]; var spText = new TMP_Text[3];
+        var originalButtons = Field<Button[]>(original, "avatarButtons");
+        for (int i = 0; i < 3; i++)
+        {
+            buttons[i] = UnityEngine.Object.Instantiate(originalButtons[i], root.transform);
+            var rect = (RectTransform)buttons[i].transform; rect.anchoredPosition = new Vector2((i - 1) * 334, 243); rect.localScale = Vector3.one * .9f;
+            hp[i] = Map(originalButtons[i].transform, buttons[i].transform, Field<Image[]>(original, "hpBars")[i]);
+            sp[i] = Map(originalButtons[i].transform, buttons[i].transform, Field<Image[]>(original, "spBars")[i]);
+            hpText[i] = Map(originalButtons[i].transform, buttons[i].transform, Field<TextMeshProUGUI[]>(original, "hpTexts")[i]);
+            spText[i] = Map(originalButtons[i].transform, buttons[i].transform, Field<TextMeshProUGUI[]>(original, "spTexts")[i]);
+            Filled(hp[i]); Filled(sp[i]);
+        }
+        var fields = new SerializedObject(root.AddComponent<StatsMenuPanelUI>());
+        AssignArray(fields, "characters", characters); AssignArray(fields, "avatarButtons", buttons);
+        AssignArray(fields, "avatarHP", hp); AssignArray(fields, "avatarSP", sp); AssignArray(fields, "avatarHPText", hpText); AssignArray(fields, "avatarSPText", spText);
+        Assign(fields, "hudEvents", AssetDatabase.LoadAssetAtPath<CharacterHudEventChannel>(AssetDatabase.GUIDToAssetPath(AssetDatabase.FindAssets("t:CharacterHudEventChannel").First())));
+        var name = Label("CharacterName", root.transform, -270, 50, 470, 65, "WiSe", 46); name.alignment = TextAlignmentOptions.MidlineLeft; Assign(fields, "characterName", name);
+        var level = Label("Level", root.transform, -270, -17, 470, 45, "LV 1", 30); level.alignment = TextAlignmentOptions.MidlineLeft; level.color = Gold; Assign(fields, "level", level);
+        Bar(root.transform, "HP", -266, -102, 450, 44, new Color(.32f, .86f, .34f), out var hpFill, out var hpValue);
+        Bar(root.transform, "SP", -266, -167, 450, 44, new Color(.13f, .72f, .94f), out var spFill, out var spValue);
+        Label("ExpLabel", root.transform, -266, -239, 450, 40, "Experience", 26).alignment = TextAlignmentOptions.MidlineLeft;
+        Bar(root.transform, "EXP", -266, -290, 450, 33, Gold, out var expFill, out var expValue);
+        Assign(fields, "hpFill", hpFill); Assign(fields, "spFill", spFill); Assign(fields, "expFill", expFill);
+        Assign(fields, "hpText", hpValue); Assign(fields, "spText", spValue); Assign(fields, "expText", expValue);
+        string[] stats = { "ATK", "DEF", "CRIT" }; string[] fieldNames = { "attack", "defense", "crit" };
+        for (int i = 0; i < 3; i++)
+        {
+            var row = Box(stats[i] + "Row", root.transform, 260, 40 - i * 72, 450, 60, Blue, Color.white);
+            Label("Name", row, -110, 0, 200, 47, stats[i], 29).alignment = TextAlignmentOptions.MidlineLeft;
+            var value = Label("Value", row, 130, 0, 150, 47, "0", 32); value.alignment = TextAlignmentOptions.MidlineRight; Assign(fields, fieldNames[i], value);
+        }
+        var gear = new TMP_Text[2];
+        for (int i = 0; i < 2; i++) { var row = Box("Equipment" + (i + 1), root.transform, 260, -210 - i * 91, 450, 75, Blue, Color.white); gear[i] = Label("ItemName", row, 0, 0, 410, 61, "Empty", 29); }
+        AssignArray(fields, "equipment", gear); fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+
+    static void BuildSettings(GameObject root)
+    {
+        Label("Title", root.transform, 0, 328, 970, 70, "Audio Settings", 46);
+        Label("Subtitle", root.transform, 0, 255, 980, 50, "Changes apply immediately and are saved", 27);
+        var fields = new SerializedObject(root.AddComponent<GameAudioMenuUI>());
+        string[] names = { "Music", "Sound Effects" }; Color[] colors = { new Color(.22f, .75f, .97f), Gold };
+        for (int i = 0; i < 2; i++)
+        {
+            var row = Box(i == 0 ? "Music" : "SFX", root.transform, 0, 105 - i * 250, 945, 185, Blue, Color.white);
+            Label("Name", row, -130, 45, 590, 61, names[i], 38).alignment = TextAlignmentOptions.MidlineLeft;
+            var percent = Label("Percentage", row, 354, 45, 165, 61, "100%", 37); percent.color = colors[i];
+            var slider = Slider(row, colors[i]); Assign(fields, i == 0 ? "musicSlider" : "sfxSlider", slider); Assign(fields, i == 0 ? "musicPercent" : "sfxPercent", percent);
+        }
+        fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+
+    static void BuildQuit(GameObject root, GameObject menu, GameSave save)
+    {
+        Label("Title", root.transform, 0, 173, 990, 125, "Save and quit to the title?", 44);
+        var details = Label("Details", root.transform, 0, 55, 960, 75, "Your progress will be saved.", 28);
+        var keep = Action("KeepPlaying", root.transform, -248, -152, "Keep Playing"); var quit = Action("SaveAndQuit", root.transform, 248, -152, "Save & Quit");
+        var fields = new SerializedObject(root.AddComponent<QuitMenuUI>());
+        Assign(fields, "save", save); Assign(fields, "menuRoot", menu); Assign(fields, "details", details); Assign(fields, "keepPlaying", keep); Assign(fields, "saveAndQuit", quit); fields.ApplyModifiedPropertiesWithoutUndo();
+    }
+
+    static void BuildContinueButton()
+    {
+        var title = SceneManager.GetSceneByName("TitleScene"); bool opened = !title.IsValid() || !title.isLoaded;
+        if (opened) title = EditorSceneManager.OpenScene("Assets/Scenes/TitleScene.unity", OpenSceneMode.Additive);
+        try
+        {
+            var slots = title.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<SaveSlotUI>(true)).Single();
+            if (slots.saveSlots.GetComponentInChildren<ContinueSaveUI>(true) == null)
+            {
+                var button = Action("ContinueLastPlayed", slots.saveSlots.transform, 0, -424, "Continue Last Played");
+                var rect = (RectTransform)button.transform; rect.sizeDelta = new Vector2(560, 100);
+                var fields = new SerializedObject(button.gameObject.AddComponent<ContinueSaveUI>());
+                Assign(fields, "continueButton", button); Assign(fields, "label", button.GetComponentInChildren<TMP_Text>(true)); fields.ApplyModifiedPropertiesWithoutUndo();
+                SceneManager.MoveGameObjectToScene(button.transform.root.gameObject, title);
+            }
+            EditorSceneManager.MarkSceneDirty(title); EditorSceneManager.SaveScene(title);
+        }
+        finally { if (opened) EditorSceneManager.CloseScene(title, true); }
+    }
+
+    static void SetupMixer()
+    {
+        const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        var mixer = AssetDatabase.LoadAssetAtPath<UnityEngine.Audio.AudioMixer>("Assets/Resources/Audio/GameAudio.mixer");
+        var type = mixer.GetType(); var master = type.GetProperty("masterGroup", All).GetValue(mixer);
+        var childrenProperty = master.GetType().GetProperty("children", All); var groupType = childrenProperty.PropertyType.GetElementType();
+        var children = ((Array)childrenProperty.GetValue(master)).Cast<UnityEngine.Object>().ToList();
+        var exposedProperty = type.GetProperty("exposedParameters", All); var exposedType = exposedProperty.PropertyType.GetElementType();
+        var exposed = Array.CreateInstance(exposedType, 2); string[] names = { "Music", "SFX" };
+        for (int i = 0; i < 2; i++)
+        {
+            var group = children.FirstOrDefault(g => g.name == names[i]);
+            if (group == null) { group = (UnityEngine.Object)type.GetMethod("CreateNewGroup", All).Invoke(mixer, new object[] { names[i], false }); children.Add(group); }
+            var parameter = Activator.CreateInstance(exposedType);
+            exposedType.GetField("guid", All).SetValue(parameter, groupType.GetMethod("GetGUIDForVolume", All).Invoke(group, null));
+            exposedType.GetField("name", All).SetValue(parameter, names[i] == "Music" ? "MusicVolume" : "SFXVolume"); exposed.SetValue(parameter, i);
+        }
+        var groups = Array.CreateInstance(groupType, children.Count); for (int i = 0; i < children.Count; i++) groups.SetValue(children[i], i);
+        childrenProperty.SetValue(master, groups); exposedProperty.SetValue(mixer, exposed);
+        EditorUtility.SetDirty((UnityEngine.Object)master); EditorUtility.SetDirty(mixer); AssetDatabase.SaveAssets();
+    }
+
+    static RectTransform Rect(string name, Transform parent, float x, float y, float width, float height)
+    {
+        var obj = new GameObject(name, typeof(RectTransform)); obj.layer = 5; obj.transform.SetParent(parent, false);
+        var rect = (RectTransform)obj.transform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = new Vector2(x, y); rect.sizeDelta = new Vector2(width, height); return rect;
+    }
+    static Image Image(string name, Transform parent, float x, float y, float width, float height, Color color)
+    { var image = Rect(name, parent, x, y, width, height).gameObject.AddComponent<Image>(); image.color = color; image.raycastTarget = false; return image; }
+    static Transform Box(string name, Transform parent, float x, float y, float width, float height, Color color, Color border)
+    {
+        var image = Image(name, parent, x, y, width, height, color); image.sprite = rounded; image.type = UnityEngine.UI.Image.Type.Sliced;
+        var edge = Image("Border", image.transform, 0, 0, width, height, border); edge.sprite = outline; edge.type = UnityEngine.UI.Image.Type.Sliced; return image.transform;
+    }
+    static TextMeshProUGUI Label(string name, Transform parent, float x, float y, float width, float height, string value, float size)
+    {
+        var text = UnityEngine.Object.Instantiate(textTemplate, parent); text.name = name; text.gameObject.SetActive(true);
+        var rect = text.rectTransform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = new Vector2(x, y); rect.sizeDelta = new Vector2(width, height);
+        text.text = value; text.fontSize = text.fontSizeMax = size; text.fontSizeMin = 20; text.enableAutoSizing = true; text.color = Color.white;
+        text.alignment = TextAlignmentOptions.Center; text.raycastTarget = false; return text;
+    }
+    static Button Action(string name, Transform parent, float x, float y, string value)
+    {
+        var button = UnityEngine.Object.Instantiate(buttonTemplate, parent); button.name = name; button.gameObject.SetActive(true);
+        var rect = (RectTransform)button.transform; rect.anchorMin = rect.anchorMax = Vector2.one * .5f; rect.anchoredPosition = new Vector2(x, y); rect.sizeDelta = new Vector2(437, 116);
+        button.onClick = new Button.ButtonClickedEvent(); button.GetComponentInChildren<TMP_Text>(true).text = value; return button;
+    }
+    static void Filled(Image image)
+    {
+        if (image.sprite == null) image.sprite = AssetDatabase.LoadAssetAtPath<Sprite>("Assets/UI/DungeonEntry/White.png");
+        image.type = UnityEngine.UI.Image.Type.Filled; image.fillMethod = UnityEngine.UI.Image.FillMethod.Horizontal;
+        image.fillOrigin = (int)UnityEngine.UI.Image.OriginHorizontal.Left; image.fillAmount = 1;
+    }
+    static void Bar(Transform parent, string name, float x, float y, float width, float height, Color color, out Image fill, out TMP_Text value)
+    {
+        var bar = Box(name, parent, x, y, width, height, new Color(.09f, .16f, .33f), Color.white);
+        fill = Image("Fill", bar, 0, 0, width - 8, height - 8, color); fill.sprite = rounded; Filled(fill);
+        value = Label("Value", bar, 0, 0, width - 16, height, "0/0", 24);
+    }
+    static Slider Slider(Transform parent, Color color)
+    {
+        var root = Rect("Slider", parent, 0, -38, 815, 78); var track = Image("Background", root, 0, 0, 815, 20, new Color(.06f, .12f, .25f)); track.sprite = rounded;
+        var fillArea = Rect("FillArea", root, 0, 0, 779, 20); var fill = Image("Fill", fillArea, 0, 0, 779, 20, color); fill.sprite = rounded;
+        var fillRect = fill.rectTransform; fillRect.anchorMin = Vector2.zero; fillRect.anchorMax = Vector2.one; fillRect.offsetMin = fillRect.offsetMax = Vector2.zero;
+        var handleArea = Rect("HandleSlideArea", root, 0, 0, 779, 73); var handle = Image("Handle", handleArea, 0, 0, 36, 0, Color.white); handle.sprite = rounded; handle.raycastTarget = true;
+        var slider = root.gameObject.AddComponent<UnityEngine.UI.Slider>(); slider.fillRect = fillRect; slider.handleRect = handle.rectTransform; slider.targetGraphic = handle;
+        slider.minValue = 0; slider.maxValue = 1; slider.value = 1; return slider;
+    }
+    static T Map<T>(Transform source, Transform copy, T component) where T : Component
+    {
+        var indices = new System.Collections.Generic.Stack<int>(); for (var t = component.transform; t != source; t = t.parent) indices.Push(t.GetSiblingIndex());
+        foreach (int i in indices) copy = copy.GetChild(i); return copy.GetComponent<T>();
+    }
+    static T Field<T>(object owner, string name) => (T)owner.GetType().GetField(name, Private).GetValue(owner);
+    static void CopyButtonFont(TextMeshProUGUI source, TextMeshProUGUI target)
+    {
+        target.font = source.font; target.fontSharedMaterial = source.fontSharedMaterial;
+        target.fontSize = source.fontSize; target.fontSizeMax = source.fontSizeMax;
+        target.fontSizeMin = source.fontSizeMin; target.enableAutoSizing = source.enableAutoSizing;
+        target.fontStyle = source.fontStyle;
+    }
+    static void Polish()
+    {
+        var scene = SceneManager.GetSceneByName("GameScene");
+        var tabs = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<MenuTabManager>(true)).Single();
+        var entries = Field<System.Collections.Generic.List<MenuTabManager.TabEntry>>(tabs, "tabs");
+        for (int i = 2; i < entries.Count; i++) CopyButtonFont(entries[0].tabButtonText, entries[i].tabButtonText);
+        foreach (Transform row in entries[2].panel.transform)
+        {
+            var icon = row.Find("Icon"); if (icon != null) UnityEngine.Object.DestroyImmediate(icon.gameObject);
+            var label = row.Find("Name"); if (label == null) continue;
+            var rect = (RectTransform)label; rect.anchoredPosition = new Vector2(-26, 0); rect.sizeDelta = new Vector2(780, 76);
+        }
+        foreach (var slider in entries[4].panel.GetComponentsInChildren<Slider>(true))
+        {
+            var area = (RectTransform)slider.handleRect.parent; area.sizeDelta = new Vector2(area.sizeDelta.x, 73);
+            slider.handleRect.sizeDelta = new Vector2(36, 0);
+        }
+        EditorSceneManager.MarkSceneDirty(scene); EditorSceneManager.SaveScene(scene);
+    }
+    static void Assign(SerializedObject fields, string name, UnityEngine.Object value) { fields.FindProperty(name).objectReferenceValue = value; }
+    static void AssignArray(SerializedObject fields, string name, System.Collections.Generic.IEnumerable<UnityEngine.Object> values)
+    { var objects = values.ToArray(); var array = fields.FindProperty(name); array.arraySize = objects.Length; for (int i = 0; i < objects.Length; i++) array.GetArrayElementAtIndex(i).objectReferenceValue = objects[i]; }
+}

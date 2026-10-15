@@ -1,0 +1,57 @@
+using UnityEngine;
+
+[CreateAssetMenu(menuName = "WiSe/Dungeon Settings")]
+public sealed class DungeonSettings : ScriptableObject
+{
+    [Tooltip("Each new dungeon rolls its total room count within these bounds, using its entrance seed.")]
+    [Range(8, DungeonLayout.MaximumRooms)] public int minimumRooms = 14;
+    [Range(8, DungeonLayout.MaximumRooms)] public int maximumRooms = 24;
+    [Range(20, 64)] public int minimumRoomSize = 36;
+    [Range(20, 64)] public int maximumRoomSize = 42;
+    [Min(100)] public float roomSpacing = 500;
+    [Tooltip("Debug option: reproduce one dungeon seed. Normally each overworld entrance gets its own seed.")]
+    public bool useFixedSeed;
+    public int fixedSeed = 24681;
+    public GameObject chestModel, chestLidModel, berdlyModel, doorModel, steelGateModel;
+    [Header("Saved UI prefab - Canvas and Images")]
+    public DungeonDoorUI doorLockUI;
+    [Min(.5f)] public float coinSize = 1.35f;
+    public GameObject coinPrefab;
+    [Min(1)] public float chestWidth = 3.2f;
+    [Header("Rare chest reward")]
+    public Consumable diamondChestLoot;
+    [Range(0, 1)] public float diamondChestChance = .025f;
+    [Min(2)] public float doorHeight = 6;
+    [Min(2)] public float steelGateLiftHeight = 6.5f;
+    [Min(.5f)] public float steelGateOpenRange = 4f;
+    [Min(.1f)] public float steelGateLiftSpeed = 5f;
+    public AudioClip gateLiftSound;
+    [Min(0)] public float gateLiftStartSeconds;
+    [Header("Dungeon floor - brick, slab, cracked, moss")]
+    public GameObject[] floorTiles = new GameObject[4];
+    [Range(1, 8)] public float floorTileSize = 6;
+    [Min(0)] public float playerLightIntensity = 80;
+    [Header("Room decorations")]
+    public GameObject[] breakableDecorations = new GameObject[3];
+    public GameObject breakingEffect;
+    public AudioClip breakingSwingSound, breakingImpactSound;
+    [Tooltip("Skip the existing clips' leading silence so their sound begins at the animation cue.")]
+    [Min(0)] public float breakingSwingStartSeconds, breakingImpactStartSeconds;
+    public GameObject[] floorDecorations = new GameObject[3];
+    [Range(1, 20)] public int minimumBreakables = 5;
+    [Range(1, 20)] public int maximumBreakables = 9;
+    [Range(0, 1)] public float decorationCoinChance = .10f;
+    [Header("Friendly NPC in ordinary normal rooms")]
+    public GameObject friendlyEnemyModel;
+    [Header("Saved NPC prefabs with world-space speech bubbles")]
+    public GameObject dungeonGuideNPC, dungeonFriendlyNPC;
+    [Range(0, 1)] public float friendlyEnemyChance = .08f;
+    public Material floorMaterial, wallMaterial, doorMaterial, berdlyMaterial;
+    public AudioClip music;
+    [Header("Area arrival and coin pickups")]
+    public DungeonAreaTitle areaTitlePrefab;
+    public AudioClip areaEnterSound, coinPickupSound;
+    [Header("Room travel")]
+    public DungeonRoomTransition roomTransitionPrefab;
+    [Min(0)] public float roomFadeOutSeconds = .18f, roomFadeInSeconds = .22f;
+}

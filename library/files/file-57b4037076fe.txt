@@ -1,0 +1,54 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public class WiSe : CharacterBase
+{
+    [SerializeField] float cuttingRange = 2.5f;
+    [SerializeField] AudioClip cuttingSwingSound;
+
+    void Update()
+    {
+        if (NPCChallengePrompt.BlocksGameplayInput || Keyboard.current == null) return;
+        if (Keyboard.current.fKey.wasPressedThisFrame)
+            CutTree();
+    }
+
+    TreeCuttable FindClosestTree()
+    {
+        Collider[] hits = Physics.OverlapSphere(transform.position, cuttingRange);
+        TreeCuttable closest = null;
+        float closestDistance = 999f;
+
+        foreach (Collider hit in hits)
+        {
+            TreeCuttable tree = hit.GetComponentInParent<TreeCuttable>();
+            if (tree == null) continue;
+
+            float distance = Vector3.Distance(transform.position, tree.transform.position);
+            if (distance < closestDistance)
+            {
+                closestDistance = distance;
+                closest = tree;
+            }
+        }
+
+        return closest;
+    }
+
+    void CutTree()
+    {
+        TreeCuttable tree = FindClosestTree();
+        var movement = GetComponent<CharacterMovement>();
+        if (tree == null || movement == null) return;
+        movement.TryPlayBreakAction(tree.transform.position,
+            () => { if (tree != null) tree.Cut(transform.position); },
+            null,
+            () => { if (cuttingSwingSound != null) DungeonAudio.Play(cuttingSwingSound, transform.position, .45f); });
+    }
+
+    void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.green;
+        Gizmos.DrawWireSphere(transform.position, cuttingRange);
+    }
+}

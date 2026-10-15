@@ -1,0 +1,10 @@
+using Unity.AI.Navigation;
+using UnityEngine;
+
+// Authored layouts in BattleScene; placement and cover remain editable in the Hierarchy.
+public sealed class BattleLayout : MonoBehaviour
+{
+    public Transform[] partySpawns, enemySpawns;
+    public BattleCover[] cover;
+    public NavMeshSurface surface;
+}
